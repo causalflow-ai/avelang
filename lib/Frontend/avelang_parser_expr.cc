@@ -255,12 +255,19 @@ ast::Call *AveLangParser::ParseCall(const py::object &py_call) {
         }
     }
 
-    // Parse keywords (simplified - just collect names)
+    // Parse keywords after positional arguments and retain the keyword names.
+    // Intrinsic builders can use the names to apply defaults/reordering.
     llvm::SmallVector<std::string, 4> keywords;
     for (auto keyword : MaybePyList(py_call, "keywords")) {
         py::object kw_obj = keyword.cast<py::object>();
         if (py::hasattr(kw_obj, "arg")) {
             std::string kw_name = kw_obj.attr("arg").cast<std::string>();
+            if (py::hasattr(kw_obj, "value")) {
+                ast::Expr *parsed_arg = ParseExpr(kw_obj.attr("value"));
+                if (parsed_arg) {
+                    args.push_back(parsed_arg);
+                }
+            }
             keywords.push_back(std::move(kw_name));
         }
     }

@@ -5,6 +5,7 @@
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -127,6 +128,10 @@ class GpuOutliningPass
                             return addrSpaceAttr.getValue() ==
                                    mlir::gpu::AddressSpace::Workgroup;
                         }
+                        if (auto intSpace =
+                                mlir::dyn_cast<mlir::IntegerAttr>(addressSpace)) {
+                            return intSpace.getInt() == 3;
+                        }
                     }
                     return false;
                 };
@@ -140,8 +145,14 @@ class GpuOutliningPass
 
                 for (auto allocaOp : workgroupAllocaOps) {
                     auto memrefType = allocaOp.getType();
+                    unsigned attributionIndex =
+                        gpuFunc.getNumWorkgroupAttributions();
                     auto workgroupArg = gpuFunc.addWorkgroupAttribution(
                         memrefType, allocaOp.getLoc());
+                    gpuFunc.setWorkgroupAttributionAttr(
+                        attributionIndex,
+                        mlir::LLVM::LLVMDialect::getAlignAttrName(),
+                        builder.getI64IntegerAttr(128));
                     allocaOp.getResult().replaceAllUsesWith(workgroupArg);
                     allocaOp.erase();
                 }

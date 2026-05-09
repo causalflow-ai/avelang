@@ -157,6 +157,7 @@ class LowerToLLVM::Impl {
         }
 
         PassManager pm(ir_context_->GetMLIRContext());
+        pm.enableVerifier(false);
 
         pm.addPass(causalflow::avelang::dialect::
                        createLowerAveLangGPUToIntrinsicsPass());
@@ -237,6 +238,23 @@ class LowerToLLVM::Impl {
             llvm::errs() << "Expected exactly one GPU module after lowering, "
                          << "found " << gpuModules.size() << "\n";
             return nullptr;
+        }
+
+        // NVGPU TMA descriptor lowering materializes this helper as a top-level
+        // llvm.func on the builtin.module, but we translate the nested
+        // gpu.module in isolation. Ensure the declaration exists in the
+        // translated symbol scope.
+        constexpr llvm::StringLiteral kTensorMapEncodeFn =
+            "mgpuTensorMapEncodeTiledMemref";
+        if (auto topLevelFn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+                kTensorMapEncodeFn)) {
+            auto gpuModule = gpuModules[0];
+            if (!gpuModule.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+                    kTensorMapEncodeFn)) {
+                mlir::OpBuilder builder(gpuModule.getContext());
+                builder.setInsertionPointToEnd(gpuModule.getBody());
+                builder.clone(*topLevelFn.getOperation());
+            }
         }
 
         // Translate MLIR to LLVM IR

@@ -53,9 +53,12 @@ set_target_properties(_avelang_bindings PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Set output directory if specified by setup.py
-if(DEFINED AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY)
-    set_target_properties(_avelang_bindings PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY}"
-    )
+# Keep the in-tree Python package usable for development builds. setup.py
+# supplies AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY for wheel builds.
+if(NOT DEFINED AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY)
+    set(AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
+
+set_target_properties(_avelang_bindings PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${AVE_LANG_PYTHON_LIBRARY_OUTPUT_DIRECTORY}"
+)

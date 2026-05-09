@@ -1,6 +1,7 @@
 #include "AveLangOps.h"
 #include "AveLangDialect.h"
 #include "IR/Intrinsics/amdgpu_mfma_signatures.h"
+#include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/Ptr/IR/PtrTypes.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
@@ -659,6 +660,78 @@ void NVVMStMatrixOp::build(mlir::OpBuilder &builder,
                            mlir::OperationState &state,
                            mlir::ValueRange operands,
                            mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 2u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    // No result types to add (void operation)
+}
+
+void NVVMWGMMADescriptorOp::build(mlir::OpBuilder &builder,
+                                  mlir::OperationState &state,
+                                  mlir::ValueRange operands,
+                                  mlir::TypeRange resultTypes,
+                                  mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 5u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    assert(resultTypes.size() == 1u && "mismatched number of return types");
+    state.addTypes(resultTypes);
+}
+
+void NVVMTMADescriptorOp::build(mlir::OpBuilder &builder,
+                                mlir::OperationState &state,
+                                mlir::ValueRange operands,
+                                mlir::TypeRange resultTypes,
+                                mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 2u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    assert(resultTypes.size() == 1u && "mismatched number of return types");
+    state.addTypes(resultTypes);
+}
+
+void NVVMTMAFenceOp::build(mlir::OpBuilder &builder,
+                           mlir::OperationState &state,
+                           mlir::ValueRange operands,
+                           mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 1u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+}
+
+void NVVMTMALoadOp::build(mlir::OpBuilder &builder,
+                          mlir::OperationState &state,
+                          mlir::ValueRange operands,
+                          mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 7u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+}
+
+void NVVMTMAStoreOp::build(mlir::OpBuilder &builder,
+                           mlir::OperationState &state,
+                           mlir::ValueRange operands,
+                           mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 4u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+}
+
+void NVVMWGMMAAsyncOp::build(mlir::OpBuilder &builder,
+                             mlir::OperationState &state,
+                             mlir::ValueRange operands,
+                             mlir::TypeRange resultTypes,
+                             mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 3u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    assert(resultTypes.size() == 1u && "mismatched number of return types");
+    state.addTypes(resultTypes);
+}
+
+void NVVMWGMMAStoreOp::build(mlir::OpBuilder &builder, mlir::OperationState &state,
+                                mlir::ValueRange operands,
+                                mlir::ArrayRef<mlir::NamedAttribute> attributes) {
     assert(operands.size() == 2u && "mismatched number of parameters");
     state.addOperands(operands);
     state.addAttributes(attributes);

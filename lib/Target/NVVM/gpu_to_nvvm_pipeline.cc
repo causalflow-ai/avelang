@@ -2,6 +2,8 @@
 #include "Dialect/AveLang/Transforms/normalize_ave_lang_return_pass.h"
 
 #include <mlir/Conversion/AffineToStandard/AffineToStandard.h>
+#include <mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h>
+#include <mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h>
 #include <mlir/Conversion/Passes.h>
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
@@ -9,15 +11,18 @@
 #include <mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
+#include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/MemRef/Transforms/Passes.h>
+#include <mlir/IR/SymbolTable.h>
 #include <mlir/Pass/PassManager.h>
+#include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Transforms/Passes.h>
 
 namespace causalflow::avelang::target::nvvm {
 
 using namespace mlir;
 
-static const int kIndexBitwidth = 32;
+static const int kIndexBitwidth = 64;
 
 static void buildCommonPassPipeline(OpPassManager &pm,
                                     const NVVMToLLVMPipelineOptions &options) {
@@ -55,6 +60,8 @@ static void buildGpuPassPipeline(OpPassManager &pm,
     convertOptions.useBarePtrCallConv = options.use_bare_ptr_memref_call_conv;
     pm.addNestedPass<gpu::GPUModuleOp>(
         createConvertGpuOpsToNVVMOps(convertOptions));
+    pm.addNestedPass<gpu::GPUModuleOp>(createConvertNVGPUToNVVMPass());
+    pm.addPass(createConvertNVVMToLLVMPass());
 
     // Add vector-to-LLVM pass to lower vector operations from intrinsics
     pm.addNestedPass<gpu::GPUModuleOp>(createConvertVectorToLLVMPass());

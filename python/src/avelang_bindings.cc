@@ -80,7 +80,33 @@ DescribeRemainingTranslationBlockers(mlir::Operation *operation) {
         if (!HasMeaningfulMLIRLocation(location)) {
             return;
         }
-        blockers.insert(location + ": builtin.unrealized_conversion_cast");
+        std::string detail = location + ": builtin.unrealized_conversion_cast";
+        detail += " (";
+        if (!cast.getInputs().empty()) {
+            detail += "from ";
+            {
+                std::string fromTy;
+                llvm::raw_string_ostream os(fromTy);
+                cast.getInputs().front().getType().print(os);
+                os.flush();
+                detail += fromTy;
+            }
+        }
+        if (!cast.getOutputs().empty()) {
+            if (!cast.getInputs().empty()) {
+                detail += " ";
+            }
+            detail += "to ";
+            {
+                std::string toTy;
+                llvm::raw_string_ostream os(toTy);
+                cast.getOutputs().front().getType().print(os);
+                os.flush();
+                detail += toTy;
+            }
+        }
+        detail += ")";
+        blockers.insert(std::move(detail));
     });
 
     if (blockers.empty()) {

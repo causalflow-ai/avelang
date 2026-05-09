@@ -1,4 +1,5 @@
 #include "Dialect/AveLang/IR/AveLangOps.h"
+#include "Dialect/AveLang/Transforms/lower_gpuop_to_intrinsics_pass.h"
 #include "Frontend/avelang_parser.h"
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
@@ -1214,6 +1215,239 @@ def stmatrix_comprehensive_test(data1: S.i32,
     S.nvvm.stmatrix_m8n8_x1_b16(shared_mem, data1)
     S.nvvm.stmatrix_m8n8_x2_b16(shared_mem, data2)
     S.nvvm.stmatrix_m8n8_x4_b16(shared_mem, data4)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMWgmmaOps) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def wgmma_ops_test():
+    S.nvvm.wgmma_fence_aligned()
+
+    S.nvvm.wgmma_group_sync_aligned()
+
+    S.nvvm.wgmma_wait_group_sync(0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMMakeWgmmaDescriptor) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def make_wgmma_descriptor_test():
+    shared_mem = S.make_shared((64, 16), S.bf16)
+    desc = S.nvvm.make_wgmma_descriptor(shared_mem, 0, 0, 0, 0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMMakeTmaDescriptor) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def make_tma_descriptor_test(tensor: S.Tensor((64, 16), S.f16)):
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(tensor, smem_layout)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMTmaFence) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_fence_test(tensor: S.Tensor((64, 16), S.f16)):
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(tensor, smem_layout)
+    S.nvvm.tma_fence(desc)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(cf::createLowerAveLangGPUToIntrinsicsPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    bool foundTmaFence = false;
+    mlir->walk([&](mlir::Operation *op) {
+        if (op->getName().getStringRef() ==
+            "nvgpu.tma.fence.descriptor") {
+            foundTmaFence = true;
+        }
+    });
+    EXPECT_TRUE(foundTmaFence);
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMTmaLoad) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_load_test(tensor: S.Tensor((64, 16), S.f16)):
+    smem = S.make_shared((16, 16), S.f16)
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(tensor, smem_layout)
+    barrier = S.nvvm.mbarrier_create()
+    S.nvvm.mbarrier_init(barrier, 0)
+    S.nvvm.tma_load(
+        smem, desc, (0, 0), barrier, mbar_id=0,
+        predicate=True, multicast_mask=None)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(cf::createLowerAveLangGPUToIntrinsicsPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    bool foundTmaLoad = false;
+    bool foundExpectTx = false;
+    mlir->walk([&](mlir::Operation *op) {
+        if (op->getName().getStringRef() == "nvgpu.tma.async.load") {
+            foundTmaLoad = true;
+        } else if (op->getName().getStringRef() ==
+                   "nvgpu.mbarrier.arrive.expect_tx") {
+            foundExpectTx = true;
+        }
+    });
+    EXPECT_TRUE(foundTmaLoad);
+    EXPECT_TRUE(foundExpectTx);
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMTmaStore) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_store_test(tensor: S.Tensor((64, 16), S.f16)):
+    smem = S.make_shared((16, 16), S.f16)
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(tensor, smem_layout)
+    S.nvvm.tma_store(smem, desc, (0, 0), predicate=True)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(cf::createLowerAveLangGPUToIntrinsicsPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    bool foundTmaStore = false;
+    mlir->walk([&](mlir::Operation *op) {
+        if (op->getName().getStringRef() == "nvgpu.tma.async.store") {
+            foundTmaStore = true;
+        }
+    });
+    EXPECT_TRUE(foundTmaStore);
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMWgmmaInitAccumulatorAndStore) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def wgmma_init_accumulator_and_store_test():
+    output = S.make_shared((64, 16), S.f32)
+    acc = S.nvvm.wgmma_init_accumulator(64, 16)
+    S.nvvm.wgmma_store(acc, output)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMWgmmaAsync) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def wgmma_async_test():
+    a_shared = S.make_shared((64, 16), S.bf16)
+    b_shared = S.make_shared((16, 16), S.bf16)
+    output = S.make_shared((64, 16), S.f32)
+    desc_a = S.nvvm.make_wgmma_descriptor(a_shared, 3, 0, 0, 0)
+    desc_b = S.nvvm.make_wgmma_descriptor(b_shared, 3, 0, 0, 0)
+    acc = S.nvvm.wgmma_init_accumulator(64, 16)
+    result = S.nvvm.wgmma_async(desc_a, desc_b, acc)
+    S.nvvm.wgmma_store(result, output)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMMBarrierOps) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def mbarrier_ops_test():
+    barrier = S.nvvm.mbarrier_create()
+    S.nvvm.mbarrier_init(barrier, 0)
+    S.nvvm.mbarrier_try_wait_parity(barrier, 0, 10, 0)
+    token = S.nvvm.mbarrier_arrive(barrier, 0)
+    ready = S.nvvm.mbarrier_test_wait(barrier, token, 0)
+    S.nvvm.mbarrier_arrive_expect_tx(barrier, 16, 0, 1)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);

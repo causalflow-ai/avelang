@@ -12,6 +12,7 @@
 #include <mlir/Dialect/ControlFlow/IR/ControlFlowOps.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/Ptr/IR/PtrTypes.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
@@ -953,6 +954,11 @@ bool FunctionGenerator::ResolveNameAssignmentTarget(
     auto value_type = value.getType();
     if (mlir::isa<cf::MemRefType>(value_type) ||
         mlir::isa<mlir::VectorType>(value_type) ||
+        mlir::isa<mlir::nvgpu::TensorMapDescriptorType>(value_type) ||
+        mlir::isa<mlir::nvgpu::MBarrierGroupType>(value_type) ||
+        mlir::isa<mlir::nvgpu::MBarrierTokenType>(value_type) ||
+        mlir::isa<mlir::nvgpu::WarpgroupMatrixDescriptorType>(value_type) ||
+        mlir::isa<mlir::nvgpu::WarpgroupAccumulatorType>(value_type) ||
         mlir::isa<mlir::OpaqueType>(value_type) ||
         value.getDefiningOp<cf::MakeIntTupleOp>()) {
         ctx_->syms->DefineSymbol(target_name, value);

@@ -51,8 +51,12 @@ mlir::Attribute normalizeBuiltinMemorySpace(mlir::MLIRContext *context,
             return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
                                           5);
         case mlir::gpu::AddressSpace::Global:
-        case mlir::gpu::AddressSpace::Workgroup:
             return memorySpace;
+        case mlir::gpu::AddressSpace::Workgroup:
+            // Keep workgroup memory space in integer form to satisfy NVVM
+            // memref-to-LLVM conversions and avoid mixed-address-space views.
+            return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                          3);
         }
     }
     return memorySpace;
@@ -68,12 +72,55 @@ mlir::Attribute resolveMemorySpace(mlir::MLIRContext *context,
     return normalizeBuiltinMemorySpace(context, fallback);
 }
 
+bool isWorkgroupMemorySpaceAttr(mlir::Attribute memorySpace) {
+    auto intSpace = mlir::dyn_cast_or_null<mlir::IntegerAttr>(memorySpace);
+    return intSpace && intSpace.getInt() == 3;
+}
+
 mlir::MemRefType withResolvedMemorySpace(mlir::MLIRContext *context,
                                          mlir::MemRefType type,
                                          mlir::Attribute fallback = {}) {
     return mlir::MemRefType::get(
         type.getShape(), type.getElementType(), type.getLayout(),
         resolveMemorySpace(context, type.getMemorySpace(), fallback));
+}
+
+mlir::MemRefType getBuiltinMemRefType(mlir::Type type) {
+    if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return withResolvedMemorySpace(type.getContext(), builtinType);
+    }
+
+    auto substrateType = mlir::dyn_cast<MemRefType>(type);
+    if (!substrateType) {
+        return {};
+    }
+
+    mlir::MemRefLayoutAttrInterface layout;
+    auto layoutType = mlir::cast<LayoutType>(substrateType.getLayout());
+    auto strides = layoutType.getStrides();
+    if (!strides.empty()) {
+        layout = mlir::StridedLayoutAttr::get(type.getContext(),
+                                              /*offset=*/0, strides);
+    }
+
+    return mlir::MemRefType::get(
+        layoutType.getDims(), substrateType.getElementType(), layout,
+        normalizeBuiltinMemorySpace(type.getContext(),
+                                    substrateType.getMemorySpace()));
+}
+
+mlir::Value castToBuiltinMemRef(mlir::Location loc, mlir::Value value,
+                                mlir::PatternRewriter &rewriter) {
+    auto builtinType = getBuiltinMemRefType(value.getType());
+    if (!builtinType) {
+        return {};
+    }
+    if (value.getType() == builtinType) {
+        return value;
+    }
+    return rewriter
+        .create<AveLangMemRefCastOp>(loc, value, builtinType)
+        .getResult();
 }
 
 std::optional<int64_t> getElementByteSize(mlir::Type elementType) {
@@ -116,6 +163,20 @@ std::optional<int64_t> getPreferredAlignment(mlir::Type elementType) {
 
     return static_cast<int64_t>(
         llvm::PowerOf2Ceil(static_cast<uint64_t>(*elementBytes)));
+}
+
+std::optional<int64_t> getPreferredAllocaAlignment(mlir::MemRefType type) {
+    auto preferred = getPreferredAlignment(type.getElementType());
+    if (!isWorkgroupMemorySpaceAttr(type.getMemorySpace())) {
+        return preferred;
+    }
+
+    // WGMMA shared-memory descriptors are sensitive to base alignment.
+    int64_t minWorkgroupAlignment = 128;
+    if (!preferred || *preferred < minWorkgroupAlignment) {
+        return minWorkgroupAlignment;
+    }
+    return preferred;
 }
 
 std::optional<int64_t> getStaticElementCount(mlir::MemRefType type) {
@@ -1114,7 +1175,7 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
         mlir::MemRefLayoutAttrInterface(), normalizedMemorySpace);
 
     mlir::IntegerAttr alignmentAttr;
-    if (auto alignment = getPreferredAlignment(resultType.getElementType())) {
+    if (auto alignment = getPreferredAllocaAlignment(resultType)) {
         alignmentAttr = rewriter.getI64IntegerAttr(*alignment);
     }
 
@@ -1160,6 +1221,17 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
     // promotion passes can still recognize them as booleans instead of raw
     // byte buffers.
     if (resultType.getElementType().isInteger(1)) {
+        auto typedResult = buildResultWithTypedAlloca();
+        if (!typedResult) {
+            return mlir::failure();
+        }
+        rewriter.replaceOp(op, typedResult);
+        return mlir::success();
+    }
+
+    // Keep workgroup allocations typed so outlined shared-memory globals retain
+    // natural element typing and requested alignment.
+    if (isWorkgroupMemorySpaceAttr(normalizedMemorySpace)) {
         auto typedResult = buildResultWithTypedAlloca();
         if (!typedResult) {
             return mlir::failure();
@@ -1219,8 +1291,7 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
 
 mlir::LogicalResult AveLangMemRefLoadLoweringPattern::matchAndRewrite(
     AveLangMemRefLoadOp op, mlir::PatternRewriter &rewriter) const {
-    auto memrefType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getMemref().getType());
+    auto memrefType = getBuiltinMemRefType(op.getMemref().getType());
     if (!memrefType) {
         return mlir::failure();
     }
@@ -1230,8 +1301,12 @@ mlir::LogicalResult AveLangMemRefLoadLoweringPattern::matchAndRewrite(
     auto indices = op.getIndices();
 
     if (resultType == elementType) {
-        rewriter.replaceOpWithNewOp<mlir::memref::LoadOp>(op, op.getMemref(),
-                                                          indices);
+        auto memref = castToBuiltinMemRef(op.getLoc(), op.getMemref(),
+                                          rewriter);
+        if (!memref) {
+            return mlir::failure();
+        }
+        rewriter.replaceOpWithNewOp<mlir::memref::LoadOp>(op, memref, indices);
         return mlir::success();
     }
 
@@ -1240,8 +1315,7 @@ mlir::LogicalResult AveLangMemRefLoadLoweringPattern::matchAndRewrite(
 
 mlir::LogicalResult AveLangMemRefLoadVecLoweringPattern::matchAndRewrite(
     AveLangMemRefLoadVecOp op, mlir::PatternRewriter &rewriter) const {
-    auto memrefType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getMemref().getType());
+    auto memrefType = getBuiltinMemRefType(op.getMemref().getType());
     if (!memrefType) {
         return mlir::failure();
     }
@@ -1252,15 +1326,19 @@ mlir::LogicalResult AveLangMemRefLoadVecLoweringPattern::matchAndRewrite(
         return mlir::failure();
     }
 
-    rewriter.replaceOpWithNewOp<mlir::vector::LoadOp>(
-        op, resultType, op.getMemref(), op.getIndices());
+    auto memref = castToBuiltinMemRef(op.getLoc(), op.getMemref(), rewriter);
+    if (!memref) {
+        return mlir::failure();
+    }
+
+    rewriter.replaceOpWithNewOp<mlir::vector::LoadOp>(op, resultType, memref,
+                                                      op.getIndices());
     return mlir::success();
 }
 
 mlir::LogicalResult AveLangMemRefStoreLoweringPattern::matchAndRewrite(
     AveLangMemRefStoreOp op, mlir::PatternRewriter &rewriter) const {
-    auto memrefType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getMemref().getType());
+    auto memrefType = getBuiltinMemRefType(op.getMemref().getType());
     if (!memrefType) {
         return mlir::failure();
     }
@@ -1270,15 +1348,25 @@ mlir::LogicalResult AveLangMemRefStoreLoweringPattern::matchAndRewrite(
     auto indices = op.getIndices();
 
     if (valueType == elementType) {
+        auto memref = castToBuiltinMemRef(op.getLoc(), op.getMemref(),
+                                          rewriter);
+        if (!memref) {
+            return mlir::failure();
+        }
         rewriter.replaceOpWithNewOp<mlir::memref::StoreOp>(
-            op, op.getValue(), op.getMemref(), indices);
+            op, op.getValue(), memref, indices);
         return mlir::success();
     }
 
     if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(valueType)) {
         if (elementType == vectorType.getElementType()) {
+            auto memref =
+                castToBuiltinMemRef(op.getLoc(), op.getMemref(), rewriter);
+            if (!memref) {
+                return mlir::failure();
+            }
             rewriter.replaceOpWithNewOp<mlir::vector::StoreOp>(
-                op, op.getValue(), op.getMemref(), indices);
+                op, op.getValue(), memref, indices);
             return mlir::success();
         }
     }
@@ -1288,18 +1376,20 @@ mlir::LogicalResult AveLangMemRefStoreLoweringPattern::matchAndRewrite(
 
 mlir::LogicalResult AveLangMemRefViewLoweringPattern::matchAndRewrite(
     AveLangMemRefViewOp op, mlir::PatternRewriter &rewriter) const {
-    auto resultType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getResult().getType());
+    auto resultType = getBuiltinMemRefType(op.getResult().getType());
     if (!resultType) {
         return mlir::failure();
     }
-    auto sourceType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getSource().getType());
+    auto sourceType = getBuiltinMemRefType(op.getSource().getType());
+    auto source = castToBuiltinMemRef(op.getLoc(), op.getSource(), rewriter);
+    if (!source) {
+        return mlir::failure();
+    }
     auto viewType = withResolvedMemorySpace(
         rewriter.getContext(), resultType,
         sourceType ? sourceType.getMemorySpace() : mlir::Attribute{});
     rewriter.replaceOpWithNewOp<mlir::memref::ViewOp>(
-        op, viewType, op.getSource(), op.getByteShift(), op.getSizes());
+        op, viewType, source, op.getByteShift(), op.getSizes());
     return mlir::success();
 }
 
@@ -1309,6 +1399,16 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
         mlir::dyn_cast<mlir::MemRefType>(op.getResult().getType());
     if (!resultType) {
         return mlir::failure();
+    }
+
+    auto sourceType = mlir::dyn_cast<mlir::MemRefType>(op.getSource().getType());
+    if (sourceType && sourceType.getShape() == resultType.getShape() &&
+        sourceType.getElementType() == resultType.getElementType() &&
+        sourceType.getLayout() == resultType.getLayout() &&
+        sourceType.getMemorySpace() != resultType.getMemorySpace()) {
+        rewriter.replaceOpWithNewOp<mlir::memref::MemorySpaceCastOp>(
+            op, resultType, op.getSource());
+        return mlir::success();
     }
 
     auto loc = op.getLoc();
@@ -1401,8 +1501,6 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
     bool useDirectReinterpret = false;
     mlir::Value reinterpretSource = op.getSource();
     mlir::OpFoldResult reinterpretOffset = rewriter.getIndexAttr(0);
-    auto sourceType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getSource().getType());
     bool sourceIsSubviewLike =
         op.getSource().getDefiningOp<mlir::memref::SubViewOp>() ||
         op.getSource().getDefiningOp<AveLangMemRefSubViewOp>();
@@ -1486,18 +1584,20 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
         return mlir::success();
     }
 
+    auto baseType = getBuiltinMemRefType(baseInfo->base.getType());
+    if (!baseType) {
+        return mlir::failure();
+    }
+
     // First, create a contiguous view from the base i8 buffer to the target
     // element type.
     auto contiguousType = mlir::MemRefType::get(
         foldedShape, resultType.getElementType(),
         mlir::MemRefLayoutAttrInterface(),
-        resolveMemorySpace(
-            rewriter.getContext(), resultType.getMemorySpace(),
-            mlir::cast<mlir::MemRefType>(baseInfo->base.getType())
-                .getMemorySpace()));
-    auto view = mlir::memref::ViewOp::create(rewriter, loc, contiguousType,
-                                             baseInfo->base,
-                                             baseInfo->byteShift, sizeValues);
+        resolveMemorySpace(rewriter.getContext(), resultType.getMemorySpace(),
+                           baseType.getMemorySpace()));
+    auto view = rewriter.create<mlir::memref::ViewOp>(
+        loc, contiguousType, baseInfo->base, baseInfo->byteShift, sizeValues);
 
     if (!needReinterpret) {
         rewriter.replaceOp(op, view.getResult());
@@ -1508,10 +1608,8 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
         mlir::StridedLayoutAttr::get(rewriter.getContext(), 0, staticStrides);
     auto stridedType = mlir::MemRefType::get(
         foldedShape, resultType.getElementType(), stridedLayout,
-        resolveMemorySpace(
-            rewriter.getContext(), resultType.getMemorySpace(),
-            mlir::cast<mlir::MemRefType>(baseInfo->base.getType())
-                .getMemorySpace()));
+        resolveMemorySpace(rewriter.getContext(), resultType.getMemorySpace(),
+                           baseType.getMemorySpace()));
 
     auto reinterpretOp = mlir::memref::ReinterpretCastOp::create(
         rewriter, loc, stridedType, view.getResult(), rewriter.getIndexAttr(0),
@@ -1536,8 +1634,7 @@ mlir::LogicalResult
 AveLangMemRefExtractAlignedPointerLoweringPattern::matchAndRewrite(
     AveLangMemRefExtractAlignedPointerAsIndexOp op,
     mlir::PatternRewriter &rewriter) const {
-    auto memrefType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getSource().getType());
+    auto memrefType = getBuiltinMemRefType(op.getSource().getType());
     if (!memrefType) {
         return mlir::failure();
     }
@@ -1558,21 +1655,27 @@ AveLangMemRefExtractAlignedPointerLoweringPattern::matchAndRewrite(
         return mlir::success();
     }
 
+    auto source = castToBuiltinMemRef(loc, op.getSource(), rewriter);
+    if (!source) {
+        return mlir::failure();
+    }
     rewriter.replaceOpWithNewOp<mlir::memref::ExtractAlignedPointerAsIndexOp>(
-        op, op.getSource());
+        op, source);
     return mlir::success();
 }
 
 mlir::LogicalResult AveLangMemRefSubViewLoweringPattern::matchAndRewrite(
     AveLangMemRefSubViewOp op, mlir::PatternRewriter &rewriter) const {
-    auto sourceType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getSource().getType());
+    auto sourceType = getBuiltinMemRefType(op.getSource().getType());
     if (!sourceType) {
         return mlir::failure();
     }
+    auto source = castToBuiltinMemRef(op.getLoc(), op.getSource(), rewriter);
+    if (!source) {
+        return mlir::failure();
+    }
 
-    auto resultType =
-        mlir::dyn_cast<mlir::MemRefType>(op.getResult().getType());
+    auto resultType = getBuiltinMemRefType(op.getResult().getType());
     if (!resultType) {
         return mlir::failure();
     }
@@ -1613,8 +1716,8 @@ mlir::LogicalResult AveLangMemRefSubViewLoweringPattern::matchAndRewrite(
             sizesFold.push_back(
                 rewriter.getIndexAttr(sourceType.getDimSize(i)));
         } else {
-            auto dimOp = mlir::memref::DimOp::create(
-                rewriter, op.getLoc(), op.getSource(), static_cast<int64_t>(i));
+            auto dimOp = rewriter.create<mlir::memref::DimOp>(
+                op.getLoc(), source, static_cast<int64_t>(i));
             sizesFold.push_back(dimOp.getResult());
         }
 
@@ -1625,14 +1728,17 @@ mlir::LogicalResult AveLangMemRefSubViewLoweringPattern::matchAndRewrite(
         }
     }
 
-    auto inferredType = mlir::cast<mlir::MemRefType>(
+    auto inferredType = getBuiltinMemRefType(
         mlir::memref::SubViewOp::inferRankReducedResultType(
             resultType.getShape(), sourceType, offsetsFold, sizesFold,
             stridesFold));
+    if (!inferredType) {
+        return mlir::failure();
+    }
 
-    auto subview = mlir::memref::SubViewOp::create(
-        rewriter, op.getLoc(), inferredType, op.getSource(), offsetsFold,
-        sizesFold, stridesFold);
+    auto subview = rewriter.create<mlir::memref::SubViewOp>(
+        op.getLoc(), inferredType, source, offsetsFold, sizesFold,
+        stridesFold);
 
     rewriter.replaceOp(op, subview.getResult());
     return mlir::success();

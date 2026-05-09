@@ -257,6 +257,167 @@ def NVVMStMatrixOp : AveLang_GPU_Op<"nvvm_stmatrix", []> {
     let hasVerifier = 1;
 }
 
+def NVVMWGMMADescriptorOp : AveLang_GPU_Op<"nvvm_wgmma_descriptor", []> {
+    let summary = "NVVM WGMMA Descriptor operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_descriptor` operation creates a descriptor for the NVVM WGMMA intrinsic.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$memref,
+        I32Attr:$swizzle,
+        I32Attr:$l2promo,
+        I32Attr:$oob,
+        I32Attr:$interleave
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $memref attr-dict `:` type($memref) `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMTMADescriptorOp : AveLang_GPU_Op<"nvvm_tma_descriptor", []> {
+    let summary = "NVVM TMA Descriptor operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_descriptor` operation creates an NVGPU
+        tensor-map descriptor for Tensor Memory Access from a memref operand.
+        Box dimensions are derived from the provided shared-memory layout.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$memref,
+        AnyType:$layout
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $memref `,` $layout attr-dict `:` type($memref) `,` type($layout)
+        `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMTMAFenceOp : AveLang_GPU_Op<"nvvm_tma_fence", []> {
+    let summary = "NVVM TMA descriptor fence operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_fence` operation fences an NVGPU tensor-map
+        descriptor before it is used by TMA operations.
+    }];
+
+    let arguments = (ins
+        AnyType:$desc
+    );
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $desc attr-dict `:` type($desc)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMTMALoadOp : AveLang_GPU_Op<"nvvm_tma_load", []> {
+    let summary = "NVVM TMA asynchronous load operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_load` operation loads a TMA tile from
+        global memory to shared memory using an NVGPU tensor-map descriptor.
+        The lowering also emits the mbarrier expect-tx operation using the
+        destination tile byte size.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$dst,
+        AnyType:$desc,
+        AnyType:$coords,
+        AnyType:$barrier,
+        AnyType:$mbarId,
+        AnyType:$predicate,
+        AnyType:$multicastMask
+    );
+    let results = (outs);
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMTMAStoreOp : AveLang_GPU_Op<"nvvm_tma_store", []> {
+    let summary = "NVVM TMA asynchronous store operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_store` operation stores a TMA tile from
+        shared memory to global memory using an NVGPU tensor-map descriptor.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$src,
+        AnyType:$desc,
+        AnyType:$coords,
+        AnyType:$predicate
+    );
+    let results = (outs);
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMWGMMAStoreOp : AveLang_GPU_Op<"nvvm_wgmma_store", []> {
+    let summary = "NVVM WGMMA Store operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_store` operation stores the result of a WGMMA operation
+        to memory using the NVVM WGMMA store intrinsic.
+    }];
+
+    let arguments = (ins
+        AnyType:$desc,
+        AnyType:$dstMemref
+    );
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $desc `,` $dstMemref attr-dict `:`
+        type($desc) `,` type($dstMemref)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
+def NVVMWGMMAAsyncOp : AveLang_GPU_Op<"nvvm_wgmma_async", []> {
+    let summary = "NVVM WGMMA Async operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_async` operation performs a warpgroup matrix
+        multiply-accumulate using NVVM WGMMA descriptors and accumulator values.
+    }];
+
+    let arguments = (ins
+        AnyType:$descA,
+        AnyType:$descB,
+        AnyType:$matrixC
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $descA `,` $descB `,` $matrixC attr-dict `:`
+        type($descA) `,` type($descB) `,` type($matrixC) `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//

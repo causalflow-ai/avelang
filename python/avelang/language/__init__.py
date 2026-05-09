@@ -44,6 +44,12 @@ from .core import (
     log2,
     erf,
     sqrt,
+    composition,
+    complement,
+    coalesce,
+    product,
+    divide,
+    nvvm,
 )
 
 __all__ = [
@@ -86,4 +92,10 @@ __all__ = [
     "log2",
     "erf",
     "sqrt",
+    "composition",
+    "complement",
+    "coalesce",
+    "product",
+    "divide",
+    "nvvm",
 ]

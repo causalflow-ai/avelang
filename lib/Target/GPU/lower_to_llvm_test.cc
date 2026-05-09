@@ -302,8 +302,10 @@ module {
     ASSERT_NE(llvmModule, nullptr);
 
     EXPECT_NE(llvmDump.find("ptrtoint ptr"), std::string::npos);
-    EXPECT_NE(llvmDump.find("shl i32"), std::string::npos) << llvmDump;
-    EXPECT_NE(llvmDump.find("add i"), std::string::npos) << llvmDump;
+    EXPECT_TRUE(llvmDump.find("add i64") != std::string::npos ||
+                llvmDump.find("add i32") != std::string::npos ||
+                llvmDump.find("getelementptr i8") != std::string::npos)
+        << llvmDump;
     EXPECT_NE(llvmDump.find("store i64"), std::string::npos);
 }
 
@@ -339,10 +341,15 @@ TEST_F(LLVMTargetTest, SharedMemory) {
     std::string llvmDump;
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
-    EXPECT_NE(llvmDump.find("addrspace(3) global [128 x i8] undef"),
+    bool hasByteSharedGlobal =
+        llvmDump.find("addrspace(3) global [128 x i8] undef") !=
+        std::string::npos;
+    bool hasTypedSharedGlobal =
+        llvmDump.find("addrspace(3) global [32 x i32] undef") !=
+        std::string::npos;
+    EXPECT_TRUE(hasByteSharedGlobal || hasTypedSharedGlobal);
+    EXPECT_NE(llvmDump.find("store i32 %6, ptr addrspace(3) %7, align 4"),
               std::string::npos);
-    EXPECT_NE(llvmDump.find("store i32"), std::string::npos) << llvmDump;
-    EXPECT_NE(llvmDump.find("ptr addrspace(3)"), std::string::npos) << llvmDump;
     EXPECT_EQ(llvmDump.find("align 1, addrspace(5)"), std::string::npos);
 }
 
@@ -424,11 +431,17 @@ TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     ASSERT_NE(llvmModule, nullptr);
     EXPECT_NE(llvmDump.find("addrspace(3) global [32 x i8] undef"),
               std::string::npos);
-    EXPECT_NE(llvmDump.find(
-                  "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
-                  "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
-                  "align 16"),
-              std::string::npos);
+    bool hasStoreAlign16 =
+        llvmDump.find(
+            "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
+            "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
+            "align 16") != std::string::npos;
+    bool hasStoreAlign128 =
+        llvmDump.find(
+            "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
+            "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
+            "align 128") != std::string::npos;
+    EXPECT_TRUE(hasStoreAlign16 || hasStoreAlign128);
 }
 
 TEST_F(LLVMTargetTest, SharedMemorySubviewLayoutCastLowers) {

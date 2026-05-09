@@ -5,8 +5,11 @@
 #include "Utils/assert.h"
 
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
+#include <mlir/Dialect/UB/IR/UBOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
@@ -36,6 +39,162 @@ namespace causalflow::avelang::dialect {
 namespace amdgpu_mfma = causalflow::avelang::amdgpu::mfma;
 
 namespace {
+
+static mlir::MemRefType
+getBuiltinWorkgroupMemRefType(mlir::Type type, mlir::MLIRContext *context,
+                              mlir::Location loc) {
+    // Use integer shared-memory address space to match NVVM lowering
+    // expectations and avoid unresolved memory-space cast conversions.
+    auto workgroupMemorySpace =
+        mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), 3);
+    if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, memrefType.getShape(),
+            memrefType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    if (auto substrateType = mlir::dyn_cast<MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, substrateType.getShape(),
+            substrateType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    mlir::emitError(loc) << "expected memref-like operand";
+    return {};
+}
+
+static mlir::MemRefType getBuiltinTensorMapMemRefType(mlir::Type type) {
+    if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return builtinType;
+    }
+    if (auto substrateType = mlir::dyn_cast<MemRefType>(type)) {
+        mlir::MemRefLayoutAttrInterface layout;
+        auto strides = substrateType.getStrides();
+        if (!strides.empty()) {
+            layout = mlir::StridedLayoutAttr::get(type.getContext(),
+                                                  /*offset=*/0, strides);
+        }
+        return mlir::MemRefType::get(substrateType.getShape(),
+                                     substrateType.getElementType(), layout,
+                                     substrateType.getMemorySpace());
+    }
+    return {};
+}
+
+static std::optional<int64_t> getElementByteSize(mlir::Type elementType) {
+    if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(elementType)) {
+        auto elemBytes = getElementByteSize(vectorType.getElementType());
+        if (!elemBytes) {
+            return std::nullopt;
+        }
+        return (*elemBytes) * vectorType.getNumElements();
+    }
+    if (!elementType.isIntOrFloat()) {
+        return std::nullopt;
+    }
+    int64_t bitWidth = elementType.getIntOrFloatBitWidth();
+    if (bitWidth <= 0 || bitWidth % 8 != 0) {
+        return std::nullopt;
+    }
+    return bitWidth / 8;
+}
+
+static std::optional<int64_t> getStaticByteSize(mlir::MemRefType type) {
+    auto elemBytes = getElementByteSize(type.getElementType());
+    if (!elemBytes || !type.hasStaticShape()) {
+        return std::nullopt;
+    }
+    int64_t elemCount = 1;
+    for (auto dim : type.getShape()) {
+        if (dim == mlir::ShapedType::kDynamic) {
+            return std::nullopt;
+        }
+        elemCount *= dim;
+    }
+    return elemCount * (*elemBytes);
+}
+
+static bool extractTupleValues(mlir::Value tupleValue,
+                               llvm::SmallVectorImpl<mlir::Value> &values) {
+    if (auto tupleOp = tupleValue.getDefiningOp<MakeIntTupleOp>()) {
+        for (auto elem : tupleOp.getElements()) {
+            if (!extractTupleValues(elem, values)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    values.push_back(tupleValue);
+    return true;
+}
+
+static std::optional<int64_t> getConstantIntValue(mlir::Value value) {
+    if (!value) {
+        return std::nullopt;
+    }
+    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr =
+                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    if (auto constOp = value.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+        if (auto intAttr =
+                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    return std::nullopt;
+}
+
+static mlir::Value castToIndex(mlir::Value value, mlir::Location loc,
+                               mlir::PatternRewriter &rewriter) {
+    if (value.getType().isIndex()) {
+        return value;
+    }
+    return rewriter.create<mlir::arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), value);
+}
+
+static mlir::Value castIntegerTo(mlir::Value value, mlir::IntegerType targetType,
+                                 mlir::Location loc,
+                                 mlir::PatternRewriter &rewriter) {
+    if (value.getType() == targetType) {
+        return value;
+    }
+    if (value.getType().isIndex()) {
+        return rewriter.create<mlir::arith::IndexCastOp>(loc, targetType, value);
+    }
+    auto sourceType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!sourceType) {
+        return {};
+    }
+    unsigned sourceWidth = sourceType.getWidth();
+    unsigned targetWidth = targetType.getWidth();
+    if (sourceWidth == targetWidth) {
+        return value;
+    }
+    if (sourceWidth > targetWidth) {
+        return rewriter.create<mlir::arith::TruncIOp>(loc, targetType, value);
+    }
+    return rewriter.create<mlir::arith::ExtUIOp>(loc, targetType, value);
+}
+
+static mlir::Value castToBuiltinMemRef(mlir::Value value,
+                                       mlir::MemRefType targetType,
+                                       mlir::Location loc,
+                                       mlir::PatternRewriter &rewriter) {
+    if (!targetType) {
+        return {};
+    }
+    if (value.getType() == targetType) {
+        return value;
+    }
+    return rewriter
+        .create<AveLangMemRefCastOp>(loc, value, targetType)
+        .getResult();
+}
 
 /// Helper to convert a memref to an aligned pointer index with optional bounds
 /// checking. Returns a null Value on failure and emits a diagnostic.
@@ -469,6 +628,316 @@ class NVVMStMatrixLowering : public mlir::OpRewritePattern<NVVMStMatrixOp> {
     }
 };
 
+class NVVMWGMMADescriptorLowering
+    : public mlir::OpRewritePattern<NVVMWGMMADescriptorOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMWGMMADescriptorOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMWGMMADescriptorOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto memref = op.getMemref();
+        auto swizzle = op.getSwizzle();
+        auto l2promo = op.getL2promo();
+        auto oob = op.getOob();
+        auto interleave = op.getInterleave();
+        auto normalizedMemrefType = getBuiltinWorkgroupMemRefType(
+            memref.getType(), rewriter.getContext(), op.getLoc());
+        if (!normalizedMemrefType) {
+            return mlir::failure();
+        }
+        auto builtinMemref =
+            castToBuiltinMemRef(memref, normalizedMemrefType, op.getLoc(),
+                                rewriter);
+        if (!builtinMemref) {
+            return mlir::failure();
+        }
+
+        auto swizzleKind = (swizzle == 0) ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_NONE : (swizzle == 1) ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_32B : (swizzle == 2) ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_64B : (swizzle == 3) ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_128B : static_cast<mlir::nvgpu::TensorMapSwizzleKind>(swizzle);
+
+        auto l2promoKind = (l2promo == 0) ? mlir::nvgpu::TensorMapL2PromoKind::L2PROMO_NONE : (l2promo == 1) ? mlir::nvgpu::TensorMapL2PromoKind::L2PROMO_64B : (l2promo == 2) ? mlir::nvgpu::TensorMapL2PromoKind::L2PROMO_128B : (l2promo == 3) ? mlir::nvgpu::TensorMapL2PromoKind::L2PROMO_256B : static_cast<mlir::nvgpu::TensorMapL2PromoKind>(l2promo);
+
+        auto oobKind = (oob == 0) ?
+        mlir::nvgpu::TensorMapOOBKind::OOB_ZERO : (oob == 1) ?
+        mlir::nvgpu::TensorMapOOBKind::OOB_NAN :
+        static_cast<mlir::nvgpu::TensorMapOOBKind>(oob);
+
+        auto interleaveKind = (interleave == 0) ?
+        mlir::nvgpu::TensorMapInterleaveKind::INTERLEAVE_NONE : (interleave == 1) ?
+        mlir::nvgpu::TensorMapInterleaveKind::INTERLEAVE_16B : (interleave == 2) ?
+        mlir::nvgpu::TensorMapInterleaveKind::INTERLEAVE_32B :
+        static_cast<mlir::nvgpu::TensorMapInterleaveKind>(interleave);
+
+        auto descriptorMemrefType = normalizedMemrefType;
+        if (normalizedMemrefType.getRank() > 1 &&
+            swizzleKind != mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_NONE) {
+            auto elemBytes =
+                getElementByteSize(normalizedMemrefType.getElementType());
+            if (!elemBytes) {
+                return mlir::failure();
+            }
+            int64_t requiredLastDim = 128 / *elemBytes;
+            if (normalizedMemrefType.getShape().back() != requiredLastDim) {
+                llvm::SmallVector<int64_t> descriptorShape(
+                    normalizedMemrefType.getShape().begin(),
+                    normalizedMemrefType.getShape().end());
+                descriptorShape.back() = requiredLastDim;
+                descriptorMemrefType = mlir::MemRefType::get(
+                    descriptorShape, normalizedMemrefType.getElementType(),
+                    normalizedMemrefType.getLayout(),
+                    normalizedMemrefType.getMemorySpace());
+            }
+        }
+
+        auto descType = mlir::nvgpu::TensorMapDescriptorType::get(
+            rewriter.getContext(), descriptorMemrefType, swizzleKind,
+            l2promoKind, oobKind, interleaveKind);
+        auto desc = rewriter.create<mlir::ub::PoisonOp>(op.getLoc(), descType);
+
+        auto wgDesc = rewriter.create<mlir::nvgpu::WarpgroupGenerateDescriptorOp>(
+            op.getLoc(), op.getResult().getType(), builtinMemref,
+            desc.getResult());
+        rewriter.replaceOp(op, wgDesc.getResult());
+        return mlir::success();
+    }
+};
+
+class NVVMTMADescriptorLowering
+    : public mlir::OpRewritePattern<NVVMTMADescriptorOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMADescriptorOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMADescriptorOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto tensor = op.getMemref();
+        auto tensorType = getBuiltinTensorMapMemRefType(tensor.getType());
+        if (!tensorType) {
+            return mlir::failure();
+        }
+
+        auto layoutOp = op.getLayout().getDefiningOp<MakeLayoutOp>();
+        if (!layoutOp) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> boxDimensions;
+        if (!extractTupleValues(layoutOp.getDims(), boxDimensions) ||
+            boxDimensions.empty()) {
+            return mlir::failure();
+        }
+
+        auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+        if (!funcOp) {
+            return mlir::failure();
+        }
+
+        unsigned argIndex = funcOp.getNumArguments();
+        auto descriptorPtrType =
+            mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+        auto attrs = mlir::DictionaryAttr::get(rewriter.getContext());
+        if (mlir::failed(funcOp.insertArgument(
+                argIndex, descriptorPtrType, attrs, op.getLoc()))) {
+            return mlir::failure();
+        }
+
+        auto descriptor = rewriter.create<mlir::UnrealizedConversionCastOp>(
+            op.getLoc(), op.getResult().getType(), funcOp.getArgument(argIndex));
+        rewriter.replaceOp(op, descriptor.getResult(0));
+        return mlir::success();
+    }
+};
+
+class NVVMTMALoadLowering : public mlir::OpRewritePattern<NVVMTMALoadOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMALoadOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMALoadOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto builtinDstType = getBuiltinWorkgroupMemRefType(
+            op.getDst().getType(), rewriter.getContext(), op.getLoc());
+        if (!builtinDstType) {
+            return mlir::failure();
+        }
+        auto builtinDst =
+            castToBuiltinMemRef(op.getDst(), builtinDstType, op.getLoc(),
+                                rewriter);
+        if (!builtinDst) {
+            return mlir::failure();
+        }
+
+        auto txCount = getStaticByteSize(builtinDstType);
+        if (!txCount) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> coordinates;
+        if (!extractTupleValues(op.getCoords(), coordinates) ||
+            coordinates.empty()) {
+            return mlir::failure();
+        }
+        for (auto &coord : coordinates) {
+            coord = castToIndex(coord, op.getLoc(), rewriter);
+        }
+
+        auto descType =
+            mlir::dyn_cast<mlir::nvgpu::TensorMapDescriptorType>(
+                op.getDesc().getType());
+        if (!descType ||
+            static_cast<int64_t>(coordinates.size()) !=
+                descType.getTensor().getRank()) {
+            return mlir::failure();
+        }
+
+        auto mbarId = castToIndex(op.getMbarId(), op.getLoc(), rewriter);
+        auto predicate = castIntegerTo(op.getPredicate(), rewriter.getI1Type(),
+                                      op.getLoc(), rewriter);
+        if (!mbarId || !predicate) {
+            return mlir::failure();
+        }
+
+        auto txCountValue =
+            rewriter.create<mlir::arith::ConstantIndexOp>(op.getLoc(),
+                                                          *txCount);
+        rewriter.create<mlir::nvgpu::MBarrierArriveExpectTxOp>(
+            op.getLoc(), op.getBarrier(), txCountValue, mbarId, predicate);
+
+        mlir::Value multicastMask;
+        auto maskSentinel = getConstantIntValue(op.getMulticastMask());
+        if (!maskSentinel || *maskSentinel >= 0) {
+            multicastMask = castIntegerTo(op.getMulticastMask(),
+                                          rewriter.getI16Type(), op.getLoc(),
+                                          rewriter);
+            if (!multicastMask) {
+                return mlir::failure();
+            }
+        }
+
+        rewriter.create<mlir::nvgpu::TmaAsyncLoadOp>(
+            op.getLoc(), builtinDst, op.getBarrier(), op.getDesc(),
+            coordinates, mbarId, multicastMask, predicate);
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
+class NVVMTMAFenceLowering : public mlir::OpRewritePattern<NVVMTMAFenceOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMAFenceOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMAFenceOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto descType =
+            mlir::dyn_cast<mlir::nvgpu::TensorMapDescriptorType>(
+                op.getDesc().getType());
+        if (!descType) {
+            return mlir::failure();
+        }
+
+        rewriter.create<mlir::nvgpu::TmaFenceOp>(op.getLoc(), op.getDesc());
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
+class NVVMTMAStoreLowering : public mlir::OpRewritePattern<NVVMTMAStoreOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMAStoreOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMAStoreOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto builtinSrcType = getBuiltinWorkgroupMemRefType(
+            op.getSrc().getType(), rewriter.getContext(), op.getLoc());
+        if (!builtinSrcType) {
+            return mlir::failure();
+        }
+        auto builtinSrc =
+            castToBuiltinMemRef(op.getSrc(), builtinSrcType, op.getLoc(),
+                                rewriter);
+        if (!builtinSrc) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> coordinates;
+        if (!extractTupleValues(op.getCoords(), coordinates) ||
+            coordinates.empty()) {
+            return mlir::failure();
+        }
+        for (auto &coord : coordinates) {
+            coord = castToIndex(coord, op.getLoc(), rewriter);
+        }
+
+        auto descType =
+            mlir::dyn_cast<mlir::nvgpu::TensorMapDescriptorType>(
+                op.getDesc().getType());
+        if (!descType ||
+            static_cast<int64_t>(coordinates.size()) !=
+                descType.getTensor().getRank()) {
+            return mlir::failure();
+        }
+
+        auto predicate = castIntegerTo(op.getPredicate(), rewriter.getI1Type(),
+                                      op.getLoc(), rewriter);
+        if (!predicate) {
+            return mlir::failure();
+        }
+
+        rewriter.create<mlir::nvgpu::TmaAsyncStoreOp>(
+            op.getLoc(), builtinSrc, op.getDesc(), coordinates, predicate);
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
+class NVVMWGMMAAsyncLowering : public mlir::OpRewritePattern<NVVMWGMMAAsyncOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMWGMMAAsyncOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMWGMMAAsyncOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto wgmma = rewriter.create<mlir::nvgpu::WarpgroupMmaOp>(
+            op.getLoc(), op.getResult().getType(), op.getDescA(), op.getDescB(),
+            rewriter.getI64IntegerAttr(0), mlir::UnitAttr(),
+            rewriter.getUnitAttr(),
+            op.getMatrixC());
+        rewriter.replaceOp(op, wgmma.getResult());
+        return mlir::success();
+    }
+};
+
+class NVVMWGMMAStoreLowering : public mlir::OpRewritePattern<NVVMWGMMAStoreOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMWGMMAStoreOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMWGMMAStoreOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto desc = op.getDesc();
+        auto dst_memref = op.getDstMemref();
+        auto builtinDstType = getBuiltinWorkgroupMemRefType(
+            dst_memref.getType(), rewriter.getContext(), op.getLoc());
+        if (!builtinDstType) {
+            return mlir::failure();
+        }
+        auto builtinDst =
+            castToBuiltinMemRef(dst_memref, builtinDstType, op.getLoc(),
+                                rewriter);
+        if (!builtinDst) {
+            return mlir::failure();
+        }
+
+        rewriter.create<mlir::nvgpu::WarpgroupMmaStoreOp>(op.getLoc(), desc,
+                                                          builtinDst);
+
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
 class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
   public:
     using mlir::OpRewritePattern<AMDGPUMfmaOp>::OpRewritePattern;
@@ -602,7 +1071,11 @@ class LowerAveLangGPUToIntrinsicsPass
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, AMDGPUMfmaLowering,
+                     NVVMStMatrixLowering, NVVMWGMMADescriptorLowering,
+                     NVVMTMADescriptorLowering, NVVMTMALoadLowering,
+                     NVVMTMAFenceLowering, NVVMTMAStoreLowering,
+                     NVVMWGMMAAsyncLowering,
+                     NVVMWGMMAStoreLowering, AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 

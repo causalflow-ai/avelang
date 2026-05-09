@@ -171,3 +171,104 @@ def erf(x):
 def sqrt(x):
     """Compute sqrt(x) for scalar GPU values."""
     pass
+
+
+def composition(lhs, rhs):
+    """Compose two static layouts."""
+    pass
+
+
+def complement(layout, size: int):
+    """Compute a complement layout within the given static size."""
+    pass
+
+
+def coalesce(layout):
+    """Coalesce adjacent layout dimensions when possible."""
+    pass
+
+
+def product(lhs, rhs):
+    """Compute the product of two static layouts."""
+    pass
+
+
+def divide(lhs, rhs):
+    """Divide one static layout by another."""
+    pass
+
+
+class _NVVMModule:
+    def wgmma_fence_aligned(self):
+        pass
+
+    def wgmma_group_sync_aligned(self):
+        pass
+
+    def wgmma_wait_group_sync(self, group: int):
+        pass
+
+    def make_wgmma_descriptor(
+        self, tensor, swizzle_kind: int, l2promo_kind: int, oob_kind: int,
+        interleave_kind: int
+    ):
+        pass
+
+    def make_tma_descriptor(self, tensor, smem_layout):
+        pass
+
+    def tma_fence(self, desc):
+        pass
+
+    def tma_load(
+        self, dst, desc, coords, barrier, mbar_id=0, predicate=True,
+        multicast_mask=None
+    ):
+        pass
+
+    def tma_store(self, src, desc, coords, predicate=True):
+        pass
+
+    def wgmma_async(self, desc_a, desc_b, acc):
+        pass
+
+    def wgmma_init_accumulator(self, m: int, n: int):
+        pass
+
+    def wgmma_store(self, acc, dst):
+        pass
+
+    def cp_async_ca_shared_global(
+        self, dst, src, dst_offset_bytes, src_offset_bytes, size_bytes: int
+    ):
+        pass
+
+    def cp_async_commit_group(self):
+        pass
+
+    def cp_async_wait_group(self, n: int):
+        pass
+
+    def mbarrier_create(self):
+        pass
+
+    def mbarrier_init(self, barrier, mbar_id: int, count: int = 0,
+                      predicate: int = True):
+        pass
+
+    def mbarrier_try_wait_parity(self, barrier, parity: int, ticks: int,
+                                 mbar_id: int):
+        pass
+
+    def mbarrier_arrive(self, barrier, mbar_id: int):
+        pass
+
+    def mbarrier_test_wait(self, barrier, token, mbar_id: int):
+        pass
+
+    def mbarrier_arrive_expect_tx(self, barrier, txcount: int, mbar_id: int,
+                                  predicate: int):
+        pass
+
+
+nvvm = _NVVMModule()
