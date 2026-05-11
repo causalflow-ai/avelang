@@ -31,6 +31,9 @@ SHM_TOTAL_BF16_A = SHM_GROUPS_A * SHM_GROUP_BF16
 SHM_TOTAL_BF16_B = SHM_GROUPS_B * SHM_GROUP_BF16
 SHM_CHUNKS_PER_ROW = GROUP_K // VEC_SIZE
 
+MI300_CU_COUNT = 38 * 8
+WGM_XCC = 8
+
 SCHED_MASK_MFMA = 0x8
 SCHED_MASK_BUFFER_LOAD = 0x20
 SCHED_MASK_DS_READ = 0x100
@@ -45,8 +48,8 @@ def _wgm_mapping(m: al.u32, n: al.u32) -> (al.u32, al.u32):
 
     total_groups = m_groups * n_groups
 
-    cu_count = al.convert(38 * 8, al.u32)
-    wgm_xcc = al.convert(8, al.u32)
+    cu_count = al.convert(MI300_CU_COUNT, al.u32)
+    wgm_xcc = al.convert(WGM_XCC, al.u32)
     workgroup_mapping = al.convert(32, al.u32)
 
     linear_group_limit = (total_groups // wgm_xcc) * wgm_xcc
