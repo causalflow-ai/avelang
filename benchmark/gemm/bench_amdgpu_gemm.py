@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import sys
-from pathlib import Path
-
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON_DIR = REPO_ROOT / "python"
-if PYTHON_DIR.exists():
-    sys.path.insert(0, str(PYTHON_DIR))
-
 from avelang_kernels import amdgpu_gemm
 
 

@@ -35,11 +35,10 @@ SCHED_MASK_MFMA = 0x8
 SCHED_MASK_BUFFER_LOAD = 0x20
 SCHED_MASK_DS_READ = 0x100
 SCHED_MASK_DS_WRITE = 0x200
-SCHED_MASK_S_BARRIER = 0x0
 
 
 @avelang.jit
-def wgm_mapping(m: al.u32, n: al.u32) -> (al.u32, al.u32):
+def _wgm_mapping(m: al.u32, n: al.u32) -> (al.u32, al.u32):
     linear_group_id = al.block_id(0)
     m_groups = m // GROUP_M
     n_groups = n // GROUP_N
@@ -89,7 +88,7 @@ def wgm_mapping(m: al.u32, n: al.u32) -> (al.u32, al.u32):
 
 
 @avelang.jit
-def load_global_a(
+def _load_global_a(
     src_rsrc: al.Tensor((4,), al.u32),
     k: al.u32,
     group_row: al.u32,
@@ -117,7 +116,7 @@ def load_global_a(
 
 
 @avelang.jit
-def load_global_b(
+def _load_global_b(
     src_rsrc: al.Tensor((4,), al.u32),
     k: al.u32,
     group_row: al.u32,
@@ -145,7 +144,7 @@ def load_global_b(
 
 
 @avelang.jit
-def store_shm_a(
+def _store_shm_a(
     shm: al.Tensor((SHM_TOTAL_BF16_A,), al.bf16),
     reg: al.Tensor((REG_ROWS_A, VEC_SIZE), al.bf16),
     tid: al.u32,
@@ -179,7 +178,7 @@ def store_shm_a(
 
 
 @avelang.jit
-def store_shm_b(
+def _store_shm_b(
     shm: al.Tensor((SHM_TOTAL_BF16_B,), al.bf16),
     reg: al.Tensor((REG_ROWS_B, VEC_SIZE), al.bf16),
     tid: al.u32,
@@ -213,7 +212,7 @@ def store_shm_b(
 
 
 @avelang.jit
-def load_shm_to_regs_batch_a(
+def _load_shm_to_regs_batch_a(
     shm: al.Tensor((SHM_TOTAL_BF16_A,), al.bf16),
     row_base: al.u32,
     batch_id: al.u32,
@@ -240,7 +239,7 @@ def load_shm_to_regs_batch_a(
 
 
 @avelang.jit
-def load_shm_to_regs_batch_b(
+def _load_shm_to_regs_batch_b(
     shm: al.Tensor((SHM_TOTAL_BF16_B,), al.bf16),
     row_base: al.u32,
     batch_id: al.u32,
@@ -267,7 +266,7 @@ def load_shm_to_regs_batch_b(
 
 
 @avelang.jit
-def matmul_from_regs_batch(
+def _matmul_from_regs_batch(
     data_a: al.Tensor((M_TILES_PER_WARP, 4), al.u32),
     data_b: al.Tensor((N_TILES_PER_WARP, 4), al.u32),
     acc: al.Tensor((M_TILES_PER_WARP, N_TILES_PER_WARP, 4), al.f32),
@@ -289,7 +288,7 @@ def matmul_from_regs_batch(
 
 
 @avelang.jit
-def write_results(
+def _write_results(
     dst_rsrc: al.Tensor((4,), al.u32),
     n: al.u32,
     group_m: al.u32,
@@ -327,59 +326,17 @@ def write_results(
             al.amdgpu.raw_buffer_store_x2(packed, dst_rsrc, thread_offset, warp_offset, 0)
 
 
-
 @avelang.jit
-def hot_loop_scheduler():
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-
+def _hot_loop_scheduler():
     for _ in al.range(8):
         al.amdgpu.sched_group_barrier(SCHED_MASK_DS_READ, 1, 0)
         al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 2, 0)
 
-    al.amdgpu.sched_group_barrier(SCHED_MASK_S_BARRIER, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 2, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 2, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 2, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
-    al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
-
-    al.amdgpu.sched_group_barrier(SCHED_MASK_S_BARRIER, 1, 0)
+    for _ in al.range(8):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_DS_WRITE, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_BUFFER_LOAD, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, 3, 0)
 
     for _ in al.range(8):
         al.amdgpu.sched_group_barrier(SCHED_MASK_DS_READ, 1, 0)
@@ -403,7 +360,7 @@ def _gemm_pipeline_transposed_b_kernel(
 
     m_groups = (m + GROUP_M - 1) // GROUP_M
     n_groups = (n + GROUP_N - 1) // GROUP_N
-    group_m, group_n = wgm_mapping(m, n)
+    group_m, group_n = _wgm_mapping(m, n)
 
     a_tensor = al.make_tensor(A, al.bf16, al.make_layout((m, k), (k, 1)))
     b_tensor = al.make_tensor(B, al.bf16, al.make_layout((n, k), (k, 1)))
@@ -429,70 +386,70 @@ def _gemm_pipeline_transposed_b_kernel(
 
     k_total = k // GROUP_K
 
-    load_global_a(a_rsrc, k, group_m, 0, tid, reg_a)
-    load_global_b(b_rsrc, k, group_n, 0, tid, reg_b)
-    store_shm_a(shm_a, reg_a, tid)
-    store_shm_b(shm_b, reg_b, tid)
+    _load_global_a(a_rsrc, k, group_m, 0, tid, reg_a)
+    _load_global_b(b_rsrc, k, group_n, 0, tid, reg_b)
+    _store_shm_a(shm_a, reg_a, tid)
+    _store_shm_b(shm_b, reg_b, tid)
     al.syncthreads()
 
-    load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
-    load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
-    load_global_a(a_rsrc, k, group_m, 1, tid, reg_a)
-    load_global_b(b_rsrc, k, group_n, 1, tid, reg_b)
+    _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
+    _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
+    _load_global_a(a_rsrc, k, group_m, 1, tid, reg_a)
+    _load_global_b(b_rsrc, k, group_n, 1, tid, reg_b)
 
     for k_idx in al.range(0, k_total - 3, 2):
-        load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
-        load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
-        matmul_from_regs_batch(data_a0, data_b0, acc)
+        _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
+        _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
+        _matmul_from_regs_batch(data_a0, data_b0, acc)
         al.syncthreads()
 
-        store_shm_a(shm_a, reg_a, tid)
-        store_shm_b(shm_b, reg_b, tid)
-        load_global_a(a_rsrc, k, group_m, k_idx + 2, tid, reg_a)
-        load_global_b(b_rsrc, k, group_n, k_idx + 2, tid, reg_b)
+        _store_shm_a(shm_a, reg_a, tid)
+        _store_shm_b(shm_b, reg_b, tid)
+        _load_global_a(a_rsrc, k, group_m, k_idx + 2, tid, reg_a)
+        _load_global_b(b_rsrc, k, group_n, k_idx + 2, tid, reg_b)
         al.syncthreads()
 
-        load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
-        load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
-        matmul_from_regs_batch(data_a1, data_b1, acc)
+        _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
+        _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
+        _matmul_from_regs_batch(data_a1, data_b1, acc)
 
-        load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
-        load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
-        matmul_from_regs_batch(data_a0, data_b0, acc)
+        _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
+        _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
+        _matmul_from_regs_batch(data_a0, data_b0, acc)
         al.syncthreads()
 
-        store_shm_a(shm_a, reg_a, tid)
-        store_shm_b(shm_b, reg_b, tid)
-        load_global_a(a_rsrc, k, group_m, k_idx + 3, tid, reg_a)
-        load_global_b(b_rsrc, k, group_n, k_idx + 3, tid, reg_b)
+        _store_shm_a(shm_a, reg_a, tid)
+        _store_shm_b(shm_b, reg_b, tid)
+        _load_global_a(a_rsrc, k, group_m, k_idx + 3, tid, reg_a)
+        _load_global_b(b_rsrc, k, group_n, k_idx + 3, tid, reg_b)
         al.syncthreads()
 
-        load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
-        load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
-        matmul_from_regs_batch(data_a1, data_b1, acc)
+        _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
+        _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
+        _matmul_from_regs_batch(data_a1, data_b1, acc)
 
-        hot_loop_scheduler()
-        hot_loop_scheduler()
+        _hot_loop_scheduler()
+        _hot_loop_scheduler()
 
-    load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
-    load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
-    matmul_from_regs_batch(data_a0, data_b0, acc)
+    _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
+    _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
+    _matmul_from_regs_batch(data_a0, data_b0, acc)
     al.syncthreads()
 
-    store_shm_a(shm_a, reg_a, tid)
-    store_shm_b(shm_b, reg_b, tid)
+    _store_shm_a(shm_a, reg_a, tid)
+    _store_shm_b(shm_b, reg_b, tid)
     al.syncthreads()
 
-    load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
-    load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
-    matmul_from_regs_batch(data_a1, data_b1, acc)
+    _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 0, wtid, data_a0)
+    _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 0, wtid, data_b0)
+    _matmul_from_regs_batch(data_a1, data_b1, acc)
 
-    load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
-    load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
-    matmul_from_regs_batch(data_a0, data_b0, acc)
-    matmul_from_regs_batch(data_a1, data_b1, acc)
+    _load_shm_to_regs_batch_a(shm_a, warp_row * WARP_MAT_M, 1, wtid, data_a1)
+    _load_shm_to_regs_batch_b(shm_b, warp_col * WARP_MAT_N, 1, wtid, data_b1)
+    _matmul_from_regs_batch(data_a0, data_b0, acc)
+    _matmul_from_regs_batch(data_a1, data_b1, acc)
 
-    write_results(c_rsrc, n, group_m, group_n, wtid, warp_row, warp_col, acc)
+    _write_results(c_rsrc, n, group_m, group_n, wtid, warp_row, warp_col, acc)
 
 
 def gemm_pipeline_transposed_b(
