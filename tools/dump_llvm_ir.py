@@ -202,12 +202,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--target-triple",
-        default="nvptx64-nvidia-cuda",
+        default="amdgcn-amd-amdhsa",
         help="Target triple (default: nvptx64-nvidia-cuda for NVIDIA, amdgcn-amd-amdhsa for AMDGPU)",
     )
     parser.add_argument(
         "--target-chipset",
-        default="sm_80",
+        default="gfx90a",
         help="Target GPU chipset (default: sm_80 for NVIDIA, gfx90a for AMDGPU)",
     )
     parser.add_argument(
