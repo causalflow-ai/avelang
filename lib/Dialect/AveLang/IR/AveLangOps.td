@@ -257,6 +257,30 @@ def NVVMStMatrixOp : AveLang_GPU_Op<"nvvm_stmatrix", []> {
     let hasVerifier = 1;
 }
 
+
+def NVVMTMADescriptorOp : AveLang_GPU_Op<"nvvm_tma_descriptor", []> {
+    let summary = "NVVM TMA Descriptor operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_descriptor` operation creates an NVGPU
+        tensor-map descriptor for Tensor Memory Access from a memref operand.
+        Box dimensions are derived from the provided shared-memory layout.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$memref,
+        AnyType:$layout
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $memref `,` $layout attr-dict `:` type($memref) `,` type($layout)
+        `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//
