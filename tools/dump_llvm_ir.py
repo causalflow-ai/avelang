@@ -176,7 +176,7 @@ def main() -> int:
             "  # Dump LLVM IR from a file (specify function separately)\n"
             "  dump_llvm_ir.py path/to/kernel.py my_kernel\n\n"
             "  # Dump LLVM IR using module path syntax\n"
-            "  dump_llvm_ir.py avelang_kernels.amdgpu_gemm:_gemm_1stage_pipeline_kernel\n\n"
+            "  dump_llvm_ir.py avelang_kernels.amdgpu_gemm:_gemm_pipeline_transposed_b_kernel\n\n"
             "  # Dump LLVM IR from file with inline function specification\n"
             "  dump_llvm_ir.py path/to/kernel.py:my_kernel\n\n"
             "  # List all JIT functions in a module\n"
@@ -202,12 +202,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--target-triple",
-        default="nvptx64-nvidia-cuda",
+        default="amdgcn-amd-amdhsa",
         help="Target triple (default: nvptx64-nvidia-cuda for NVIDIA, amdgcn-amd-amdhsa for AMDGPU)",
     )
     parser.add_argument(
         "--target-chipset",
-        default="sm_80",
+        default="gfx90a",
         help="Target GPU chipset (default: sm_80 for NVIDIA, gfx90a for AMDGPU)",
     )
     parser.add_argument(
