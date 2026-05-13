@@ -44,6 +44,7 @@ from .core import (
     log2,
     erf,
     sqrt,
+    nvvm,
 )
 
 __all__ = [
@@ -86,4 +87,5 @@ __all__ = [
     "log2",
     "erf",
     "sqrt",
+    "nvvm",
 ]

@@ -171,3 +171,23 @@ def erf(x):
 def sqrt(x):
     """Compute sqrt(x) for scalar GPU values."""
     pass
+
+
+class _NVVMModule:
+    def make_tma_descriptor(self, tensor, smem_layout):
+        pass
+
+    def tma_fence(self, desc):
+        pass
+
+    def tma_load(
+        self, dst, desc, coords, barrier, mbar_id=0, predicate=True,
+        multicast_mask=None
+    ):
+        pass
+
+    def tma_store(self, src, desc, coords, predicate=True):
+        pass
+    
+
+nvvm = _NVVMModule()
