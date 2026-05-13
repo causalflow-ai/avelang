@@ -344,6 +344,9 @@ class NvidiaDriver(GPUDriver):
             raise RuntimeError("No CUDA device available for NvidiaDriver.")
 
         major, minor = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name().lower()
         arch = f"sm_{major}{minor}"
+        if major == 9 and ("h100" in name or "h800" in name):
+            arch = "sm_90a"
 
         return GPUTarget("nvptx64-nvidia-cuda", arch)
