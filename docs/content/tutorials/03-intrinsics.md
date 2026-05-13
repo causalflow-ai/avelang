@@ -207,6 +207,9 @@ The launch grid now comes from the runtime shape:
 m = 128
 n = 128
 k = 128
+
+A = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+B = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
 C = torch.empty((m, n), dtype=torch.float32, device="cuda")
 
 grid_x = n // 32

@@ -16,13 +16,13 @@ import avelang.language as al
 
 @avelang.jit
 def axpy(a: al.i32, b: al.i32, n: al.i32,
-         x: al.Tensor((32,), al.i32), y: al.Tensor((32,), al.i32)):
+         x: al.Tensor((256,), al.i32), y: al.Tensor((256,), al.i32)):
     idx = al.block_id(0) * al.block_dim(0) + al.thread_id(0)
     if idx < n:
         y[idx] = a * x[idx] + b
 ```
 
-In the program above, the type annotation `al.i32` denotes the 32-bit integer type. `al.Tensor((32,), al.i32)` specfies that both `x` and `y` are a tensor with 32 elements of integers. Ave exposes `al.block_id(0)`, `al.block_dim(0)`, and `al.thread_id(0)` like CUDA and HIP to give the program explicit controls of the GPU. 
+In the program above, the type annotation `al.i32` denotes the 32-bit integer type. `al.Tensor((256,), al.i32)` specfies that both `x` and `y` are a tensor with 256 elements of integers. Ave exposes `al.block_id(0)`, `al.block_dim(0)`, and `al.thread_id(0)` like CUDA and HIP to give the program explicit controls of the GPU. 
 
 You can execute the kernel by providing the desired shapes of the grids and blocks just like executing a Triton function: 
 
