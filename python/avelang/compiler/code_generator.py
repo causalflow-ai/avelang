@@ -228,6 +228,13 @@ def _collect_jit_dependencies(jit_fn) -> list:
     return ordered
 
 
+def _has_constexpr_params(jit_fn) -> bool:
+    return any(
+        getattr(param, "is_constexpr", False)
+        for param in getattr(jit_fn, "params", [])
+    )
+
+
 def _build_import_module(jit_fns: list) -> ast.Module:
     import_nodes = []
     seen_imports = set()
@@ -264,6 +271,8 @@ def compile_to_binary(src, target, opt_level: int = 2, options=None):
         generator.add_jit_dependency(dep.parse())
 
     for dep in jit_deps:
+        if _has_constexpr_params(dep):
+            continue
         dep_func = _get_function_def(dep.parse())
         dep_globals = {}
         collect_globals = getattr(dep, "_collect_global_constexprs", None)

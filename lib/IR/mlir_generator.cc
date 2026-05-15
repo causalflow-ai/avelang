@@ -31,6 +31,7 @@
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <cctype>
 #include <limits>
 #include <memory>
 #include <string>
@@ -241,6 +242,37 @@ static std::string AddressSpaceTag(mlir::Attribute memorySpace) {
     return "unknown";
 }
 
+static std::string ConstexprTag(llvm::StringRef name, mlir::Attribute value) {
+    std::string tag = "c";
+    tag.append(name.begin(), name.end());
+    tag.push_back('_');
+    if (auto intAttr = mlir::dyn_cast_or_null<mlir::IntegerAttr>(value)) {
+        auto v = intAttr.getInt();
+        if (v < 0) {
+            tag.append("neg");
+            tag.append(std::to_string(-v));
+        } else {
+            tag.append(std::to_string(v));
+        }
+        return tag;
+    }
+    if (auto floatAttr = mlir::dyn_cast_or_null<mlir::FloatAttr>(value)) {
+        std::string buffer;
+        llvm::raw_string_ostream os(buffer);
+        floatAttr.getValue().print(os);
+        os.flush();
+        for (char &ch : buffer) {
+            if (!std::isalnum(static_cast<unsigned char>(ch))) {
+                ch = '_';
+            }
+        }
+        tag.append(buffer);
+        return tag;
+    }
+    tag.append("unknown");
+    return tag;
+}
+
 llvm::SmallVector<std::string, 4>
 MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
     ast::FunctionDef *func,
@@ -272,8 +304,38 @@ MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
     return tags;
 }
 
+llvm::SmallVector<std::string, 4> MLIRGeneratorImpl::GetFunctionConstexprTags(
+    ast::FunctionDef *func,
+    const ConstexprBindingMap *constexpr_bindings) const {
+    llvm::SmallVector<std::string, 4> tags;
+    if (!func || !constexpr_bindings || constexpr_bindings->empty()) {
+        return tags;
+    }
+    auto *args = func->GetArguments();
+    if (!args) {
+        return tags;
+    }
+    for (auto *arg : args->GetArgs()) {
+        if (!arg) {
+            continue;
+        }
+        auto *attr_expr =
+            llvm::dyn_cast_or_null<ast::AttributeExpr>(arg->GetAnnotation());
+        if (!attr_expr || attr_expr->GetAttr() != "constexpr") {
+            continue;
+        }
+        auto it = constexpr_bindings->find(arg->GetArgName());
+        if (it == constexpr_bindings->end()) {
+            continue;
+        }
+        tags.push_back(ConstexprTag(arg->GetArgName(), it->second));
+    }
+    return tags;
+}
+
 std::string MLIRGeneratorImpl::GetFunctionScopeName(
-    ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces) {
+    ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces,
+    const ConstexprBindingMap *constexpr_bindings) {
     if (!func) {
         return {};
     }
@@ -282,12 +344,15 @@ std::string MLIRGeneratorImpl::GetFunctionScopeName(
         return {};
     }
     auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
+    auto constexpr_tags = GetFunctionConstexprTags(func, constexpr_bindings);
+    tags.append(constexpr_tags.begin(), constexpr_tags.end());
     return MangleFunctionName({}, name, tags);
 }
 
 std::string MLIRGeneratorImpl::GetMangledFunctionName(
     ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces,
-    llvm::StringRef name_prefix) {
+    llvm::StringRef name_prefix,
+    const ConstexprBindingMap *constexpr_bindings) {
     if (!func) {
         return {};
     }
@@ -300,6 +365,8 @@ std::string MLIRGeneratorImpl::GetMangledFunctionName(
         scope.push_back(name_prefix.str());
     }
     auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
+    auto constexpr_tags = GetFunctionConstexprTags(func, constexpr_bindings);
+    tags.append(constexpr_tags.begin(), constexpr_tags.end());
     return MangleFunctionName(scope, name, tags);
 }
 

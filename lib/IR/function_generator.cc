@@ -98,12 +98,14 @@ CanImplicitlyDemoteConstantWithoutPrecisionLoss(mlir::Value value,
 FunctionGenerator::FunctionGenerator(MLIRGeneratorImpl &parent,
                                      MLIRGenerator::FunctionType function_type,
                                      ArgAddressSpaceMap argument_address_spaces,
-                                     std::string name_prefix)
+                                     std::string name_prefix,
+                                     ConstexprBindingMap constexpr_bindings)
     : parent_(parent), ctx_(parent.ctx_),
       builder_(parent.ctx_->ir_context->GetMLIRContext()),
       expr_generator_(this), function_type_(function_type),
       name_prefix_(std::move(name_prefix)),
-      argument_address_spaces_(std::move(argument_address_spaces)) {
+      argument_address_spaces_(std::move(argument_address_spaces)),
+      constexpr_bindings_(std::move(constexpr_bindings)) {
     SS_ASSERT(ctx_);
 }
 
@@ -118,6 +120,21 @@ FunctionGenerator::GetMLIRLocation(clang::SourceLocation loc) const {
 }
 
 mlir::ModuleOp FunctionGenerator::GetModule() const { return parent_.module_; }
+
+std::optional<int64_t>
+FunctionGenerator::LookupConstexprInteger(llvm::StringRef name) const {
+    auto it = constexpr_bindings_.find(name.str());
+    if (it == constexpr_bindings_.end() || !it->second) {
+        return std::nullopt;
+    }
+    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(it->second)) {
+        return intAttr.getInt();
+    }
+    if (auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(it->second)) {
+        return boolAttr.getValue() ? 1 : 0;
+    }
+    return std::nullopt;
+}
 
 mlir::Value FunctionGenerator::GenerateExpr(ast::Expr *expr) {
     if (!expr) {
@@ -136,10 +153,11 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     }
 
     mlir::OpBuilder::InsertionGuard insertion_guard(builder_);
+    auto generator_guard = ctx_->GetFunctionGeneratorGuard(this);
 
     current_func_ = func;
-    local_symbol_scope_name_ =
-        parent_.GetFunctionScopeName(func, &argument_address_spaces_);
+    local_symbol_scope_name_ = parent_.GetFunctionScopeName(
+        func, &argument_address_spaces_, &constexpr_bindings_);
     qualified_scope_prefix_ = name_prefix_;
     if (!local_symbol_scope_name_.empty()) {
         if (!qualified_scope_prefix_.empty()) {
@@ -290,8 +308,9 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
     std::string mangled_name;
     if (function_type_ == MLIRGenerator::FunctionType::kPrivateFunction) {
-        mangled_name = parent_.GetMangledFunctionName(
-            func, &argument_address_spaces_, name_prefix_);
+        mangled_name =
+            parent_.GetMangledFunctionName(func, &argument_address_spaces_,
+                                           name_prefix_, &constexpr_bindings_);
         if (mangled_name.empty()) {
             ctx_->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
@@ -328,7 +347,6 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     }
     auto &body_block = func_op.getFunctionBody().emplaceBlock();
 
-    auto generator_guard = ctx_->GetFunctionGeneratorGuard(this);
     SymbolTable::FrameGuard guard(ctx_->syms.get());
 
     builder_.setInsertionPointToStart(&entry_block);
@@ -342,6 +360,21 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     // arguments here are runtime parameters that need to be defined.
     for (size_t i = 0; i < argNames.size(); ++i) {
         ctx_->syms->DefineSymbol(argNames[i], entry_block.getArgument(i));
+    }
+
+    for (const auto &[name, attr] : constexpr_bindings_) {
+        if (!attr) {
+            continue;
+        }
+        auto typed_attr = mlir::dyn_cast<mlir::TypedAttr>(attr);
+        if (!typed_attr) {
+            continue;
+        }
+        auto const_value = mlir::arith::ConstantOp::create(
+            builder_, ctx_->GetMLIRLocation(builder_.getContext(), func),
+            typed_attr);
+        ctx_->syms->GetCurrentFrame().AddValue(name, const_value,
+                                               /*immutable=*/true);
     }
 
     for (auto *stmt : func->GetBody()) {

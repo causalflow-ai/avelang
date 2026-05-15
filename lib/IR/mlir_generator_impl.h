@@ -38,6 +38,7 @@ namespace causalflow::avelang::ir {
 class MLIRGeneratorImpl;
 class FunctionGenerator;
 using ArgAddressSpaceMap = std::unordered_map<std::string, mlir::Attribute>;
+using ConstexprBindingMap = std::unordered_map<std::string, mlir::Attribute>;
 
 class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
   public:
@@ -58,6 +59,9 @@ class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
 
     mlir::Value GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
                                  llvm::ArrayRef<mlir::Value> resolved_args);
+    mlir::Value GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
+                                 llvm::ArrayRef<mlir::Value> resolved_args,
+                                 llvm::ArrayRef<ast::Expr *> source_arg_exprs);
     mlir::Value
     GenerateJitFunctionCall(ast::Call *call, ast::FunctionDef *func,
                             llvm::ArrayRef<mlir::Value> resolved_args);
@@ -83,7 +87,8 @@ class FunctionGenerator : public ast::ASTVisitor<FunctionGenerator> {
     explicit FunctionGenerator(MLIRGeneratorImpl &parent,
                                MLIRGenerator::FunctionType function_type,
                                ArgAddressSpaceMap argument_address_spaces = {},
-                               std::string name_prefix = {});
+                               std::string name_prefix = {},
+                               ConstexprBindingMap constexpr_bindings = {});
 
     MLIRGeneratorImpl &GetParent() { return parent_; }
     GeneratorContext *GetContext() { return ctx_; }
@@ -113,6 +118,8 @@ class FunctionGenerator : public ast::ASTVisitor<FunctionGenerator> {
     const ast::FunctionDef *GetCurrentFunctionDef() const {
         return current_func_;
     }
+    std::optional<int64_t>
+    LookupConstexprInteger(llvm::StringRef name) const;
 
   private:
     mlir::Value GenerateExpr(ast::Expr *expr);
@@ -153,6 +160,7 @@ class FunctionGenerator : public ast::ASTVisitor<FunctionGenerator> {
     std::string qualified_scope_prefix_;
     const ast::FunctionDef *current_func_ = nullptr;
     ArgAddressSpaceMap argument_address_spaces_;
+    ConstexprBindingMap constexpr_bindings_;
     mlir::Block *entry_block_ = nullptr;
 };
 
@@ -172,13 +180,18 @@ class MLIRGeneratorImpl {
     std::string GetMangledFunctionName(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces = nullptr,
-        llvm::StringRef name_prefix = {});
+        llvm::StringRef name_prefix = {},
+        const ConstexprBindingMap *constexpr_bindings = nullptr);
     std::string GetFunctionScopeName(
         ast::FunctionDef *func,
-        const ArgAddressSpaceMap *arg_address_spaces = nullptr);
+        const ArgAddressSpaceMap *arg_address_spaces = nullptr,
+        const ConstexprBindingMap *constexpr_bindings = nullptr);
     llvm::SmallVector<std::string, 4> GetFunctionAddressSpaceTags(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces) const;
+    llvm::SmallVector<std::string, 4> GetFunctionConstexprTags(
+        ast::FunctionDef *func,
+        const ConstexprBindingMap *constexpr_bindings) const;
     std::string getArgName(ast::ASTNode *arg);
     void HandleImport(ast::Import *import_stmt);
     void HandleImportFrom(ast::ImportFrom *import_from_stmt);
