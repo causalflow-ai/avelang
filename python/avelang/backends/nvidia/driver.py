@@ -1,6 +1,7 @@
 import os
 import functools
 import subprocess
+import ast
 from pathlib import Path
 
 import torch
@@ -61,6 +62,8 @@ LAUNCHER_PROLOGUE = """
 #include <cuda.h>
 #include <Python.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 static inline void gpuAssert(CUresult code, const char *file, int line)
 {
@@ -98,6 +101,20 @@ typedef struct _DevicePtrInfo {
     CUdeviceptr dev_ptr;
     bool valid;
 } DevicePtrInfo;
+
+typedef struct _TmaCleanupData {
+    CUdeviceptr dev_ptr;
+} TmaCleanupData;
+
+static void CUDA_CB cleanupTmaDescriptor(void *userData) {
+  TmaCleanupData *data = (TmaCleanupData *)userData;
+  if (data) {
+    if (data->dev_ptr) {
+      cuMemFree(data->dev_ptr);
+    }
+    PyMem_RawFree(data);
+  }
+}
 
 static PyObject* data_ptr_str = NULL;
 
@@ -172,7 +189,126 @@ PyMODINIT_FUNC PyInit___avelang_launcher(void) {
 """
 
 
-def make_launcher(constants, signature) -> str:
+def _literal_int_tuple(node):
+    if not isinstance(node, ast.Tuple):
+        return None
+    values = []
+    for elt in node.elts:
+        if not isinstance(elt, ast.Constant) or not isinstance(elt.value, int):
+            return None
+        values.append(elt.value)
+    return tuple(values)
+
+
+def _is_attr_call(node, name):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == name
+    )
+
+
+def _dtype_to_tma_enum(dtype):
+    name = getattr(dtype, "name", str(dtype))
+    return {
+        "u8": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+        "u16": "CU_TENSOR_MAP_DATA_TYPE_UINT16",
+        "u32": "CU_TENSOR_MAP_DATA_TYPE_UINT32",
+        "i32": "CU_TENSOR_MAP_DATA_TYPE_INT32",
+        "u64": "CU_TENSOR_MAP_DATA_TYPE_UINT64",
+        "i64": "CU_TENSOR_MAP_DATA_TYPE_INT64",
+        "fp16": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+        "fp32": "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
+        "fp64": "CU_TENSOR_MAP_DATA_TYPE_FLOAT64",
+        "bf16": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+    }.get(name)
+
+
+def _dtype_size(dtype):
+    name = getattr(dtype, "name", str(dtype))
+    return {
+        "u8": 1,
+        "u16": 2,
+        "u32": 4,
+        "i32": 4,
+        "u64": 8,
+        "i64": 8,
+        "fp16": 2,
+        "fp32": 4,
+        "fp64": 8,
+        "bf16": 2,
+    }.get(name)
+
+
+def _default_strides(shape):
+    stride = 1
+    strides = []
+    for dim in reversed(shape):
+        strides.append(stride)
+        stride *= dim
+    return tuple(reversed(strides))
+
+
+def collect_tma_descriptor_specs(src):
+    arg_names = list(src.fn.signature.parameters.keys())
+    arg_indices = {name: idx for idx, name in enumerate(arg_names)}
+    layout_dims = {}
+    specs = []
+
+    def dims_from_layout(node):
+        if isinstance(node, ast.Name):
+            return layout_dims.get(node.id)
+        if _is_attr_call(node, "make_layout") and node.args:
+            return _literal_int_tuple(node.args[0])
+        return None
+
+    class Visitor(ast.NodeVisitor):
+        def visit_Assign(self, node):
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _is_attr_call(node.value, "make_layout")
+                and node.value.args
+            ):
+                dims = _literal_int_tuple(node.value.args[0])
+                if dims is not None:
+                    layout_dims[node.targets[0].id] = dims
+            self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if _is_attr_call(node, "make_tma_descriptor") and len(node.args) >= 2:
+                tensor_node = node.args[0]
+                if isinstance(tensor_node, ast.Name) and tensor_node.id in arg_indices:
+                    box_dims = dims_from_layout(node.args[1])
+                    annotation = src.fn.signature.parameters[tensor_node.id].annotation
+                    shape = getattr(annotation, "shape", None)
+                    element_ty = getattr(annotation, "element_ty", None)
+                    tma_dtype = _dtype_to_tma_enum(element_ty)
+                    elem_size = _dtype_size(element_ty)
+                    if box_dims and shape and tma_dtype and elem_size:
+                        shape = tuple(shape)
+                        strides = _default_strides(shape)
+                        specs.append(
+                            {
+                                "arg_index": arg_indices[tensor_node.id],
+                                "rank": len(shape),
+                                "global_dims": tuple(reversed(shape)),
+                                "global_strides": tuple(
+                                    stride * elem_size for stride in reversed(strides[:-1])
+                                ),
+                                "box_dims": tuple(reversed(box_dims)),
+                                "dtype": tma_dtype,
+                            }
+                        )
+            self.generic_visit(node)
+
+    Visitor().visit(src.fn.parse())
+    return specs
+
+
+def make_launcher(constants, signature, tma_specs=None) -> str:
+    tma_specs = tma_specs or []
+
     def ty_to_cpp(ty):
         TYPE_MAP = {
             "i32": "int",
@@ -261,6 +397,7 @@ def make_launcher(constants, signature) -> str:
     ]
 
     params = [f"&arg{i}" for i, ty in signature.items() if ty != "constexpr"]
+    params.extend(f"&tma_desc_dev{i}" for i in range(len(tma_specs)))
     if params:
         params_decl = f"    void *params[] = {{\n        {', '.join(params)},\n    }};"
         params_arg = "params"
@@ -274,10 +411,62 @@ def make_launcher(constants, signature) -> str:
     internal_args = ", ".join(internal_args_list)
     launch_args = f", {internal_args}" if internal_args else ""
 
+    tma_decl_list = []
+    for i, spec in enumerate(tma_specs):
+        rank = spec["rank"]
+        global_dims = ", ".join(str(v) for v in spec["global_dims"])
+        global_strides = ", ".join(str(v) for v in spec["global_strides"])
+        box_dims = ", ".join(str(v) for v in spec["box_dims"])
+        element_strides = ", ".join("1" for _ in range(rank))
+        strides_arg = f"tma_global_strides{i}" if rank > 1 else "NULL"
+        tma_decl_list.append(
+            f"""
+    CUtensorMap tma_desc_host{i};
+    cuuint64_t tma_global_dims{i}[{rank}] = {{{global_dims}}};
+    cuuint32_t tma_box_dims{i}[{rank}] = {{{box_dims}}};
+    cuuint32_t tma_element_strides{i}[{rank}] = {{{element_strides}}};
+    CUdeviceptr tma_desc_dev{i} = 0;
+"""
+        )
+        if rank > 1:
+            tma_decl_list.append(
+                f"    cuuint64_t tma_global_strides{i}[{rank - 1}] = {{{global_strides}}};\n"
+            )
+        tma_decl_list.append(
+            f"""
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &tma_desc_host{i}, {spec["dtype"]}, {rank},
+        (void *)arg{spec["arg_index"]}, tma_global_dims{i}, {strides_arg},
+        tma_box_dims{i}, tma_element_strides{i},
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    CUDA_CHECK(cuMemAlloc(&tma_desc_dev{i}, sizeof(CUtensorMap)));
+    CUDA_CHECK(cuMemcpyHtoDAsync(tma_desc_dev{i}, &tma_desc_host{i},
+                                 sizeof(CUtensorMap), stream));
+"""
+        )
+    tma_decls = "".join(tma_decl_list)
+
+    tma_cleanup_list = []
+    for i in range(len(tma_specs)):
+        tma_cleanup_list.append(
+            f"""
+    TmaCleanupData *tma_cleanup{i} =
+        (TmaCleanupData *)PyMem_RawMalloc(sizeof(TmaCleanupData));
+    if (tma_cleanup{i}) {{
+      tma_cleanup{i}->dev_ptr = tma_desc_dev{i};
+      CUDA_CHECK(cuLaunchHostFunc(stream, cleanupTmaDescriptor, tma_cleanup{i}));
+    }}
+"""
+        )
+    tma_cleanups = "".join(tma_cleanup_list)
+
     cuda_launch = f"""
 static void CudaLaunch(int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, CUstream stream, CUfunction func{", " + arg_decl if arg_decl else ""}) {{
+{tma_decls}
 {params_decl}
     CUDA_CHECK(cuLaunchKernel(func, grid_x, grid_y, grid_z, block_x, block_y, block_z, 0, stream, {params_arg}, NULL));
+{tma_cleanups}
 }} 
 
 static PyObject *PyLaunch(PyObject *self, PyObject *args) {{
@@ -314,7 +503,8 @@ class CudaLauncher:
 
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
-        src = make_launcher(constants, signature)
+        tma_specs = collect_tma_descriptor_specs(src)
+        src = make_launcher(constants, signature, tma_specs)
         mod = compile_module_from_src(
             src,
             "__avelang_launcher",
@@ -344,6 +534,9 @@ class NvidiaDriver(GPUDriver):
             raise RuntimeError("No CUDA device available for NvidiaDriver.")
 
         major, minor = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name().lower()
         arch = f"sm_{major}{minor}"
+        if major == 9 and ("h100" in name or "h800" in name):
+            arch = "sm_90a"
 
         return GPUTarget("nvptx64-nvidia-cuda", arch)
