@@ -100,18 +100,34 @@ typedef struct _DevicePtrInfo {
     bool valid;
 } DevicePtrInfo;
 
-typedef struct _TmaCleanupData {
-    CUdeviceptr dev_ptr;
-} TmaCleanupData;
+typedef struct _TmaDescriptorCacheEntry {
+    CUcontext context;
+    CUdeviceptr global_address;
+    CUdeviceptr descriptor;
+    struct _TmaDescriptorCacheEntry *next;
+} TmaDescriptorCacheEntry;
 
-static void CUDA_CB cleanupTmaDescriptor(void *userData) {
-  TmaCleanupData *data = (TmaCleanupData *)userData;
-  if (data) {
-    if (data->dev_ptr) {
-      cuMemFree(data->dev_ptr);
+static void clearTmaDescriptorCache(TmaDescriptorCacheEntry **head) {
+  TmaDescriptorCacheEntry *entry = *head;
+  while (entry) {
+    TmaDescriptorCacheEntry *next = entry->next;
+    CUcontext current = NULL;
+    CUcontext popped = NULL;
+    bool pushed = false;
+    if (cuCtxGetCurrent(&current) == CUDA_SUCCESS &&
+        current != entry->context &&
+        cuCtxPushCurrent(entry->context) == CUDA_SUCCESS) {
+      pushed = true;
     }
-    PyMem_RawFree(data);
+    cuCtxSynchronize();
+    cuMemFree(entry->descriptor);
+    if (pushed) {
+      cuCtxPopCurrent(&popped);
+    }
+    PyMem_RawFree(entry);
+    entry = next;
   }
+  *head = NULL;
 }
 
 static PyObject* data_ptr_str = NULL;
@@ -167,6 +183,7 @@ cleanup:
 
 LAUNCHER_EPILOGUE = """static PyMethodDef ModuleMethods[] = {
   {"launch", PyLaunch, METH_VARARGS, "Entry point for all kernels with this signature"},
+  {"clear_tma_cache", ClearTmaCache, METH_NOARGS, "Free cached TMA descriptors"},
   {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -415,7 +432,10 @@ def make_launcher(constants, signature, tma_specs=None) -> str:
     internal_args = ", ".join(internal_args_list)
     launch_args = f", {internal_args}" if internal_args else ""
 
-    tma_decl_list = []
+    tma_cache_decls = []
+    tma_getter_list = []
+    tma_lookup_list = []
+    tma_clear_list = []
     for i, spec in enumerate(tma_specs):
         rank = spec["rank"]
         global_dims = ", ".join(str(v) for v in spec["global_dims"])
@@ -423,54 +443,88 @@ def make_launcher(constants, signature, tma_specs=None) -> str:
         box_dims = ", ".join(str(v) for v in spec["box_dims"])
         element_strides = ", ".join("1" for _ in range(rank))
         strides_arg = f"tma_global_strides{i}" if rank > 1 else "NULL"
-        tma_decl_list.append(
+        tma_cache_decls.append(f"static TmaDescriptorCacheEntry *tma_cache{i} = NULL;\n")
+        stride_decl = ""
+        if rank > 1:
+            stride_decl = (
+                f"    cuuint64_t tma_global_strides{i}[{rank - 1}] = "
+                f"{{{global_strides}}};\n"
+            )
+        tma_getter_list.append(
             f"""
-    CUtensorMap tma_desc_host{i};
+static CUdeviceptr GetOrCreateTmaDescriptor{i}(CUdeviceptr global_address) {{
+    CUcontext context = NULL;
+    CUDA_CHECK(cuCtxGetCurrent(&context));
+    if (PyErr_Occurred()) {{
+      return 0;
+    }}
+    for (TmaDescriptorCacheEntry *entry = tma_cache{i}; entry; entry = entry->next) {{
+      if (entry->context == context && entry->global_address == global_address) {{
+        return entry->descriptor;
+      }}
+    }}
+
+    CUtensorMap tma_desc_host{i} __attribute__((aligned(128)));
     cuuint64_t tma_global_dims{i}[{rank}] = {{{global_dims}}};
     cuuint32_t tma_box_dims{i}[{rank}] = {{{box_dims}}};
     cuuint32_t tma_element_strides{i}[{rank}] = {{{element_strides}}};
-    CUdeviceptr tma_desc_dev{i} = 0;
-"""
-        )
-        if rank > 1:
-            tma_decl_list.append(
-                f"    cuuint64_t tma_global_strides{i}[{rank - 1}] = {{{global_strides}}};\n"
-            )
-        tma_decl_list.append(
-            f"""
+{stride_decl}
     CUDA_CHECK(cuTensorMapEncodeTiled(
         &tma_desc_host{i}, {spec["dtype"]}, {rank},
-        (void *)arg{spec["arg_index"]}, tma_global_dims{i}, {strides_arg},
+        (void *)global_address, tma_global_dims{i}, {strides_arg},
         tma_box_dims{i}, tma_element_strides{i},
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    CUDA_CHECK(cuMemAlloc(&tma_desc_dev{i}, sizeof(CUtensorMap)));
-    CUDA_CHECK(cuMemcpyHtoDAsync(tma_desc_dev{i}, &tma_desc_host{i},
-                                 sizeof(CUtensorMap), stream));
-"""
-        )
-    tma_decls = "".join(tma_decl_list)
-
-    tma_cleanup_list = []
-    for i in range(len(tma_specs)):
-        tma_cleanup_list.append(
-            f"""
-    TmaCleanupData *tma_cleanup{i} =
-        (TmaCleanupData *)PyMem_RawMalloc(sizeof(TmaCleanupData));
-    if (tma_cleanup{i}) {{
-      tma_cleanup{i}->dev_ptr = tma_desc_dev{i};
-      CUDA_CHECK(cuLaunchHostFunc(stream, cleanupTmaDescriptor, tma_cleanup{i}));
+    if (PyErr_Occurred()) {{
+      return 0;
     }}
+
+    CUdeviceptr tma_desc_dev{i} = 0;
+    CUDA_CHECK(cuMemAlloc(&tma_desc_dev{i}, sizeof(CUtensorMap)));
+    if (PyErr_Occurred()) {{
+      return 0;
+    }}
+    CUDA_CHECK(cuMemcpyHtoD(tma_desc_dev{i}, &tma_desc_host{i}, sizeof(CUtensorMap)));
+    if (PyErr_Occurred()) {{
+      cuMemFree(tma_desc_dev{i});
+      return 0;
+    }}
+
+    TmaDescriptorCacheEntry *entry =
+        (TmaDescriptorCacheEntry *)PyMem_RawMalloc(sizeof(TmaDescriptorCacheEntry));
+    if (!entry) {{
+      cuMemFree(tma_desc_dev{i});
+      PyErr_NoMemory();
+      return 0;
+    }}
+    entry->context = context;
+    entry->global_address = global_address;
+    entry->descriptor = tma_desc_dev{i};
+    entry->next = tma_cache{i};
+    tma_cache{i} = entry;
+    return tma_desc_dev{i};
+}}
 """
         )
-    tma_cleanups = "".join(tma_cleanup_list)
+        tma_lookup_list.append(
+            f"    CUdeviceptr tma_desc_dev{i} = GetOrCreateTmaDescriptor{i}("
+            f"ptr_info{spec['arg_index']}.dev_ptr);\n"
+        )
+        tma_clear_list.append(f"    clearTmaDescriptorCache(&tma_cache{i});\n")
+
+    tma_cache_decls_text = "".join(tma_cache_decls)
+    tma_getters = "".join(tma_getter_list)
+    tma_lookups = "".join(tma_lookup_list)
+    tma_clears = "".join(tma_clear_list)
+    tma_args = "".join(f", CUdeviceptr tma_desc_dev{i}" for i in range(len(tma_specs)))
+    tma_launch_args = "".join(f", tma_desc_dev{i}" for i in range(len(tma_specs)))
 
     cuda_launch = f"""
-static void CudaLaunch(int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, CUstream stream, CUfunction func{", " + arg_decl if arg_decl else ""}) {{
-{tma_decls}
+{tma_cache_decls_text}
+{tma_getters}
+static void CudaLaunch(int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, CUstream stream, CUfunction func{", " + arg_decl if arg_decl else ""}{tma_args}) {{
 {params_decl}
     CUDA_CHECK(cuLaunchKernel(func, grid_x, grid_y, grid_z, block_x, block_y, block_z, 0, stream, {params_arg}, NULL));
-{tma_cleanups}
 }} 
 
 static PyObject *PyLaunch(PyObject *self, PyObject *args) {{
@@ -484,11 +538,24 @@ static PyObject *PyLaunch(PyObject *self, PyObject *args) {{
         return NULL;
     }}
     {ptr_decls_text}
+{tma_lookups}
+    if (PyErr_Occurred()) {{
+      return NULL;
+    }}
 
     Py_BEGIN_ALLOW_THREADS;
-    CudaLaunch(grid_x, grid_y, grid_z, block_x, block_y, block_z, (CUstream)stream, func{launch_args});
+    CudaLaunch(grid_x, grid_y, grid_z, block_x, block_y, block_z, (CUstream)stream, func{launch_args}{tma_launch_args});
     Py_END_ALLOW_THREADS;
 
+    if (PyErr_Occurred()) {{
+      return NULL;
+    }}
+    Py_RETURN_NONE;
+}}
+
+static PyObject *ClearTmaCache(PyObject *self, PyObject *args) {{
+    ensureCudaContext();
+{tma_clears}
     if (PyErr_Occurred()) {{
       return NULL;
     }}
@@ -518,9 +585,18 @@ class CudaLauncher:
             src_extension=".cpp",
         )
         self.launch = mod.launch
+        self.clear_tma_cache = mod.clear_tma_cache
 
     def __call__(self, gridX, gridY, gridZ, blockX, blockY, blockZ, stream, function, *args):
         return self.launch(gridX, gridY, gridZ, blockX, blockY, blockZ, stream, function, *args)
+
+    def __del__(self):
+        clear_tma_cache = getattr(self, "clear_tma_cache", None)
+        if clear_tma_cache is not None:
+            try:
+                clear_tma_cache()
+            except Exception:
+                pass
 
 
 class NvidiaDriver(GPUDriver):
