@@ -769,6 +769,55 @@ def kernel(a: S.Tensor((32,), S.i32)):
     RunMLIRGenerationTestWithJitDeps(kSourceCode, {"helper"});
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRJitFunctionWithTensorReturn) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def make_pair(a: S.u32, b: S.u32) -> S.Tensor((2,), S.u32):
+    pair = S.make_local((2,), S.u32)
+    pair[0] = a
+    pair[1] = b
+    return pair
+
+@avelang.jit
+def kernel(out: S.Tensor((2,), S.u32)):
+    pair = make_pair(S.convert(3, S.u32), S.convert(5, S.u32))
+    out[0] = pair[0]
+    out[1] = pair[1]
+)""""";
+
+    RunMLIRGenerationTestWithJitDeps(kSourceCode, {"make_pair"});
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRJitFunctionWithMultipleTensorReturns) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def make_pairs(a: S.u32, b: S.u32) -> (S.Tensor((2,), S.u32), S.Tensor((2,), S.u32)):
+    first = S.make_local((2,), S.u32)
+    second = S.make_local((2,), S.u32)
+    first[0] = a
+    first[1] = b
+    second[0] = b
+    second[1] = a
+    return first, second
+
+@avelang.jit
+def kernel(out: S.Tensor((4,), S.u32)):
+    first, second = make_pairs(S.convert(3, S.u32), S.convert(5, S.u32))
+    out[0] = first[0]
+    out[1] = first[1]
+    out[2] = second[0]
+    out[3] = second[1]
+)""""";
+
+    RunMLIRGenerationTestWithJitDeps(kSourceCode, {"make_pairs"});
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRNestedFunctionCall) {
     static const std::string kSourceCode = R"""""(
 import avelang

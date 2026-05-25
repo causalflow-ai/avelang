@@ -214,17 +214,8 @@ void MakeIntTupleOp::build(mlir::OpBuilder &builder,
 
 // Custom verify method
 mlir::LogicalResult MakeIntTupleOp::verify() {
-    // Verify that all operands are integer or index types, or nested tuples
-    for (auto operand : getOperands()) {
-        auto type = operand.getType();
-
-        // Allow integer types, index types, or None types (for nested tuples)
-        if (!type.isIntOrIndex() && !mlir::isa<mlir::NoneType>(type)) {
-            return emitOpError(
-                "all elements must be integers, indices, or tuples");
-        }
-    }
-
+    // This operation also carries Python tuple values for multi-result calls.
+    // Shape/layout consumers validate their integer-only requirements.
     return mlir::success();
 }
 

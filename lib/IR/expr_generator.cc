@@ -1391,16 +1391,6 @@ ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
         return call_op.getResult(0);
     }
 
-    for (auto type : result_types) {
-        if (!type.isIntOrIndex() && !mlir::isa<mlir::NoneType>(type)) {
-            Report(this, basic::DiagnosticCode::kUnimplemented,
-                   call->GetSourceRange().getBegin())
-                << "Multiple return values must be integers, indices, or "
-                   "tuples";
-            return nullptr;
-        }
-    }
-
     auto tuple_op =
         cf::MakeIntTupleOp::create(builder, loc, call_op.getResults());
     return tuple_op.getResult();
