@@ -3,6 +3,7 @@
 #include "AST/ast_nodes_expr.h"
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "generator_context.h"
+#include "mlir_generator_impl.h"
 #include "parsing_utils.h"
 #include "symbol_table.h"
 #include "type_system.h"
@@ -465,6 +466,11 @@ ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
     }
 
     if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
+        if (auto *func_gen = ctx_->GetCurrentFunctionGenerator()) {
+            if (auto value = func_gen->LookupConstexprInteger(name->GetId())) {
+                return value;
+            }
+        }
         auto symbol = ctx_->syms->LookupSymbol(name->GetId());
         if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue)) {
             return std::nullopt;

@@ -9,6 +9,7 @@ import avelang.language as S
 GLOBAL_SIZE = 16
 GLOBAL_OFFSET = S.constexpr(3)
 GLOBAL_F32_EXACT = -0.5
+GLOBAL_COMPARISON_THRESHOLD = 8
 
 
 @avelang.jit
@@ -39,6 +40,33 @@ def kernel_global_exact_float_constant(
     output_data[tid] = shared_buf[tid]
 
 
+@avelang.jit
+def kernel_constexpr_compare_python_global(
+    output_data: S.Tensor((1,), S.i32),
+    value: S.constexpr,
+):
+    if value > GLOBAL_COMPARISON_THRESHOLD:
+        output_data[0] = 1
+    else:
+        output_data[0] = 0
+
+
+@avelang.jit
+def compare_global_constexpr_in_device_function(value: S.constexpr) -> S.i32:
+    result = 0
+    if value > GLOBAL_COMPARISON_THRESHOLD:
+        result = 1
+    return result
+
+
+@avelang.jit
+def kernel_device_function_compares_python_globals(
+    output_data: S.Tensor((1,), S.i32),
+    value: S.constexpr,
+):
+    output_data[0] = compare_global_constexpr_in_device_function(value)
+
+
 class TestGlobalConstexprInjection(unittest.TestCase):
     def test_global_constexpr_injection(self):
         input_data = torch.arange(GLOBAL_SIZE, dtype=torch.int32, device="cuda")
@@ -66,6 +94,24 @@ class TestGlobalConstexprInjection(unittest.TestCase):
             torch.equal(output_data.cpu(), expected.cpu()),
             f"Expected: {expected.tolist()}, Actual: {output_data.tolist()}",
         )
+
+    def test_constexpr_parameter_can_compare_with_python_global(self):
+        output_data = torch.zeros((1,), dtype=torch.int32, device="cuda")
+
+        kernel_constexpr_compare_python_global[lambda: ((1, 1, 1), (1, 1, 1))](
+            output_data, GLOBAL_COMPARISON_THRESHOLD + 1
+        )
+
+        self.assertEqual(output_data.cpu().item(), 1)
+
+    def test_device_function_can_compare_constexpr_with_python_global(self):
+        output_data = torch.zeros((1,), dtype=torch.int32, device="cuda")
+
+        kernel_device_function_compares_python_globals[lambda: ((1, 1, 1), (1, 1, 1))](
+            output_data, GLOBAL_COMPARISON_THRESHOLD + 1
+        )
+
+        self.assertEqual(output_data.cpu().item(), 1)
 
 
 if __name__ == "__main__":

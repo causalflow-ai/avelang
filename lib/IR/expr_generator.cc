@@ -1,4 +1,5 @@
 #include "Utils/assert.h"
+#include "constant_folder.h"
 #include "layout_operation.h"
 #include "mlir_generator_impl.h"
 #include "parsing_utils.h"
@@ -1311,18 +1312,25 @@ mlir::Value ExprGenerator::CastTensorVector(mlir::Value value,
 mlir::Value
 ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
                                 llvm::ArrayRef<mlir::Value> resolved_args) {
+    return GenerateFuncCall(call, func_op, resolved_args, call->GetArgs());
+}
+
+mlir::Value
+ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
+                                llvm::ArrayRef<mlir::Value> resolved_args,
+                                llvm::ArrayRef<ast::Expr *> source_arg_exprs) {
     if (!call || !func_op) {
         return nullptr;
     }
 
     auto func_type = func_op.getFunctionType();
     auto input_types = func_type.getInputs();
-    if (input_types.size() != call->GetArgs().size()) {
+    if (input_types.size() != source_arg_exprs.size()) {
         Report(this, basic::DiagnosticCode::kTypeMismatch,
                call->GetSourceRange().getBegin())
             << "Function '" << func_op.getSymName() << "' expects "
             << input_types.size() << " arguments but got "
-            << call->GetArgs().size();
+            << source_arg_exprs.size();
         return nullptr;
     }
 
@@ -1337,7 +1345,7 @@ ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
     llvm::SmallVector<mlir::Value> call_args;
     call_args.reserve(input_types.size());
     for (size_t i = 0; i < input_types.size(); ++i) {
-        auto *arg_expr = call->GetArgs()[i];
+        auto *arg_expr = source_arg_exprs[i];
         auto expected_type = input_types[i];
         mlir::Value arg_value;
 
@@ -1413,15 +1421,61 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
         return mlir::Value();
     }
 
-    auto collect_argument_address_spaces =
-        [&](ast::FunctionDef *callee,
-            llvm::ArrayRef<mlir::Value> call_args) -> ArgAddressSpaceMap {
+    auto *ctx = parent_->GetContext();
+    auto fold_constexpr_argument = [&](ast::Expr *expr,
+                                       mlir::Value value) -> mlir::Attribute {
+        ConstantFolder folder(ctx);
+        if (auto evaluated = folder.Evaluate(expr)) {
+            return parent_->GetBuilder().getI64IntegerAttr(*evaluated);
+        }
+        if (!value) {
+            return {};
+        }
+
+        auto &builder = parent_->GetBuilder();
+        if (auto const_op = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+            auto attr = const_op.getValue();
+            if (mlir::isa<mlir::IntegerAttr, mlir::FloatAttr>(attr)) {
+                return attr;
+            }
+        }
+        if (auto folded = ConstantFolder::FoldIntValue(value)) {
+            auto type = value.getType();
+            if (type.isIndex()) {
+                return builder.getIndexAttr(*folded);
+            }
+            if (type.isInteger()) {
+                return builder.getIntegerAttr(type, *folded);
+            }
+            return builder.getI64IntegerAttr(*folded);
+        }
+        if (auto folded = ConstantFolder::FoldBoolValue(value)) {
+            return builder.getBoolAttr(*folded);
+        }
+        return {};
+    };
+
+    auto collect_call_specialization =
+        [&](ast::FunctionDef *callee, llvm::ArrayRef<mlir::Value> all_call_args,
+            llvm::SmallVectorImpl<mlir::Value> &runtime_call_args,
+            llvm::SmallVectorImpl<ast::Expr *> &runtime_arg_exprs,
+            ConstexprBindingMap &constexpr_bindings) -> ArgAddressSpaceMap {
         ArgAddressSpaceMap address_spaces;
         if (!callee) {
             return address_spaces;
         }
         auto *func_args = callee->GetArguments();
         if (!func_args) {
+            return address_spaces;
+        }
+        const auto &source_args = call->GetArgs();
+        if (source_args.size() != func_args->GetArgs().size()) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kTypeMismatch,
+                call->GetSourceRange().getBegin())
+                << "JIT function '" << callee->GetName() << "' expects "
+                << func_args->GetArgs().size() << " arguments but got "
+                << source_args.size();
             return address_spaces;
         }
         size_t call_index = 0;
@@ -1432,13 +1486,33 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
             if (auto *attr_expr = llvm::dyn_cast_or_null<ast::AttributeExpr>(
                     arg->GetAnnotation())) {
                 if (attr_expr->GetAttr() == "constexpr") {
+                    if (call_index >= all_call_args.size()) {
+                        break;
+                    }
+                    auto attr = fold_constexpr_argument(
+                        source_args[call_index], all_call_args[call_index]);
+                    if (!attr) {
+                        ctx->diagnostic_manager->Report(
+                            basic::DiagnosticCode::kUnimplemented,
+                            source_args[call_index]
+                                ->GetSourceRange()
+                                .getBegin())
+                            << "JIT helper constexpr parameter '"
+                            << arg->GetArgName()
+                            << "' is not a specialization-time constant";
+                    } else {
+                        constexpr_bindings[arg->GetArgName()] = attr;
+                    }
+                    ++call_index;
                     continue;
                 }
             }
-            if (call_index >= call_args.size()) {
+            if (call_index >= all_call_args.size()) {
                 break;
             }
-            auto value = call_args[call_index];
+            auto value = all_call_args[call_index];
+            runtime_call_args.push_back(value);
+            runtime_arg_exprs.push_back(source_args[call_index]);
             ++call_index;
             if (!value) {
                 continue;
@@ -1467,7 +1541,6 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
     };
 
     auto &impl = parent_->GetParent();
-    auto *ctx = parent_->GetContext();
     const auto &name = func->GetName();
     if (name.empty()) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
@@ -1475,11 +1548,16 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
             << "JIT function has no name";
         return mlir::Value();
     }
-    auto arg_address_spaces =
-        collect_argument_address_spaces(func, resolved_args);
+    auto arg_address_spaces = ArgAddressSpaceMap();
+    llvm::SmallVector<mlir::Value> runtime_args;
+    llvm::SmallVector<ast::Expr *> runtime_arg_exprs;
+    ConstexprBindingMap constexpr_bindings;
+    arg_address_spaces =
+        collect_call_specialization(func, resolved_args, runtime_args,
+                                    runtime_arg_exprs, constexpr_bindings);
     auto scope_prefix = parent_->GetQualifiedScopePrefix();
-    auto mangled_name =
-        impl.GetMangledFunctionName(func, &arg_address_spaces, scope_prefix);
+    auto mangled_name = impl.GetMangledFunctionName(
+        func, &arg_address_spaces, scope_prefix, &constexpr_bindings);
     if (mangled_name.empty()) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call->GetSourceRange().getBegin())
@@ -1512,7 +1590,8 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
         mlir::OpBuilder::InsertionGuard guard(parent_->GetBuilder());
         FunctionGenerator function_generator(
             impl, MLIRGenerator::FunctionType::kPrivateFunction,
-            std::move(arg_address_spaces), scope_prefix);
+            std::move(arg_address_spaces), scope_prefix,
+            std::move(constexpr_bindings));
         function_generator.Generate(func);
         module = parent_->GetModule();
         if (module) {
@@ -1530,7 +1609,7 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
         return mlir::Value();
     }
 
-    return GenerateFuncCall(call, func_op, resolved_args);
+    return GenerateFuncCall(call, func_op, runtime_args, runtime_arg_exprs);
 }
 
 mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
