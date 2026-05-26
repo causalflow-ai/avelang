@@ -243,6 +243,27 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     // Resolve return type if present
     SmallVector<mlir::Type> returnTypes;
     if (auto *returns_expr = func->GetReturns()) {
+        auto materialize_value_return_type =
+            [&](mlir::Type type) -> mlir::Type {
+            if (function_type_ !=
+                MLIRGenerator::FunctionType::kPrivateFunction) {
+                return type;
+            }
+            auto memref_type = mlir::dyn_cast<cf::MemRefType>(type);
+            if (!memref_type) {
+                return type;
+            }
+            if (!memref_type.hasStaticShape()) {
+                ctx_->diagnostic_manager->Report(
+                    basic::DiagnosticCode::kUnimplemented,
+                    returns_expr->GetSourceRange().getBegin())
+                    << "Tensor return values must have a static shape";
+                return mlir::Type();
+            }
+            return mlir::VectorType::get(memref_type.getShape(),
+                                         memref_type.getElementType());
+        };
+
         auto resolve_tuple_types = [&](auto *tuple_expr) -> bool {
             for (auto *elem : tuple_expr->GetElts()) {
                 auto elem_type = ctx_->syms->ResolveType(elem);
@@ -254,11 +275,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                                func->GetName();
                     return false;
                 }
-                if (!elem_type.isIntOrIndex()) {
-                    ctx_->diagnostic_manager->Report(
-                        basic::DiagnosticCode::kUnimplemented,
-                        returns_expr->GetSourceRange().getBegin())
-                        << "Tuple return types must be integer or index types";
+                elem_type = materialize_value_return_type(elem_type);
+                if (!elem_type) {
                     return false;
                 }
                 returnTypes.push_back(elem_type);
@@ -289,6 +307,10 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                     returns_expr->GetSourceRange().getBegin())
                     << "Failed to resolve return type for function: " +
                            func->GetName();
+                return;
+            }
+            return_type = materialize_value_return_type(return_type);
+            if (!return_type) {
                 return;
             }
             returnTypes.push_back(return_type);
@@ -446,6 +468,24 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                     return;
                 }
 
+                auto prepare_return_value =
+                    [&](mlir::Value value, unsigned result_index) {
+                        auto expected_type =
+                            func_op.getFunctionType().getResult(result_index);
+                        auto cast_value = expr_generator_.CastTensorVector(
+                            value, expected_type,
+                            value_expr->GetSourceRange().getBegin());
+                        if (cast_value &&
+                            cast_value.getType() != expected_type) {
+                            cast_value = CreateTypeConversion(
+                                cast_value, cast_value.getType(), expected_type,
+                                return_loc, builder_);
+                        }
+                        return cast_value && cast_value.getType() == expected_type
+                                   ? cast_value
+                                   : mlir::Value();
+                    };
+
                 if (num_results == 1) {
                     if (return_value.getDefiningOp<cf::MakeIntTupleOp>()) {
                         ctx_->diagnostic_manager->Report(
@@ -455,10 +495,18 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                                "function";
                         return;
                     }
-                    cf::ReturnOp::create(builder_, return_loc, return_value);
+                    auto cast_value = prepare_return_value(return_value, 0);
+                    if (!cast_value) {
+                        ctx_->diagnostic_manager->Report(
+                            basic::DiagnosticCode::kTypeMismatch,
+                            ret->GetSourceRange().getBegin())
+                            << "Failed to convert return value";
+                        return;
+                    }
+                    cf::ReturnOp::create(builder_, return_loc, cast_value);
                     if (emitPlaceholderReturn()) {
                         func::ReturnOp::create(builder_, return_loc,
-                                               return_value);
+                                               cast_value);
                     }
                     return;
                 }
@@ -486,16 +534,9 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                 llvm::SmallVector<mlir::Value> cast_values;
                 cast_values.reserve(tuple_values.size());
                 for (size_t i = 0; i < tuple_values.size(); ++i) {
-                    auto expected_type = function_type.getResult(i);
-                    auto cast_value = expr_generator_.CastTensorVector(
-                        tuple_values[i], expected_type,
-                        value_expr->GetSourceRange().getBegin());
-                    if (cast_value.getType() != expected_type) {
-                        cast_value = CreateTypeConversion(
-                            cast_value, cast_value.getType(), expected_type,
-                            return_loc, builder_);
-                    }
-                    if (!cast_value || cast_value.getType() != expected_type) {
+                    auto cast_value =
+                        prepare_return_value(tuple_values[i], i);
+                    if (!cast_value) {
                         ctx_->diagnostic_manager->Report(
                             basic::DiagnosticCode::kTypeMismatch,
                             ret->GetSourceRange().getBegin())

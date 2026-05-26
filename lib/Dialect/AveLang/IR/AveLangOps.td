@@ -56,11 +56,11 @@ def ReturnOp : AveLang_Op<"return"> {
 }
 
 def MakeIntTupleOp : AveLang_Op<"make_int_tuple", [Pure]> {
-    let summary = "Create an integer tuple from elements";
+    let summary = "Create a tuple from elements";
     let description = [{
-        The `ave.make_int_tuple` operation creates a tuple containing
-        integer or index values, or nested tuples. This replaces the 
-        ParseNestedTuple functionality from builtin_module.cc.
+        The `ave.make_int_tuple` operation creates a tuple value. Shape and
+        layout users require integer or index elements; function result
+        tuples may contain arbitrary value types.
         
         Example:
         ```mlir
