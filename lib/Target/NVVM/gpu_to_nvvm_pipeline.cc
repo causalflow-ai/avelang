@@ -16,6 +16,7 @@
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/MemRef/Transforms/Passes.h>
 #include <mlir/IR/SymbolTable.h>
+#include <mlir/Interfaces/FunctionInterfaces.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Transforms/Passes.h>
@@ -63,6 +64,56 @@ static std::unique_ptr<Pass> createSetNVVMWorkgroupAttributionAlignPass() {
     return std::make_unique<SetNVVMWorkgroupAttributionAlignPass>();
 }
 
+class SetNVVMTmaDescriptorABIAttributesPass
+    : public PassWrapper<SetNVVMTmaDescriptorABIAttributesPass,
+                         OperationPass<gpu::GPUModuleOp>> {
+  public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        SetNVVMTmaDescriptorABIAttributesPass)
+
+    void runOnOperation() override {
+        Builder builder(&getContext());
+        getOperation().walk([&](LLVM::LLVMFuncOp func) {
+            auto tmaIndices = func->getAttrOfType<DenseI32ArrayAttr>(
+                "ave.nv_tma_desc_indices");
+            if (!tmaIndices) {
+                return;
+            }
+            for (int32_t index : tmaIndices.asArrayRef()) {
+                // Match Triton's nvTmaDesc ABI: a descriptor is an aligned,
+                // by-value grid-constant CUtensorMap kernel argument.
+                auto descriptorBytes = LLVM::LLVMArrayType::get(
+                    &getContext(), builder.getI8Type(), 128);
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(LLVM::LLVMDialect::getByValAttrName()),
+                    TypeAttr::get(descriptorBytes));
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(NVVM::NVVMDialect::getGridConstantAttrName()),
+                    builder.getUnitAttr());
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(LLVM::LLVMDialect::getAlignAttrName()),
+                    builder.getI32IntegerAttr(64));
+            }
+            func->removeAttr("ave.nv_tma_desc_indices");
+        });
+    }
+
+    StringRef getArgument() const final {
+        return "set-nvvm-tma-descriptor-abi-attributes";
+    }
+
+    StringRef getDescription() const final {
+        return "Set NVVM by-value grid-constant attributes on TMA descriptors";
+    }
+};
+
+static std::unique_ptr<Pass> createSetNVVMTmaDescriptorABIAttributesPass() {
+    return std::make_unique<SetNVVMTmaDescriptorABIAttributesPass>();
+}
+
 } // namespace
 
 static void buildCommonPassPipeline(OpPassManager &pm,
@@ -103,6 +154,8 @@ static void buildGpuPassPipeline(OpPassManager &pm,
     convertOptions.useBarePtrCallConv = options.use_bare_ptr_memref_call_conv;
     pm.addNestedPass<gpu::GPUModuleOp>(
         createConvertGpuOpsToNVVMOps(convertOptions));
+    pm.addNestedPass<gpu::GPUModuleOp>(
+        createSetNVVMTmaDescriptorABIAttributesPass());
     pm.addNestedPass<gpu::GPUModuleOp>(createConvertNVGPUToNVVMPass());
     pm.addPass(createConvertNVVMToLLVMPass());
 

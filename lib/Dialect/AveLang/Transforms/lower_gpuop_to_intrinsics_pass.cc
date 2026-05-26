@@ -536,7 +536,11 @@ class NVVMTMADescriptorLowering
         unsigned argIndex = funcOp.getNumArguments();
         auto descriptorPtrType =
             mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
-        auto attrs = mlir::DictionaryAttr::get(rewriter.getContext());
+        // GPU outlining uses this marker to apply the CUDA TMA argument ABI
+        // once the argument belongs to a kernel.
+        auto attrs = rewriter.getDictionaryAttr(
+            {rewriter.getNamedAttr("ave.nv_tma_desc",
+                                   rewriter.getUnitAttr())});
         if (mlir::failed(funcOp.insertArgument(
                 argIndex, descriptorPtrType, attrs, op.getLoc()))) {
             return mlir::failure();
