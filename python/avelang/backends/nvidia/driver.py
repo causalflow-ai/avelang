@@ -61,6 +61,8 @@ LAUNCHER_PROLOGUE = """
 #include <cuda.h>
 #include <Python.h>
 #include <stdbool.h>
+#include <cstdint>
+#include <cstring>
 
 static inline void gpuAssert(CUresult code, const char *file, int line)
 {
@@ -70,8 +72,8 @@ static inline void gpuAssert(CUresult code, const char *file, int line)
       const char* str;
       cuGetErrorString(code, &str);
       char err[1024] = {0,};
-      strcat(err, prefix);
-      strcat(err, str);
+      std::strcat(err, prefix);
+      std::strcat(err, str);
       PyGILState_STATE gil_state;
       gil_state = PyGILState_Ensure();
       PyErr_SetString(PyExc_RuntimeError, err);
@@ -103,6 +105,9 @@ static PyObject* data_ptr_str = NULL;
 
 static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
   DevicePtrInfo ptr_info;
+  PyObject *ret = NULL;
+  std::uint64_t dev_ptr = 0;
+  CUresult status = CUDA_SUCCESS;
   ptr_info.dev_ptr = 0;
   ptr_info.valid = true;
   if (PyLong_Check(obj)) {
@@ -113,7 +118,7 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     // valid nullptr
     return ptr_info;
   }
-  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
+  ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
   if (!ret) {
     PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
     ptr_info.valid = false;
@@ -126,9 +131,8 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
   }
   ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(ret);
   if(!ptr_info.dev_ptr)
-    return ptr_info;
-  uint64_t dev_ptr;
-  int status = cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);
+    goto cleanup;
+  status = cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);
   if (status == CUDA_ERROR_INVALID_VALUE) {
       PyErr_Format(PyExc_ValueError,
                    "Pointer argument (at %d) cannot be accessed from ave-lang (CPU tensor?)", idx);
@@ -321,6 +325,7 @@ class CudaLauncher:
             library_dirs=library_dirs(),
             include_dirs=include_dirs,
             libraries=libraries,
+            src_extension=".cpp",
         )
         self.launch = mod.launch
 
