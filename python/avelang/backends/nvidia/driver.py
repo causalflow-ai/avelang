@@ -1,7 +1,6 @@
 import os
 import functools
 import subprocess
-import ast
 from pathlib import Path
 
 import torch
@@ -178,123 +177,6 @@ PyMODINIT_FUNC PyInit___avelang_launcher(void) {
   return m;
 }
 """
-
-
-def _literal_int_tuple(node):
-    if not isinstance(node, ast.Tuple):
-        return None
-    values = []
-    for elt in node.elts:
-        if not isinstance(elt, ast.Constant) or not isinstance(elt.value, int):
-            return None
-        values.append(elt.value)
-    return tuple(values)
-
-
-def _is_attr_call(node, name):
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == name
-    )
-
-
-def _dtype_to_tma_enum(dtype):
-    name = getattr(dtype, "name", str(dtype))
-    return {
-        "u8": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
-        "u16": "CU_TENSOR_MAP_DATA_TYPE_UINT16",
-        "u32": "CU_TENSOR_MAP_DATA_TYPE_UINT32",
-        "i32": "CU_TENSOR_MAP_DATA_TYPE_INT32",
-        "u64": "CU_TENSOR_MAP_DATA_TYPE_UINT64",
-        "i64": "CU_TENSOR_MAP_DATA_TYPE_INT64",
-        "fp16": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
-        "fp32": "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
-        "fp64": "CU_TENSOR_MAP_DATA_TYPE_FLOAT64",
-        "bf16": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
-    }.get(name)
-
-
-def _dtype_size(dtype):
-    name = getattr(dtype, "name", str(dtype))
-    return {
-        "u8": 1,
-        "u16": 2,
-        "u32": 4,
-        "i32": 4,
-        "u64": 8,
-        "i64": 8,
-        "fp16": 2,
-        "fp32": 4,
-        "fp64": 8,
-        "bf16": 2,
-    }.get(name)
-
-
-def _default_strides(shape):
-    stride = 1
-    strides = []
-    for dim in reversed(shape):
-        strides.append(stride)
-        stride *= dim
-    return tuple(reversed(strides))
-
-
-def collect_tma_descriptor_specs(src):
-    arg_names = list(src.fn.signature.parameters.keys())
-    arg_indices = {name: idx for idx, name in enumerate(arg_names)}
-    layout_dims = {}
-    specs = []
-
-    def dims_from_layout(node):
-        if isinstance(node, ast.Name):
-            return layout_dims.get(node.id)
-        if _is_attr_call(node, "make_layout") and node.args:
-            return _literal_int_tuple(node.args[0])
-        return None
-
-    class Visitor(ast.NodeVisitor):
-        def visit_Assign(self, node):
-            if (
-                len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and _is_attr_call(node.value, "make_layout")
-                and node.value.args
-            ):
-                dims = _literal_int_tuple(node.value.args[0])
-                if dims is not None:
-                    layout_dims[node.targets[0].id] = dims
-            self.generic_visit(node)
-
-        def visit_Call(self, node):
-            if _is_attr_call(node, "make_tma_descriptor") and len(node.args) >= 2:
-                tensor_node = node.args[0]
-                if isinstance(tensor_node, ast.Name) and tensor_node.id in arg_indices:
-                    box_dims = dims_from_layout(node.args[1])
-                    annotation = src.fn.signature.parameters[tensor_node.id].annotation
-                    shape = getattr(annotation, "shape", None)
-                    element_ty = getattr(annotation, "element_ty", None)
-                    tma_dtype = _dtype_to_tma_enum(element_ty)
-                    elem_size = _dtype_size(element_ty)
-                    if box_dims and shape and tma_dtype and elem_size:
-                        shape = tuple(shape)
-                        strides = _default_strides(shape)
-                        specs.append(
-                            {
-                                "arg_index": arg_indices[tensor_node.id],
-                                "rank": len(shape),
-                                "global_dims": tuple(reversed(shape)),
-                                "global_strides": tuple(
-                                    stride * elem_size for stride in reversed(strides[:-1])
-                                ),
-                                "box_dims": tuple(reversed(box_dims)),
-                                "dtype": tma_dtype,
-                            }
-                        )
-            self.generic_visit(node)
-
-    Visitor().visit(src.fn.parse())
-    return specs
 
 
 def make_launcher(constants, signature, tma_specs=None) -> str:
@@ -475,7 +357,13 @@ class CudaLauncher:
 
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
-        tma_specs = collect_tma_descriptor_specs(src)
+        tma_specs = []
+        for spec in getattr(src, "tma_specs", []):
+            spec = dict(spec)
+            arg_name = spec.pop("arg_name", None)
+            if arg_name is not None:
+                spec["arg_index"] = src.fn.arg_names.index(arg_name)
+            tma_specs.append(spec)
         src = make_launcher(constants, signature, tma_specs)
         mod = compile_module_from_src(
             src,
