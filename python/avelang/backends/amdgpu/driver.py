@@ -119,20 +119,17 @@ LAUNCHER_PROLOGUE = """
 #include <Python.h>
 #include <stdbool.h>
 #include <cstdint>
-#include <cstring>
+#include <string>
 
 static inline void gpuAssert(hipError_t code, const char *file, int line)
 {
    if (code != hipSuccess)
    {
-      const char* prefix = "ave-lang Error [HIP]: ";
-      const char* str = hipGetErrorString(code);
-      char err[1024] = {0,};
-      std::strcat(err, prefix);
-      std::strcat(err, str);
+      std::string err = "ave-lang Error [HIP]: ";
+      err += hipGetErrorString(code);
       PyGILState_STATE gil_state;
       gil_state = PyGILState_Ensure();
-      PyErr_SetString(PyExc_RuntimeError, err);
+      PyErr_SetString(PyExc_RuntimeError, err.c_str());
       PyGILState_Release(gil_state);
    }
 }
