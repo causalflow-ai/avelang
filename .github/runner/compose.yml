@@ -1,0 +1,58 @@
+name: avelang-mi300-runner
+
+services:
+  dind:
+    image: docker:29.4.0-dind
+    privileged: true
+    restart: unless-stopped
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    volumes:
+      - docker-data:/var/lib/docker
+      - runner-work:/home/runner/_work
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - runner-net
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    restart: unless-stopped
+    depends_on:
+      dind:
+        condition: service_healthy
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+      RUNNER_URL: ${RUNNER_URL:-https://github.com/causalflow-ai/avelang}
+      RUNNER_NAME: ${RUNNER_NAME:-mi300-dind}
+      RUNNER_LABELS: mi300,rocm72,dind
+      AVELANG_CI_IMAGE: avelang-ci:rocm7.2.2
+    secrets:
+      - source: runner-token
+        target: runner-token
+        uid: "1001"
+        gid: "1001"
+        mode: 0400
+    volumes:
+      - runner-work:/home/runner/_work
+    networks:
+      - runner-net
+
+secrets:
+  runner-token:
+    environment: RUNNER_TOKEN
+
+volumes:
+  docker-data:
+  runner-work:
+
+networks:
+  runner-net:
