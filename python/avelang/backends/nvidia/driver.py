@@ -128,6 +128,10 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     goto cleanup;
   }
   ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(ret);
+  if (PyErr_Occurred()) {
+    ptr_info.valid = false;
+    goto cleanup;
+  }
   if(!ptr_info.dev_ptr)
     goto cleanup;
   status = cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);

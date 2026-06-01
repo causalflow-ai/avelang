@@ -175,11 +175,12 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     goto cleanup;
   }
   ptr_info.dev_ptr = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(ret);
+  if (PyErr_Occurred()) {
+    ptr_info.valid = false;
+    goto cleanup;
+  }
   if(!ptr_info.dev_ptr)
     goto cleanup;
-
-  // In HIP, device pointers can be used directly
-  // No need for additional attribute lookup like in CUDA
 
 cleanup:
   Py_XDECREF(ret);
