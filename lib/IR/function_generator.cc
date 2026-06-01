@@ -1,4 +1,5 @@
 #include "Utils/assert.h"
+#include "constant_folder.h"
 #include "layout_operation.h"
 #include "mlir_generator_impl.h"
 #include "type_promotion.h"
@@ -98,12 +99,14 @@ CanImplicitlyDemoteConstantWithoutPrecisionLoss(mlir::Value value,
 FunctionGenerator::FunctionGenerator(MLIRGeneratorImpl &parent,
                                      MLIRGenerator::FunctionType function_type,
                                      ArgAddressSpaceMap argument_address_spaces,
-                                     std::string name_prefix)
+                                     std::string name_prefix,
+                                     ConstexprValueMap constexpr_values)
     : parent_(parent), ctx_(parent.ctx_),
       builder_(parent.ctx_->ir_context->GetMLIRContext()),
       expr_generator_(this), function_type_(function_type),
       name_prefix_(std::move(name_prefix)),
-      argument_address_spaces_(std::move(argument_address_spaces)) {
+      argument_address_spaces_(std::move(argument_address_spaces)),
+      constexpr_values_(std::move(constexpr_values)) {
     SS_ASSERT(ctx_);
 }
 
@@ -365,9 +368,17 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     for (size_t i = 0; i < argNames.size(); ++i) {
         ctx_->syms->DefineSymbol(argNames[i], entry_block.getArgument(i));
     }
+    for (const auto &[name, value] : constexpr_values_) {
+        ctx_->syms->GetCurrentFrame().AddValue(name, value,
+                                               /*immutable=*/true);
+    }
 
     for (auto *stmt : func->GetBody()) {
         DispatchStmt(stmt);
+        auto *block = builder_.getInsertionBlock();
+        if (block && block->mightHaveTerminator()) {
+            break;
+        }
     }
 
     // Add empty return to make function valid
@@ -1288,6 +1299,20 @@ void FunctionGenerator::VisitIf(ast::If *if_stmt) {
         ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                          if_stmt->GetSourceRange().getBegin())
             << "Failed to generate condition expression for if statement";
+        return;
+    }
+
+    if (auto folded = ConstantFolder::FoldBoolValue(condition)) {
+        SymbolTable::FrameGuard guard(ctx_->syms.get());
+        const auto &body =
+            *folded ? if_stmt->GetBody() : if_stmt->GetOrelse();
+        for (auto *stmt : body) {
+            DispatchStmt(stmt);
+            auto *block = builder_.getInsertionBlock(); 
+            if (block && block->mightHaveTerminator()) {
+                break;
+            }
+        }
         return;
     }
 
