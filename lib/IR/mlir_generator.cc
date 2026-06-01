@@ -199,6 +199,18 @@ MLIRGenerator::VisitFunctionDefWithType(ast::FunctionDef *func,
         return E;
     impl_->SnapshotModuleSymbolTable();
 
+    if (func_type == FunctionType::kPrivateFunction) {
+        if (auto *args = func->GetArguments()) {
+            for (auto *arg : args->GetArgs()) {
+                auto *annotation = llvm::dyn_cast_or_null<ast::AttributeExpr>(
+                    arg ? arg->GetAnnotation() : nullptr);
+                if (annotation && annotation->GetAttr() == "constexpr") {
+                    return llvm::Error::success();
+                }
+            }
+        }
+    }
+
     FunctionGenerator function_generator(*impl_, func_type);
     function_generator.Generate(func);
     return llvm::Error::success();
