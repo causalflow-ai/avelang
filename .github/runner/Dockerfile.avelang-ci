@@ -1,6 +1,6 @@
 FROM rocm/pytorch:rocm7.2.2_ubuntu24.04_py3.12_pytorch_release_2.10.0
 
-ARG LLVM_COMMIT=7b800a19466229b8479a78de19143dc33c3ab9b5
+ARG LLVM_TAG=rocm-7.2.2
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -18,7 +18,7 @@ RUN apt-get update \
 RUN git init /home/llvm-project \
     && cd /home/llvm-project \
     && git remote add origin https://github.com/ROCm/llvm-project.git \
-    && git fetch --depth=1 origin "${LLVM_COMMIT}" \
+    && git fetch --depth=1 origin "${LLVM_TAG}" \
     && git checkout --detach FETCH_HEAD \
     && cmake -S llvm -B build -G Ninja \
         -DLLVM_ENABLE_PROJECTS="clang;lld;mlir" \
