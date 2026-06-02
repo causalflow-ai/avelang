@@ -47,9 +47,11 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir uv \
     && ninja --version \
     && /opt/venv/bin/python --version \
     && /usr/local/bin/clang --version \
-    && /usr/local/bin/mlir-opt --version
+    && /usr/local/bin/mlir-opt --version \
+    && useradd --create-home --uid 1001 --shell /bin/bash runner
 
 ENV LD_LIBRARY_PATH=/opt/rocm/lib
 ENV PATH=/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
+USER runner
 WORKDIR /workspace/avelang
