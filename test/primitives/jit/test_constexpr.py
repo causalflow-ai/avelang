@@ -49,6 +49,13 @@ def helper_constexpr_value(kSize: S.constexpr) -> S.u32:
 
 
 @avelang.jit
+def helper_constexpr_bool_value(flag: S.constexpr) -> S.u32:
+    if flag:
+        return S.convert(11, S.u32)
+    return S.convert(23, S.u32)
+
+
+@avelang.jit
 def kernel_constexpr_return_helper(
     out: S.Tensor((4,), S.f32),
     kHighPrecision: S.constexpr,
@@ -80,6 +87,12 @@ def kernel_constexpr_call_expr(
     kSize: S.constexpr,
 ):
     out[0] = helper_constexpr_value(kSize + 1)
+
+
+@avelang.jit
+def kernel_constexpr_multiple_specializations(out: S.Tensor((4,), S.u32)):
+    out[0] = helper_constexpr_bool_value(True)
+    out[1] = helper_constexpr_bool_value(False)
 
 
 class TestConstexprResolve(unittest.TestCase):
@@ -130,6 +143,15 @@ class TestConstexprResolve(unittest.TestCase):
         torch.cuda.synchronize()
 
         self.assertEqual(out.cpu()[0], 4)
+
+    def test_constexpr_jit_helper_specializes_by_value(self):
+        out = torch.zeros((4,), dtype=torch.int32, device="cuda")
+        kernel_constexpr_multiple_specializations[
+            lambda: ((1, 1, 1), (1, 1, 1))
+        ](out)
+        torch.cuda.synchronize()
+
+        self.assertEqual(out.cpu().tolist()[:2], [11, 23])
 
 
 if __name__ == "__main__":

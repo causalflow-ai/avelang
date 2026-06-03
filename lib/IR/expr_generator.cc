@@ -1535,8 +1535,8 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
         }
     }
     auto scope_prefix = parent_->GetQualifiedScopePrefix();
-    auto mangled_name =
-        impl.GetMangledFunctionName(func, &arg_address_spaces, scope_prefix);
+    auto mangled_name = impl.GetMangledFunctionName(
+        func, &arg_address_spaces, scope_prefix, &constexpr_values);
     if (mangled_name.empty()) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call->GetSourceRange().getBegin())

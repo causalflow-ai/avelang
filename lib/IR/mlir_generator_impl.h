@@ -177,13 +177,16 @@ class MLIRGeneratorImpl {
     std::string GetMangledFunctionName(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces = nullptr,
-        llvm::StringRef name_prefix = {});
+        llvm::StringRef name_prefix = {},
+        const ConstexprValueMap *constexpr_values = nullptr);
     std::string GetFunctionScopeName(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces = nullptr);
     llvm::SmallVector<std::string, 4> GetFunctionAddressSpaceTags(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces) const;
+    llvm::SmallVector<std::string, 4> GetFunctionConstexprTags(
+        ast::FunctionDef *func, const ConstexprValueMap *constexpr_values) const;
     std::string getArgName(ast::ASTNode *arg);
     void HandleImport(ast::Import *import_stmt);
     void HandleImportFrom(ast::ImportFrom *import_from_stmt);
