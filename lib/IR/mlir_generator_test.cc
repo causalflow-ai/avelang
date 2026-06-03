@@ -1937,6 +1937,47 @@ def make_layout_empty_test():
                                "Empty tuple expressions are not supported");
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRLayoutAlgebraFunctions) {
+    static const std::string kSourceCode = R"""""(
+import substrate
+import substrate.language as S
+
+@substrate.jit
+def layout_algebra_test(
+    x8: S.Tensor((8,), S.i32),
+    x24: S.Tensor((24,), S.i32),
+    x32: S.Tensor((32,), S.i32),
+    x48: S.Tensor((48,), S.i32),
+):
+    composition_layout = S.composition(
+        S.make_layout((6, 2), (8, 2)),
+        S.make_layout((4, 3), (3, 1)),
+    )
+    coalesced_layout = S.coalesce(S.make_layout((2, 4), (1, 2)))
+    complement_layout = S.complement(S.make_layout((2, 2), (1, 6)), 24)
+    product_layout = S.product(
+        S.make_layout((2, 2), (4, 1)),
+        S.make_layout((4, 2), (2, 1)),
+    )
+    divide_layout = S.divide(
+        S.make_layout((4, 2, 3), (2, 1, 8)),
+        S.make_layout((4,), (2,)),
+    )
+
+    x_comp = S.view(x48, S.i32, composition_layout)
+    x_coal = S.view(x8, S.i32, coalesced_layout)
+    x_cpl = S.view(x24, S.i32, complement_layout)
+    x_prod = S.view(x32, S.i32, product_layout)
+    x_div = S.view(x24, S.i32, divide_layout)
+
+    x_comp[0, 0, 0] = x_coal[0]
+    x_prod[0, 0, 0, 0] = x_div[0, 0, 0, 0]
+    x_cpl[0, 0] = x_comp[1, 1, 2]
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRWithConstexpr) {
     static const std::string kSourceCode = R""""(
 import avelang

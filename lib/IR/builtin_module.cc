@@ -119,6 +119,261 @@ computeRowMajorStrides(llvm::ArrayRef<int64_t> shape) {
     return strides;
 }
 
+static bool reportLayoutAlgebraError(GeneratorContext *ctx, ast::Call *callExpr,
+                                     llvm::StringRef message) {
+    ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                    callExpr->GetSourceRange().getBegin())
+        << message.str();
+    return false;
+}
+
+static bool
+extractStaticLayout(mlir::Value layoutValue, llvm::SmallVector<int64_t> &shape,
+                    llvm::SmallVector<int64_t> &strides) {
+    auto layoutOp = layoutValue.getDefiningOp<cf::MakeLayoutOp>();
+    if (!layoutOp) {
+        return false;
+    }
+    if (!LayoutOperation::flattenTupleValues(layoutOp.getDims(), shape) ||
+        !LayoutOperation::flattenTupleValues(layoutOp.getStride(), strides)) {
+        return false;
+    }
+    if (shape.empty() || shape.size() != strides.size()) {
+        return false;
+    }
+    return llvm::all_of(shape, [](int64_t value) {
+               return value != mlir::ShapedType::kDynamic;
+           }) &&
+           llvm::all_of(strides, [](int64_t value) {
+               return value != mlir::ShapedType::kDynamic;
+           });
+}
+
+static mlir::Value createStaticIntTuple(mlir::OpBuilder &builder,
+                                        mlir::Location location,
+                                        llvm::ArrayRef<int64_t> values) {
+    llvm::SmallVector<mlir::Value> tupleValues;
+    tupleValues.reserve(values.size());
+    for (int64_t value : values) {
+        tupleValues.push_back(
+            builder.create<mlir::arith::ConstantIndexOp>(location, value));
+    }
+    return builder.create<cf::MakeIntTupleOp>(location, tupleValues)
+        .getResult();
+}
+
+static mlir::Value createStaticLayoutValue(mlir::OpBuilder &builder,
+                                           mlir::Location location,
+                                           llvm::ArrayRef<int64_t> shape,
+                                           llvm::ArrayRef<int64_t> strides) {
+    auto dimsValue = createStaticIntTuple(builder, location, shape);
+    auto stridesValue = createStaticIntTuple(builder, location, strides);
+    return builder.create<cf::MakeLayoutOp>(location, dimsValue, stridesValue)
+        .getResult();
+}
+
+static mlir::Value createLayoutFromStaticVectors(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    const std::pair<llvm::SmallVector<int64_t>, llvm::SmallVector<int64_t>>
+        &layout) {
+    if (layout.first.empty() || layout.first.size() != layout.second.size()) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "layout algebra operation produced an invalid or empty layout");
+        return nullptr;
+    }
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+    return createStaticLayoutValue(builder, location, layout.first,
+                                   layout.second);
+}
+
+static mlir::Value createCoalesceFunction(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolvedArgs) {
+    if (callExpr->GetArgs().size() != 1 || resolvedArgs.size() != 1 ||
+        !resolvedArgs[0]) {
+        reportLayoutAlgebraError(ctx, callExpr,
+                                 "coalesce() expects exactly 1 layout "
+                                 "argument");
+        return nullptr;
+    }
+
+    llvm::SmallVector<int64_t> shape;
+    llvm::SmallVector<int64_t> strides;
+    if (!extractStaticLayout(resolvedArgs[0], shape, strides)) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "coalesce() expects a static layout created by make_layout()");
+        return nullptr;
+    }
+
+    return createLayoutFromStaticVectors(
+        callExpr, ctx, LayoutOperation::coalesceStaticLayout(shape, strides));
+}
+
+static mlir::Value createCompositionFunction(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolvedArgs) {
+    if (callExpr->GetArgs().size() != 2 || resolvedArgs.size() != 2 ||
+        !resolvedArgs[0] || !resolvedArgs[1]) {
+        reportLayoutAlgebraError(ctx, callExpr,
+                                 "composition() expects exactly 2 layout "
+                                 "arguments");
+        return nullptr;
+    }
+
+    llvm::SmallVector<int64_t> shapeA;
+    llvm::SmallVector<int64_t> stridesA;
+    llvm::SmallVector<int64_t> shapeB;
+    llvm::SmallVector<int64_t> stridesB;
+    if (!extractStaticLayout(resolvedArgs[0], shapeA, stridesA) ||
+        !extractStaticLayout(resolvedArgs[1], shapeB, stridesB)) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "composition() expects static layouts created by make_layout()");
+        return nullptr;
+    }
+
+    return createLayoutFromStaticVectors(
+        callExpr, ctx,
+        LayoutOperation::computeCompositionLayout(shapeA, stridesA, shapeB,
+                                                 stridesB));
+}
+
+static mlir::Value createComplementFunction(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolvedArgs) {
+    if (callExpr->GetArgs().size() != 2 || resolvedArgs.size() != 2 ||
+        !resolvedArgs[0] || !resolvedArgs[1]) {
+        reportLayoutAlgebraError(ctx, callExpr,
+                                 "complement() expects a layout and a static "
+                                 "size");
+        return nullptr;
+    }
+
+    llvm::SmallVector<int64_t> shape;
+    llvm::SmallVector<int64_t> strides;
+    if (!extractStaticLayout(resolvedArgs[0], shape, strides)) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "complement() expects a static layout created by make_layout()");
+        return nullptr;
+    }
+
+    int64_t size = LayoutOperation::extractIndexValue(resolvedArgs[1]);
+    if (size == mlir::ShapedType::kDynamic || size <= 0) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "complement() expects a positive constant size argument");
+        return nullptr;
+    }
+
+    return createLayoutFromStaticVectors(
+        callExpr, ctx,
+        LayoutOperation::computeComplementLayout(shape, strides, size));
+}
+
+static mlir::Value createDivideFunction(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolvedArgs) {
+    if (callExpr->GetArgs().size() != 2 || resolvedArgs.size() != 2 ||
+        !resolvedArgs[0] || !resolvedArgs[1]) {
+        reportLayoutAlgebraError(ctx, callExpr,
+                                 "divide() expects exactly 2 layout "
+                                 "arguments");
+        return nullptr;
+    }
+
+    llvm::SmallVector<int64_t> shapeA;
+    llvm::SmallVector<int64_t> stridesA;
+    llvm::SmallVector<int64_t> shapeB;
+    llvm::SmallVector<int64_t> stridesB;
+    if (!extractStaticLayout(resolvedArgs[0], shapeA, stridesA) ||
+        !extractStaticLayout(resolvedArgs[1], shapeB, stridesB)) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "divide() expects static layouts created by make_layout()");
+        return nullptr;
+    }
+
+    int64_t sizeA = LayoutOperation::computeShapeProduct(shapeA);
+    auto complementB =
+        LayoutOperation::computeComplementLayout(shapeB, stridesB, sizeA);
+    if (complementB.first.empty()) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "divide() could not compute a complement for the divisor layout");
+        return nullptr;
+    }
+
+    auto tiledLayout =
+        LayoutOperation::concatenateStaticLayouts(
+            shapeB, stridesB, complementB.first, complementB.second);
+    return createLayoutFromStaticVectors(
+        callExpr, ctx,
+        LayoutOperation::computeCompositionLayout(
+            shapeA, stridesA, tiledLayout.first, tiledLayout.second));
+}
+
+static mlir::Value createProductFunction(
+    ast::Call *callExpr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolvedArgs) {
+    if (callExpr->GetArgs().size() != 2 || resolvedArgs.size() != 2 ||
+        !resolvedArgs[0] || !resolvedArgs[1]) {
+        reportLayoutAlgebraError(ctx, callExpr,
+                                 "product() expects exactly 2 layout "
+                                 "arguments");
+        return nullptr;
+    }
+
+    llvm::SmallVector<int64_t> shapeA;
+    llvm::SmallVector<int64_t> stridesA;
+    llvm::SmallVector<int64_t> shapeB;
+    llvm::SmallVector<int64_t> stridesB;
+    if (!extractStaticLayout(resolvedArgs[0], shapeA, stridesA) ||
+        !extractStaticLayout(resolvedArgs[1], shapeB, stridesB)) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "product() expects static layouts created by make_layout()");
+        return nullptr;
+    }
+
+    int64_t sizeA = LayoutOperation::computeShapeProduct(shapeA);
+    int64_t cosizeB = LayoutOperation::computeCoSize(shapeB, stridesB);
+    if (sizeA == mlir::ShapedType::kDynamic ||
+        cosizeB == mlir::ShapedType::kDynamic) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "product() requires static block size and codomain size");
+        return nullptr;
+    }
+
+    auto complementA =
+        LayoutOperation::computeComplementLayout(shapeA, stridesA,
+                                                 sizeA * cosizeB);
+    if (complementA.first.empty()) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "product() could not compute a complement for the first layout");
+        return nullptr;
+    }
+
+    auto tiledLayout = LayoutOperation::computeCompositionLayout(
+        complementA.first, complementA.second, shapeB, stridesB);
+    if (tiledLayout.first.empty()) {
+        reportLayoutAlgebraError(
+            ctx, callExpr,
+            "product() could not compose the complement with the tiler layout");
+        return nullptr;
+    }
+
+    return createLayoutFromStaticVectors(
+        callExpr, ctx,
+        LayoutOperation::concatenateStaticLayouts(
+            shapeA, stridesA, tiledLayout.first, tiledLayout.second));
+}
+
 static mlir::Location GetCallLocation(GeneratorContext *ctx,
                                       const ast::ASTNode *node) {
     auto *func_gen = ctx ? ctx->GetCurrentFunctionGenerator() : nullptr;
@@ -682,6 +937,41 @@ void AveLangModule::Initialize() {
                    llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
                     return LayoutOperation::createMakeLayoutFunction(
                         call_expr, gen_ctx, resolved_args);
+                });
+
+    AddFunction("composition",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return createCompositionFunction(call_expr, gen_ctx,
+                                                     resolved_args);
+                });
+
+    AddFunction("complement",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return createComplementFunction(call_expr, gen_ctx,
+                                                    resolved_args);
+                });
+
+    AddFunction("coalesce",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return createCoalesceFunction(call_expr, gen_ctx,
+                                                  resolved_args);
+                });
+
+    AddFunction("product",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return createProductFunction(call_expr, gen_ctx,
+                                                 resolved_args);
+                });
+
+    AddFunction("divide",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return createDivideFunction(call_expr, gen_ctx,
+                                                resolved_args);
                 });
 
     AddFunction(
