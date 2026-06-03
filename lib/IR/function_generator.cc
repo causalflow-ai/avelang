@@ -375,7 +375,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
     for (auto *stmt : func->GetBody()) {
         DispatchStmt(stmt);
-        if (builder_.getInsertionBlock()->mightHaveTerminator()) {
+        auto *block = builder_.getInsertionBlock();
+        if (block && block->mightHaveTerminator()) {
             break;
         }
     }
@@ -1307,7 +1308,8 @@ void FunctionGenerator::VisitIf(ast::If *if_stmt) {
             *folded ? if_stmt->GetBody() : if_stmt->GetOrelse();
         for (auto *stmt : body) {
             DispatchStmt(stmt);
-            if (builder_.getInsertionBlock()->mightHaveTerminator()) {
+            auto *block = builder_.getInsertionBlock(); 
+            if (block && block->mightHaveTerminator()) {
                 break;
             }
         }
