@@ -316,7 +316,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     std::string mangled_name;
     if (function_type_ == MLIRGenerator::FunctionType::kPrivateFunction) {
         mangled_name = parent_.GetMangledFunctionName(
-            func, &argument_address_spaces_, name_prefix_);
+            func, &argument_address_spaces_, name_prefix_,
+            &constexpr_values_);
         if (mangled_name.empty()) {
             ctx_->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,

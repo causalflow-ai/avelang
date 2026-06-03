@@ -11,7 +11,6 @@
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
-#include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
@@ -29,11 +28,11 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/JSON.h>
-#include <llvm/Support/raw_ostream.h>
 
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace causalflow::avelang::ir {
 
@@ -229,59 +228,28 @@ MLIRGeneratorImpl::MLIRGeneratorImpl(GeneratorContext *context)
     named_module_registry_.Initialize();
 }
 
-static std::string AddressSpaceTag(mlir::Attribute memorySpace) {
-    if (!memorySpace) {
-        return "default";
+static llvm::SmallVector<std::pair<std::string, mlir::Attribute>, 4>
+ToAddressSpaceBindings(const ArgAddressSpaceMap *arg_address_spaces) {
+    llvm::SmallVector<std::pair<std::string, mlir::Attribute>, 4> bindings;
+    if (!arg_address_spaces) {
+        return bindings;
     }
-    if (auto gpuSpace =
-            mlir::dyn_cast<mlir::gpu::AddressSpaceAttr>(memorySpace)) {
-        switch (gpuSpace.getValue()) {
-        case mlir::gpu::AddressSpace::Global:
-            return "global";
-        case mlir::gpu::AddressSpace::Workgroup:
-            return "workgroup";
-        case mlir::gpu::AddressSpace::Private:
-            return "private";
-        default:
-            break;
-        }
-        return "as" + std::to_string(static_cast<int>(gpuSpace.getValue()));
+    for (const auto &[name, address_space] : *arg_address_spaces) {
+        bindings.emplace_back(name, address_space);
     }
-    if (auto intSpace = mlir::dyn_cast<mlir::IntegerAttr>(memorySpace)) {
-        return "as" + std::to_string(intSpace.getInt());
-    }
-    return "unknown";
+    return bindings;
 }
 
-llvm::SmallVector<std::string, 4>
-MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
-    ast::FunctionDef *func,
-    const ArgAddressSpaceMap *arg_address_spaces) const {
-    llvm::SmallVector<std::string, 4> tags;
-    if (!func || !arg_address_spaces || arg_address_spaces->empty()) {
-        return tags;
+static llvm::SmallVector<std::pair<std::string, mlir::Value>, 4>
+ToConstexprBindings(const ConstexprValueMap *constexpr_values) {
+    llvm::SmallVector<std::pair<std::string, mlir::Value>, 4> bindings;
+    if (!constexpr_values) {
+        return bindings;
     }
-    auto *args = func->GetArguments();
-    if (!args) {
-        return tags;
+    for (const auto &[name, value] : *constexpr_values) {
+        bindings.emplace_back(name, value);
     }
-    for (auto *arg : args->GetArgs()) {
-        if (!arg) {
-            continue;
-        }
-        if (auto *attr_expr = llvm::dyn_cast_or_null<ast::AttributeExpr>(
-                arg->GetAnnotation())) {
-            if (attr_expr->GetAttr() == "constexpr") {
-                continue;
-            }
-        }
-        auto it = arg_address_spaces->find(arg->GetArgName());
-        if (it == arg_address_spaces->end()) {
-            continue;
-        }
-        tags.push_back(AddressSpaceTag(it->second));
-    }
-    return tags;
+    return bindings;
 }
 
 std::string MLIRGeneratorImpl::GetFunctionScopeName(
@@ -289,17 +257,13 @@ std::string MLIRGeneratorImpl::GetFunctionScopeName(
     if (!func) {
         return {};
     }
-    const auto &name = func->GetName();
-    if (name.empty()) {
-        return {};
-    }
-    auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
-    return MangleFunctionName({}, name, tags);
+    auto address_spaces = ToAddressSpaceBindings(arg_address_spaces);
+    return MangleFunctionName(func, {}, address_spaces, {});
 }
 
 std::string MLIRGeneratorImpl::GetMangledFunctionName(
     ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces,
-    llvm::StringRef name_prefix) {
+    llvm::StringRef name_prefix, const ConstexprValueMap *constexpr_values) {
     if (!func) {
         return {};
     }
@@ -311,8 +275,9 @@ std::string MLIRGeneratorImpl::GetMangledFunctionName(
     if (!name_prefix.empty()) {
         scope.push_back(name_prefix.str());
     }
-    auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
-    return MangleFunctionName(scope, name, tags);
+    auto address_spaces = ToAddressSpaceBindings(arg_address_spaces);
+    auto constexprs = ToConstexprBindings(constexpr_values);
+    return MangleFunctionName(func, scope, address_spaces, constexprs);
 }
 
 mlir::ModuleOp MLIRGeneratorImpl::CreateModule() {
