@@ -32,7 +32,8 @@ def AveLangMemRefAllocaOp : AveLang_MemRefOp<"alloca", []> {
         It mirrors memref.alloca but uses the !ave.memref type.
     }];
 
-    let arguments = (ins Variadic<Index>:$dynamicSizes);
+    let arguments = (ins Variadic<Index>:$dynamicSizes,
+                         OptionalAttr<I64Attr>:$alignment);
     let results = (outs AveLang_MemRef:$result);
 
     let assemblyFormat = [{

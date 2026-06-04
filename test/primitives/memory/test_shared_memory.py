@@ -25,6 +25,22 @@ def kernel_shm_basic(
 
 
 @avelang.jit
+def kernel_shm_manual_alignment(
+    input_data: S.Tensor((32,), S.i32),
+    output_data: S.Tensor((32,), S.i32),
+):
+    shared_buf = S.make_shared((32,), S.i32, 128)
+
+    thread_id = S.thread_id(0)
+
+    shared_buf[thread_id] = input_data[thread_id]
+
+    S.syncthreads()
+
+    output_data[thread_id] = shared_buf[31 - thread_id]
+
+
+@avelang.jit
 def kernel_shm_2d(
     input_matrix: S.Tensor((16, 16), S.f32),
     output_matrix: S.Tensor((16, 16), S.f32),
@@ -129,6 +145,25 @@ class TestSharedMemoryOps(unittest.TestCase):
         expected = torch.cat([input_data[1:], input_data[0:1]])
 
         kernel_shm_basic[lambda: ((1, 1, 1), (32, 1, 1))](input_data, output_data)
+
+        actual = output_data.cpu()
+        expected = expected.cpu()
+
+        self.assertTrue(
+            torch.equal(actual, expected),
+            f"Expected: {expected.tolist()}, Actual: {actual.tolist()}",
+        )
+
+    def test_manual_alignment_shared_memory(self):
+        """Test shared memory allocation with an explicit alignment."""
+        input_data = torch.arange(32, dtype=torch.int32, device="cuda")
+        output_data = torch.zeros(32, dtype=torch.int32, device="cuda")
+
+        expected = torch.flip(input_data, dims=(0,))
+
+        kernel_shm_manual_alignment[lambda: ((1, 1, 1), (32, 1, 1))](
+            input_data, output_data
+        )
 
         actual = output_data.cpu()
         expected = expected.cpu()

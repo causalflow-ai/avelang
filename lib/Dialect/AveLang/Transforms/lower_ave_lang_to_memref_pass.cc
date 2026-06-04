@@ -1113,9 +1113,11 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
         resultType.getShape(), resultType.getElementType(),
         mlir::MemRefLayoutAttrInterface(), normalizedMemorySpace);
 
-    mlir::IntegerAttr alignmentAttr;
-    if (auto alignment = getPreferredAlignment(resultType.getElementType())) {
-        alignmentAttr = rewriter.getI64IntegerAttr(*alignment);
+    mlir::IntegerAttr alignmentAttr = op.getAlignmentAttr();
+    if (!alignmentAttr) {
+        if (auto alignment = getPreferredAlignment(resultType.getElementType())) {
+            alignmentAttr = rewriter.getI64IntegerAttr(*alignment);
+        }
     }
 
     auto buildResultWithTypedAlloca = [&]() -> mlir::Value {

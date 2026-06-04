@@ -1277,23 +1277,29 @@ static mlir::Value
 CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
                                 llvm::ArrayRef<mlir::Value> resolved_args,
                                 mlir::gpu::AddressSpace addressSpace,
-                                const std::string &functionName) {
+                                const std::string &functionName,
+                                bool allowAlignmentArg = false) {
     auto location = GetCallLocation(ctx, call_expr);
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
 
     const auto &args = call_expr->GetArgs();
 
-    if (args.size() != 2) {
-        std::string error_msg =
-            functionName +
-            "() only supports (shape, dtype) with static shape and no strides";
+    if (args.size() != 2 && !(allowAlignmentArg && args.size() == 3)) {
+        std::string error_msg = functionName +
+                                (allowAlignmentArg
+                                     ? "() only supports (shape, dtype) or "
+                                       "(shape, dtype, alignment) with static "
+                                       "shape and no strides"
+                                     : "() only supports (shape, dtype) with "
+                                       "static shape and no strides");
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << error_msg;
         return nullptr;
     }
 
-    if (resolved_args.size() < args.size() || !resolved_args[0]) {
+    if (resolved_args.size() < args.size() || !resolved_args[0] ||
+        (args.size() == 3 && !resolved_args[2])) {
         std::string error_msg =
             "Failed to resolve " + functionName + "() arguments";
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
@@ -1308,13 +1314,35 @@ CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
     mlir::Attribute memorySpaceAttr =
         mlir::gpu::AddressSpaceAttr::get(builder.getContext(), addressSpace);
 
-    // The last argument is always the dtype
-    int dtypeArgIndex = args.size() - 1;
+    int dtypeArgIndex = 1;
     mlir::Type elementType = resolveAndValidateTensorElementType(
         args[dtypeArgIndex], ctx, call_expr->GetSourceRange().getBegin(),
         functionName);
     if (!elementType) {
         return nullptr;
+    }
+
+    mlir::IntegerAttr alignmentAttr;
+    if (allowAlignmentArg && args.size() == 3) {
+        auto alignment = ConstantFolder::FoldIntValue(resolved_args[2]);
+        if (!alignment) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                args[2]->GetSourceRange().getBegin())
+                << functionName
+                << "() alignment must be an integer constant byte width";
+            return nullptr;
+        }
+        if (*alignment <= 0 ||
+            (*alignment & (*alignment - static_cast<int64_t>(1))) != 0) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                args[2]->GetSourceRange().getBegin())
+                << functionName
+                << "() alignment must be a positive power-of-two byte width";
+            return nullptr;
+        }
+        alignmentAttr = builder.getI64IntegerAttr(*alignment);
     }
 
     if (resolved_args[0].getDefiningOp<cf::MakeLayoutOp>()) {
@@ -1418,8 +1446,12 @@ CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
                 builder.setInsertionPointToStart(entry_block);
             }
         }
-        alloca = cf::AveLangMemRefAllocaOp::create(builder, location, baseType,
-                                                   mlir::ValueRange{});
+        auto allocaOp = cf::AveLangMemRefAllocaOp::create(
+            builder, location, baseType, mlir::ValueRange{});
+        if (alignmentAttr) {
+            allocaOp->setAttr("alignment", alignmentAttr);
+        }
+        alloca = allocaOp.getResult();
     }
 
     mlir::Value layoutValue;
@@ -1453,7 +1485,8 @@ mlir::Value AveLangModule::CreateMakeSharedFunction(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateMakeTensorWithMemorySpace(call_expr, ctx, resolved_args,
                                            mlir::gpu::AddressSpace::Workgroup,
-                                           "make_shared");
+                                           "make_shared",
+                                           /*allowAlignmentArg=*/true);
 }
 
 mlir::Value AveLangModule::CreateSubviewFunction(

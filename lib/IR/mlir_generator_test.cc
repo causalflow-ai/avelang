@@ -1,4 +1,5 @@
 #include "Dialect/AveLang/IR/AveLangOps.h"
+#include "Dialect/AveLang/Transforms/lower_ave_lang_to_memref_pass.h"
 #include "Frontend/avelang_parser.h"
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
@@ -11,6 +12,7 @@
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Pass/PassManager.h>
@@ -1184,6 +1186,84 @@ def alloc_shared_test(input: S.Tensor((32,), S.i32),
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRAllocSharedWithManualAlignment) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def alloc_shared_aligned_test(output: S.Tensor((1,), S.i32)):
+    shared_mem = S.make_shared((8,), S.i32, 128)
+    shared_mem[0] = 7
+    output[0] = shared_mem[0]
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool foundAlignedSharedAlloca = false;
+    mlir->walk([&](cf::AveLangMemRefAllocaOp op) {
+        auto memrefType =
+            mlir::dyn_cast<cf::MemRefType>(op.getResult().getType());
+        if (!memrefType || !memrefType.getElementType().isInteger(8)) {
+            return;
+        }
+        auto addrSpace = mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
+            memrefType.getMemorySpace());
+        if (!addrSpace ||
+            addrSpace.getValue() != mlir::gpu::AddressSpace::Workgroup) {
+            return;
+        }
+
+        foundAlignedSharedAlloca = true;
+        ASSERT_TRUE(op.getAlignmentAttr());
+        EXPECT_EQ(op.getAlignmentAttr().getInt(), 128);
+    });
+
+    EXPECT_TRUE(foundAlignedSharedAlloca);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(cf::createLowerAveLangToMemRefPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    bool foundLoweredAlignedAlloca = false;
+    mlir->walk([&](mlir::memref::AllocaOp op) {
+        auto memrefType = op.getType();
+        auto shape = memrefType.getShape();
+        if (!memrefType.getElementType().isInteger(8) ||
+            shape.size() != 1 || shape[0] != 32) {
+            return;
+        }
+        auto addrSpace = mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
+            memrefType.getMemorySpace());
+        if (!addrSpace ||
+            addrSpace.getValue() != mlir::gpu::AddressSpace::Workgroup) {
+            return;
+        }
+
+        foundLoweredAlignedAlloca = true;
+        ASSERT_TRUE(op.getAlignmentAttr());
+        EXPECT_EQ(op.getAlignmentAttr().getInt(), 128);
+    });
+
+    EXPECT_TRUE(foundLoweredAlignedAlloca);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "Lowered MLIR verification failed!";
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRAllocSharedWithFoldedShapeExprs) {
