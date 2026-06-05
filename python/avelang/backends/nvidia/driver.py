@@ -352,5 +352,19 @@ class NvidiaDriver(GPUDriver):
 
         major, minor = torch.cuda.get_device_capability()
         arch = f"sm_{major}{minor}"
+        if major == 9 and minor == 0:
+            # torch.cuda.get_device_capability() returns only the numeric
+            # capability tuple and strips architecture suffixes such as "a" or
+            # "f" (see pytorch/pytorch#172807). Building the arch string
+            # directly from that tuple can therefore select the wrong target on
+            # hardware where suffix-specific features matter.
+            #
+            # Default Hopper to sm_90a so architecture-specific features such as
+            # WGMMA are available; these features are also required by NVIDIA
+            # CUTLASS. Users should be aware that suffixed targets are not
+            # cross-compatible with the base target. See NVIDIA's CUDA C
+            # Programming Guide, "Feature Availability":
+            # https://docs.nvidia.com/cuda/cuda-c-programming-guide/#feature-availability
+            arch = "sm_90a"
 
         return GPUTarget("nvptx64-nvidia-cuda", arch)
