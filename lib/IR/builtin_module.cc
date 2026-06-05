@@ -1277,21 +1277,17 @@ static mlir::Value
 CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
                                 llvm::ArrayRef<mlir::Value> resolved_args,
                                 mlir::gpu::AddressSpace addressSpace,
-                                const std::string &functionName,
-                                bool allowAlignmentArg = false) {
+                                const std::string &functionName) {
     auto location = GetCallLocation(ctx, call_expr);
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
 
     const auto &args = call_expr->GetArgs();
 
-    if (args.size() != 2 && !(allowAlignmentArg && args.size() == 3)) {
+    if (args.size() != 2 && args.size() != 3) {
         std::string error_msg = functionName +
-                                (allowAlignmentArg
-                                     ? "() only supports (shape, dtype) or "
-                                       "(shape, dtype, alignment) with static "
-                                       "shape and no strides"
-                                     : "() only supports (shape, dtype) with "
-                                       "static shape and no strides");
+                                "() only supports (shape, dtype) or "
+                                "(shape, dtype, alignment) with static "
+                                "shape and no strides";
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << error_msg;
@@ -1323,7 +1319,7 @@ CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
     }
 
     mlir::IntegerAttr alignmentAttr;
-    if (allowAlignmentArg && args.size() == 3) {
+    if (args.size() == 3) {
         auto alignment = ConstantFolder::FoldIntValue(resolved_args[2]);
         if (!alignment) {
             ctx->diagnostic_manager->Report(
@@ -1485,8 +1481,7 @@ mlir::Value AveLangModule::CreateMakeSharedFunction(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateMakeTensorWithMemorySpace(call_expr, ctx, resolved_args,
                                            mlir::gpu::AddressSpace::Workgroup,
-                                           "make_shared",
-                                           /*allowAlignmentArg=*/true);
+                                           "make_shared");
 }
 
 mlir::Value AveLangModule::CreateSubviewFunction(
