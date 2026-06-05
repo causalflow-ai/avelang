@@ -23,13 +23,16 @@ def _build(
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     so = os.path.join(srcdir, "{name}{suffix}".format(name=name, suffix=suffix))
     # try to avoid setuptools if possible
-    cc = os.environ.get("CC")
+    is_cxx = os.path.splitext(src)[1] in (".cc", ".cpp", ".cxx")
+    cc = os.environ.get("CXX" if is_cxx else "CC")
     if cc is None:
-        clang = shutil.which("clang")
-        gcc = shutil.which("gcc")
+        clang = shutil.which("clang++" if is_cxx else "clang")
+        gcc = shutil.which("g++" if is_cxx else "gcc")
         cc = gcc if gcc is not None else clang
         if cc is None:
-            raise RuntimeError("Failed to find C compiler. Please specify via the CC environment variable.")
+            compiler = "C++" if is_cxx else "C"
+            env_var = "CXX" if is_cxx else "CC"
+            raise RuntimeError(f"Failed to find {compiler} compiler. Please specify via the {env_var} environment variable.")
     # This function was renamed and made public in Python 3.10
     if hasattr(sysconfig, "get_default_scheme"):
         scheme = sysconfig.get_default_scheme()
@@ -74,9 +77,10 @@ def compile_module_from_src(
     include_dirs: list[str] | None = None,
     libraries: list[str] | None = None,
     ccflags: list[str] | None = None,
+    src_extension: str = ".c",
 ) -> ModuleType:
     with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, name + ".c")
+        src_path = os.path.join(tmpdir, name + src_extension)
         with open(src_path, "w") as f:
             f.write(src)
         so = _build(name, src_path, tmpdir, library_dirs or [], include_dirs or [], libraries or [], ccflags or [])

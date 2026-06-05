@@ -118,20 +118,18 @@ LAUNCHER_PROLOGUE = """
 #include <hip/hip_runtime_api.h>
 #include <Python.h>
 #include <stdbool.h>
-#include <string.h>
+#include <cstdint>
+#include <string>
 
 static inline void gpuAssert(hipError_t code, const char *file, int line)
 {
    if (code != hipSuccess)
    {
-      const char* prefix = "ave-lang Error [HIP]: ";
-      const char* str = hipGetErrorString(code);
-      char err[1024] = {0,};
-      strcat(err, prefix);
-      strcat(err, str);
+      std::string err = "ave-lang Error [HIP]: ";
+      err += hipGetErrorString(code);
       PyGILState_STATE gil_state;
       gil_state = PyGILState_Ensure();
-      PyErr_SetString(PyExc_RuntimeError, err);
+      PyErr_SetString(PyExc_RuntimeError, err.c_str());
       PyGILState_Release(gil_state);
    }
 }
@@ -154,6 +152,7 @@ static PyObject* data_ptr_str = NULL;
 
 static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
   DevicePtrInfo ptr_info;
+  PyObject *ret = NULL;
   ptr_info.dev_ptr = 0;
   ptr_info.valid = true;
   if (PyLong_Check(obj)) {
@@ -164,7 +163,7 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     // valid nullptr
     return ptr_info;
   }
-  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
+  ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
   if (!ret) {
     PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
     ptr_info.valid = false;
@@ -176,11 +175,12 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     goto cleanup;
   }
   ptr_info.dev_ptr = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(ret);
+  if (PyErr_Occurred()) {
+    ptr_info.valid = false;
+    goto cleanup;
+  }
   if(!ptr_info.dev_ptr)
-    return ptr_info;
-
-  // In HIP, device pointers can be used directly
-  // No need for additional attribute lookup like in CUDA
+    goto cleanup;
 
 cleanup:
   Py_XDECREF(ret);
@@ -383,6 +383,7 @@ class HipLauncher:
             include_dirs=include_dirs,
             libraries=libraries,
             ccflags=["-D__HIP_PLATFORM_AMD__"],
+            src_extension=".cpp",
         )
         self.launch = mod.launch
 
