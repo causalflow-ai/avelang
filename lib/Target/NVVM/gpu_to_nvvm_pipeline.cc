@@ -2,6 +2,8 @@
 #include "Dialect/AveLang/Transforms/normalize_ave_lang_return_pass.h"
 
 #include <mlir/Conversion/AffineToStandard/AffineToStandard.h>
+#include <mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h>
+#include <mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h>
 #include <mlir/Conversion/Passes.h>
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
@@ -9,15 +11,110 @@
 #include <mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
+#include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/MemRef/Transforms/Passes.h>
+#include <mlir/IR/SymbolTable.h>
+#include <mlir/Interfaces/FunctionInterfaces.h>
 #include <mlir/Pass/PassManager.h>
+#include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Transforms/Passes.h>
 
 namespace causalflow::avelang::target::nvvm {
 
 using namespace mlir;
 
-static const int kIndexBitwidth = 32;
+static const int kIndexBitwidth = 64;
+static const int64_t kNVVMWorkgroupAttributionAlignment = 128;
+
+namespace {
+
+class SetNVVMWorkgroupAttributionAlignPass
+    : public PassWrapper<SetNVVMWorkgroupAttributionAlignPass,
+                         OperationPass<gpu::GPUModuleOp>> {
+  public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        SetNVVMWorkgroupAttributionAlignPass)
+
+    void runOnOperation() override {
+        Builder builder(&getContext());
+        getOperation().walk([&](gpu::GPUFuncOp func) {
+            for (unsigned index = 0,
+                          end = func.getNumWorkgroupAttributions();
+                 index < end; ++index) {
+                func.setWorkgroupAttributionAttr(
+                    index, LLVM::LLVMDialect::getAlignAttrName(),
+                    builder.getI64IntegerAttr(
+                        kNVVMWorkgroupAttributionAlignment));
+            }
+        });
+    }
+
+    StringRef getArgument() const final {
+        return "set-nvvm-workgroup-attribution-align";
+    }
+
+    StringRef getDescription() const final {
+        return "Set NVVM workgroup attribution alignment";
+    }
+};
+
+static std::unique_ptr<Pass> createSetNVVMWorkgroupAttributionAlignPass() {
+    return std::make_unique<SetNVVMWorkgroupAttributionAlignPass>();
+}
+
+class SetNVVMTmaDescriptorABIAttributesPass
+    : public PassWrapper<SetNVVMTmaDescriptorABIAttributesPass,
+                         OperationPass<gpu::GPUModuleOp>> {
+  public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        SetNVVMTmaDescriptorABIAttributesPass)
+
+    void runOnOperation() override {
+        Builder builder(&getContext());
+        getOperation().walk([&](LLVM::LLVMFuncOp func) {
+            auto tmaIndices = func->getAttrOfType<DenseI32ArrayAttr>(
+                "ave.nv_tma_desc_indices");
+            if (!tmaIndices) {
+                return;
+            }
+            for (int32_t index : tmaIndices.asArrayRef()) {
+                // Match Triton's nvTmaDesc ABI: a descriptor is an aligned,
+                // by-value grid-constant CUtensorMap kernel argument.
+                auto descriptorBytes = LLVM::LLVMArrayType::get(
+                    &getContext(), builder.getI8Type(), 128);
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(LLVM::LLVMDialect::getByValAttrName()),
+                    TypeAttr::get(descriptorBytes));
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(NVVM::NVVMDialect::getGridConstantAttrName()),
+                    builder.getUnitAttr());
+                function_interface_impl::setArgAttr(
+                    func, index,
+                    builder.getStringAttr(LLVM::LLVMDialect::getAlignAttrName()),
+                    builder.getI32IntegerAttr(64));
+            }
+            func->removeAttr("ave.nv_tma_desc_indices");
+        });
+    }
+
+    StringRef getArgument() const final {
+        return "set-nvvm-tma-descriptor-abi-attributes";
+    }
+
+    StringRef getDescription() const final {
+        return "Set NVVM by-value grid-constant attributes on TMA descriptors";
+    }
+};
+
+static std::unique_ptr<Pass> createSetNVVMTmaDescriptorABIAttributesPass() {
+    return std::make_unique<SetNVVMTmaDescriptorABIAttributesPass>();
+}
+
+} // namespace
 
 static void buildCommonPassPipeline(OpPassManager &pm,
                                     const NVVMToLLVMPipelineOptions &options) {
@@ -49,12 +146,18 @@ static void buildGpuPassPipeline(OpPassManager &pm,
     nvvmOptions.triple = options.triple;
     nvvmOptions.optLevel = options.optimization_level;
     pm.addPass(createGpuNVVMAttachTarget(nvvmOptions));
+    pm.addNestedPass<gpu::GPUModuleOp>(
+        createSetNVVMWorkgroupAttributionAlignPass());
 
     ConvertGpuOpsToNVVMOpsOptions convertOptions;
     convertOptions.indexBitwidth = kIndexBitwidth;
     convertOptions.useBarePtrCallConv = options.use_bare_ptr_memref_call_conv;
     pm.addNestedPass<gpu::GPUModuleOp>(
         createConvertGpuOpsToNVVMOps(convertOptions));
+    pm.addNestedPass<gpu::GPUModuleOp>(
+        createSetNVVMTmaDescriptorABIAttributesPass());
+    pm.addNestedPass<gpu::GPUModuleOp>(createConvertNVGPUToNVVMPass());
+    pm.addPass(createConvertNVVMToLLVMPass());
 
     // Add vector-to-LLVM pass to lower vector operations from intrinsics
     pm.addNestedPass<gpu::GPUModuleOp>(createConvertVectorToLLVMPass());

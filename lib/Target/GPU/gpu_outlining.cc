@@ -109,6 +109,18 @@ class GpuOutliningPass
                 );
                 gpuFunc->setAttr(mlir::gpu::GPUDialect::getKernelFuncAttrName(),
                                  builder.getUnitAttr());
+                llvm::SmallVector<int32_t> tmaDescriptorIndices;
+                for (unsigned index = 0; index < funcOp.getNumArguments();
+                     ++index) {
+                    if (funcOp.getArgAttr(index, "ave.nv_tma_desc")) {
+                        tmaDescriptorIndices.push_back(index);
+                    }
+                }
+                if (!tmaDescriptorIndices.empty()) {
+                    gpuFunc->setAttr(
+                        "ave.nv_tma_desc_indices",
+                        builder.getDenseI32ArrayAttr(tmaDescriptorIndices));
+                }
 
                 // Copy function body
                 mlir::IRMapping mapping;
