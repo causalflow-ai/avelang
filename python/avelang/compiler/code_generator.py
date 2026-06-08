@@ -128,10 +128,15 @@ def _collect_constexpr_jit_dependencies(src) -> list:
     constants = getattr(src, "constants", None) or {}
     global_constants = getattr(src, "global_constants", None) or {}
     deps = []
+    seen = set()
     for info in list(constants.values()) + list(global_constants.values()):
         dep = info.get("_jit_callable") if isinstance(info, dict) else None
-        if isinstance(dep, JITCallable):
-            deps.extend(_collect_jit_dependencies(dep))
+        if isinstance(dep, JITCallable) and dep not in seen:
+            seen.add(dep)
+            for sub_dep in _collect_jit_dependencies(dep):
+                if sub_dep not in seen:
+                    seen.add(sub_dep)
+                    deps.append(sub_dep)
             deps.append(dep)
     return deps
 
