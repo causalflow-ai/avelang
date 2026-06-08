@@ -359,7 +359,10 @@ void MLIRGeneratorImpl::RegisterJitDependency(ast::FunctionDef *func) {
     if (name.empty()) {
         return;
     }
-    if (!ctx_ || !ctx_->GetCurrentFunctionGenerator()) {
+    if (!ctx_ || !ctx_->syms) {
+        return;
+    }
+    if (!ctx_->GetCurrentFunctionGenerator()) {
         jit_function_deps_[name] = func;
     }
     AddJitFunctionSymbol(ctx_->syms->GetCurrentFrame(), name, func);
@@ -367,6 +370,10 @@ void MLIRGeneratorImpl::RegisterJitDependency(ast::FunctionDef *func) {
 
 llvm::Error MLIRGeneratorImpl::RegisterJitDependencyAlias(
     llvm::StringRef alias, llvm::StringRef dependency_name) {
+    if (!ctx_ || !ctx_->syms) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "Generator context or symbol table is not initialized");
+    }
     if (alias.empty() || dependency_name.empty()) {
         return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                        "JIT dependency alias is empty");
