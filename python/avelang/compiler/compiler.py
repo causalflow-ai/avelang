@@ -28,6 +28,8 @@ class ASTSource:
         sorted_sig = [v for k, v in sorted(self.signature.items())]
 
         def get_key(x):
+            if isinstance(x, dict) and "_jit_callable" in x:
+                return x["_jit_callable"].cache_key
             return x.cache_key if hasattr(x, "cache_key") else str(x)
 
         constants_key = "-".join([get_key(v) for k, v in sorted(self.constants.items())])
