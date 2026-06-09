@@ -58,9 +58,7 @@ class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
     mlir::Value VisitImportFrom(ast::ImportFrom *import_from_stmt);
 
     mlir::Value GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
-                                 llvm::ArrayRef<mlir::Value> resolved_args,
-                                 llvm::ArrayRef<size_t> source_arg_indices = {},
-                                 bool use_source_arg_indices = false);
+                                 llvm::ArrayRef<mlir::Value> resolved_args);
     mlir::Value
     GenerateJitFunctionCall(ast::Call *call, ast::FunctionDef *func,
                             llvm::ArrayRef<mlir::Value> resolved_args);
@@ -74,6 +72,11 @@ class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
     mlir::Location GetMLIRLocation(clang::SourceLocation loc) const;
 
   private:
+    mlir::Value
+    GenerateFuncCallWithArgs(ast::Call *call, mlir::func::FuncOp func_op,
+                             llvm::ArrayRef<mlir::Value> resolved_args,
+                             llvm::ArrayRef<ast::Expr *> arg_exprs);
+
     mlir::Value EnsureCompatibleTypes(mlir::Value value, mlir::Type source_type,
                                       mlir::Type target_type,
                                       clang::SourceLocation loc);
@@ -185,8 +188,9 @@ class MLIRGeneratorImpl {
     llvm::SmallVector<std::string, 4> GetFunctionAddressSpaceTags(
         ast::FunctionDef *func,
         const ArgAddressSpaceMap *arg_address_spaces) const;
-    llvm::SmallVector<std::string, 4> GetFunctionConstexprTags(
-        ast::FunctionDef *func, const ConstexprValueMap *constexpr_values) const;
+    llvm::SmallVector<std::string, 4>
+    GetFunctionConstexprTags(ast::FunctionDef *func,
+                             const ConstexprValueMap *constexpr_values) const;
     std::string getArgName(ast::ASTNode *arg);
     void HandleImport(ast::Import *import_stmt);
     void HandleImportFrom(ast::ImportFrom *import_from_stmt);
