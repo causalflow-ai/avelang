@@ -3,6 +3,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from ... import knobs
 from ...runtime.build import compile_module_from_src
 from ..compiler import GPUTarget
 from ..driver import GPUDriver
@@ -63,7 +64,7 @@ def get_library_dirs():
         "/usr/lib",
     ]
 
-    env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
+    env_ld_library_path = knobs.build.ld_library_path
     if env_ld_library_path:
         common_lib_paths.extend(env_ld_library_path.split(":"))
 
