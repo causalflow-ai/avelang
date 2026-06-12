@@ -12,9 +12,11 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Optional
 
+from .. import knobs
 
-CACHE_DIR_ENV = "AVELANG_CACHE_DIR"
-DISABLE_CACHE_ENV = "AVELANG_DISABLE_CACHE"
+
+CACHE_DIR_ENV = knobs.CACHE_DIR_ENV
+DISABLE_CACHE_ENV = knobs.DISABLE_CACHE_ENV
 
 
 class CacheManager(ABC):
@@ -108,16 +110,11 @@ def _base32(key: str) -> str:
 
 
 def default_cache_dir() -> str:
-    if cache_dir := os.environ.get(CACHE_DIR_ENV):
-        return os.path.abspath(os.path.expanduser(cache_dir))
-    base = os.environ.get("XDG_CACHE_HOME")
-    if base:
-        return os.path.join(os.path.abspath(os.path.expanduser(base)), "avelang")
-    return os.path.join(Path.home(), ".cache", "avelang")
+    return os.path.abspath(os.path.expanduser(knobs.cache.dir))
 
 
 def is_cache_disabled() -> bool:
-    return os.environ.get(DISABLE_CACHE_ENV, "").lower() in {"1", "true", "yes", "on"}
+    return knobs.cache.disabled
 
 
 def get_cache_manager(key: str) -> CacheManager:

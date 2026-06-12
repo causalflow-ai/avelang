@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from avelang import knobs
 from avelang.backends.compiler import GPUTarget
-from avelang.compiler.cache import CACHE_DIR_ENV, DISABLE_CACHE_ENV
 from avelang.compiler.compiler import ASTSource
 from avelang.compiler import compiler as compiler_mod
 
@@ -60,10 +60,10 @@ class TestCompilerCache(unittest.TestCase):
     def test_reuses_cached_binary_for_same_source_target_and_options(self):
         first_backend = _DummyBackend(self.target)
         second_backend = _DummyBackend(self.target)
-        env = {CACHE_DIR_ENV: self.tmpdir.name}
+        env = {knobs.CACHE_DIR_ENV: self.tmpdir.name}
 
         with mock.patch.dict(os.environ, env, clear=False):
-            os.environ.pop(DISABLE_CACHE_ENV, None)
+            os.environ.pop(knobs.DISABLE_CACHE_ENV, None)
             first = self._compile_with_backend(first_backend, self._src(), {"dummy_option": 4})
             second = self._compile_with_backend(second_backend, self._src(), {"dummy_option": 4})
 
@@ -77,10 +77,10 @@ class TestCompilerCache(unittest.TestCase):
 
     def test_cache_key_includes_backend_options(self):
         backend = _DummyBackend(self.target)
-        env = {CACHE_DIR_ENV: self.tmpdir.name}
+        env = {knobs.CACHE_DIR_ENV: self.tmpdir.name}
 
         with mock.patch.dict(os.environ, env, clear=False):
-            os.environ.pop(DISABLE_CACHE_ENV, None)
+            os.environ.pop(knobs.DISABLE_CACHE_ENV, None)
             first = self._compile_with_backend(backend, self._src(), {"dummy_option": 4})
             second = self._compile_with_backend(backend, self._src(), {"dummy_option": 8})
 
@@ -90,10 +90,10 @@ class TestCompilerCache(unittest.TestCase):
 
     def test_cache_key_includes_source_hash(self):
         backend = _DummyBackend(self.target)
-        env = {CACHE_DIR_ENV: self.tmpdir.name}
+        env = {knobs.CACHE_DIR_ENV: self.tmpdir.name}
 
         with mock.patch.dict(os.environ, env, clear=False):
-            os.environ.pop(DISABLE_CACHE_ENV, None)
+            os.environ.pop(knobs.DISABLE_CACHE_ENV, None)
             first = self._compile_with_backend(backend, self._src("source-a"), {"dummy_option": 4})
             second = self._compile_with_backend(backend, self._src("source-b"), {"dummy_option": 4})
 
@@ -118,7 +118,7 @@ class TestCompilerCache(unittest.TestCase):
 
     def test_disable_cache_env_bypasses_reads_and_writes(self):
         backend = _DummyBackend(self.target)
-        env = {CACHE_DIR_ENV: self.tmpdir.name, DISABLE_CACHE_ENV: "1"}
+        env = {knobs.CACHE_DIR_ENV: self.tmpdir.name, knobs.DISABLE_CACHE_ENV: "1"}
 
         with mock.patch.dict(os.environ, env, clear=False):
             first = self._compile_with_backend(backend, self._src(), {"dummy_option": 4})
