@@ -74,6 +74,7 @@ class env_base(Generic[SetType, GetType]):
     def __set__(self, obj: object, value: Union[SetType, Env]) -> None:
         if isinstance(value, Env):
             obj.__dict__.pop(self.name, None)
+            setenv(self.key, None)
             return
         obj.__dict__[self.name] = value
         env_value = toenv(value)
@@ -82,6 +83,7 @@ class env_base(Generic[SetType, GetType]):
 
     def __delete__(self, obj: object) -> None:
         obj.__dict__.pop(self.name, None)
+        setenv(self.key, None)
 
     def get(self) -> GetType:
         raise NotImplementedError
@@ -131,7 +133,12 @@ knobs_type = TypeVar("knobs_type", bound="base_knobs")
 class base_knobs:
     @property
     def knob_descriptors(self) -> dict[str, env_base]:
-        return {name: value for name, value in type(self).__dict__.items() if isinstance(value, env_base)}
+        descriptors = {}
+        for cls in type(self).__mro__:
+            for name, value in cls.__dict__.items():
+                if isinstance(value, env_base) and name not in descriptors:
+                    descriptors[name] = value
+        return descriptors
 
     @property
     def knobs(self) -> dict[str, Any]:
