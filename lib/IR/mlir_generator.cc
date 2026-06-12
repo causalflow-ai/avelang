@@ -2,6 +2,7 @@
 #include "AST/ast_nodes_expr.h"
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "Utils/assert.h"
+#include "constant_folder.h"
 #include "generator_context.h"
 #include "mangler.h"
 #include "mlir_generator_impl.h"
@@ -31,6 +32,7 @@
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <cctype>
 #include <limits>
 #include <memory>
 #include <string>
@@ -199,6 +201,18 @@ MLIRGenerator::VisitFunctionDefWithType(ast::FunctionDef *func,
         return E;
     impl_->SnapshotModuleSymbolTable();
 
+    if (func_type == FunctionType::kPrivateFunction) {
+        if (auto *args = func->GetArguments()) {
+            for (auto *arg : args->GetArgs()) {
+                auto *annotation = llvm::dyn_cast_or_null<ast::AttributeExpr>(
+                    arg ? arg->GetAnnotation() : nullptr);
+                if (annotation && annotation->GetAttr() == "constexpr") {
+                    return llvm::Error::success();
+                }
+            }
+        }
+    }
+
     FunctionGenerator function_generator(*impl_, func_type);
     function_generator.Generate(func);
     return llvm::Error::success();
@@ -241,6 +255,77 @@ static std::string AddressSpaceTag(mlir::Attribute memorySpace) {
     return "unknown";
 }
 
+static std::string SanitizeManglePart(llvm::StringRef value) {
+    std::string result;
+    result.reserve(value.size());
+    for (char c : value) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) {
+            result.push_back(c);
+        } else if (c == '-') {
+            result.push_back('m');
+        } else {
+            result.push_back('_');
+        }
+    }
+    return result;
+}
+
+static std::string TypeTag(mlir::Type type) {
+    if (!type) {
+        return "unknown";
+    }
+    if (type.isIndex()) {
+        return "index";
+    }
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
+        return "i" + std::to_string(intType.getWidth());
+    }
+    if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
+        return "f" + std::to_string(floatType.getWidth());
+    }
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    type.print(os);
+    return SanitizeManglePart(os.str());
+}
+
+static std::optional<std::string> ConstexprValueTag(mlir::Value value) {
+    if (!value) {
+        return std::nullopt;
+    }
+
+    std::string type = TypeTag(value.getType());
+    if (value.getType().isInteger(1)) {
+        if (auto boolValue = ConstantFolder::FoldBoolValue(value)) {
+            return type + "_" + (*boolValue ? "1" : "0");
+        }
+    }
+    if (value.getType().isIntOrIndex()) {
+        if (auto intValue = ConstantFolder::FoldIntValue(value)) {
+            return type + "_" + SanitizeManglePart(std::to_string(*intValue));
+        }
+    }
+    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(
+                constOp.getValue())) {
+            std::string storage;
+            llvm::raw_string_ostream os(storage);
+            floatAttr.print(os);
+            return type + "_" + SanitizeManglePart(os.str());
+        }
+    }
+
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    if (auto *op = value.getDefiningOp()) {
+        op->print(os);
+    } else {
+        value.print(os);
+    }
+    return type + "_expr_" + SanitizeManglePart(os.str());
+}
+
 llvm::SmallVector<std::string, 4>
 MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
     ast::FunctionDef *func,
@@ -272,6 +357,38 @@ MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
     return tags;
 }
 
+llvm::SmallVector<std::string, 4> MLIRGeneratorImpl::GetFunctionConstexprTags(
+    ast::FunctionDef *func, const ConstexprValueMap *constexpr_values) const {
+    llvm::SmallVector<std::string, 4> tags;
+    if (!func || !constexpr_values || constexpr_values->empty()) {
+        return tags;
+    }
+    auto *args = func->GetArguments();
+    if (!args) {
+        return tags;
+    }
+    for (auto *arg : args->GetArgs()) {
+        if (!arg) {
+            continue;
+        }
+        auto *attr_expr = llvm::dyn_cast_or_null<ast::AttributeExpr>(
+            arg->GetAnnotation());
+        if (!attr_expr || attr_expr->GetAttr() != "constexpr") {
+            continue;
+        }
+        auto it = constexpr_values->find(arg->GetArgName());
+        if (it == constexpr_values->end()) {
+            continue;
+        }
+        auto tag = ConstexprValueTag(it->second);
+        if (!tag) {
+            continue;
+        }
+        tags.push_back(SanitizeManglePart(arg->GetArgName()) + "_" + *tag);
+    }
+    return tags;
+}
+
 std::string MLIRGeneratorImpl::GetFunctionScopeName(
     ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces) {
     if (!func) {
@@ -287,7 +404,7 @@ std::string MLIRGeneratorImpl::GetFunctionScopeName(
 
 std::string MLIRGeneratorImpl::GetMangledFunctionName(
     ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces,
-    llvm::StringRef name_prefix) {
+    llvm::StringRef name_prefix, const ConstexprValueMap *constexpr_values) {
     if (!func) {
         return {};
     }
@@ -300,7 +417,8 @@ std::string MLIRGeneratorImpl::GetMangledFunctionName(
         scope.push_back(name_prefix.str());
     }
     auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
-    return MangleFunctionName(scope, name, tags);
+    auto constexpr_tags = GetFunctionConstexprTags(func, constexpr_values);
+    return MangleFunctionName(scope, name, tags, constexpr_tags);
 }
 
 mlir::ModuleOp MLIRGeneratorImpl::CreateModule() {

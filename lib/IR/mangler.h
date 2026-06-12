@@ -12,5 +12,9 @@ std::string MangleFunctionName(llvm::ArrayRef<std::string> scope,
 std::string MangleFunctionName(llvm::ArrayRef<std::string> scope,
                                llvm::StringRef name,
                                llvm::ArrayRef<std::string> address_space_tags);
+std::string MangleFunctionName(llvm::ArrayRef<std::string> scope,
+                               llvm::StringRef name,
+                               llvm::ArrayRef<std::string> address_space_tags,
+                               llvm::ArrayRef<std::string> constexpr_tags);
 
 } // namespace causalflow::avelang::ir
