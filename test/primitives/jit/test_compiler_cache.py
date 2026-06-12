@@ -101,6 +101,21 @@ class TestCompilerCache(unittest.TestCase):
         self.assertEqual(second.kernel, b"compiled-2")
         self.assertNotEqual(first.hash, second.hash)
 
+    def test_cache_key_includes_environment_hashes(self):
+        backend = _DummyBackend(self.target)
+        env = {knobs.CACHE_DIR_ENV: self.tmpdir.name}
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop(knobs.DISABLE_CACHE_ENV, None)
+            os.environ["AVELANG_TEST_CACHE_ENV"] = "first"
+            first = self._compile_with_backend(backend, self._src(), {"dummy_option": 4})
+            os.environ["AVELANG_TEST_CACHE_ENV"] = "second"
+            second = self._compile_with_backend(backend, self._src(), {"dummy_option": 4})
+
+        self.assertEqual(first.kernel, b"compiled-1")
+        self.assertEqual(second.kernel, b"compiled-2")
+        self.assertNotEqual(first.hash, second.hash)
+
     def test_disable_cache_env_bypasses_reads_and_writes(self):
         backend = _DummyBackend(self.target)
         env = {CACHE_DIR_ENV: self.tmpdir.name, DISABLE_CACHE_ENV: "1"}

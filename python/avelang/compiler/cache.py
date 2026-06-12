@@ -150,6 +150,13 @@ def stable_json(data) -> str:
     return json.dumps(_jsonable(data), sort_keys=True, separators=(",", ":"))
 
 
+def get_environment_hashes() -> dict[str, str]:
+    return {
+        key: hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
+        for key, value in sorted(os.environ.items())
+    }
+
+
 @functools.lru_cache(maxsize=None)
 def _module_fingerprint(module_name: str) -> str:
     try:
@@ -186,5 +193,6 @@ def get_cache_key(src, backend, target, options, version: str) -> str:
         "backend": f"{backend.__class__.__module__}.{backend.__class__.__qualname__}",
         "backend_fingerprint": _module_fingerprint(backend.__class__.__module__),
         "compiler_fingerprint": _module_fingerprint("avelang.compiler.code_generator"),
+        "environment_hashes": get_environment_hashes(),
     }
     return hashlib.sha256(stable_json(data).encode("utf-8")).hexdigest()
