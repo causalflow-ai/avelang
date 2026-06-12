@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from ... import knobs
 from ..compiler import GPUTarget
 from ..driver import GPUDriver
 from ...runtime.build import compile_module_from_src
@@ -22,7 +23,7 @@ def libcuda_dirs():
     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
     locs = [line.split()[-1] for line in libs.splitlines() if "libcuda.so.1" in line]
     dirs = [os.path.dirname(loc) for loc in locs]
-    env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
+    env_ld_library_path = knobs.build.ld_library_path
     if env_ld_library_path and not dirs:
         dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
     msg = "libcuda.so cannot found!\n"

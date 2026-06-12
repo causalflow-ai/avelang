@@ -10,6 +10,8 @@ import tempfile
 
 from types import ModuleType
 
+from .. import knobs
+
 
 def _build(
     name: str,
@@ -24,14 +26,14 @@ def _build(
     so = os.path.join(srcdir, "{name}{suffix}".format(name=name, suffix=suffix))
     # try to avoid setuptools if possible
     is_cxx = os.path.splitext(src)[1] in (".cc", ".cpp", ".cxx")
-    cc = os.environ.get("CXX" if is_cxx else "CC")
+    cc = knobs.build.cxx if is_cxx else knobs.build.cc
     if cc is None:
         clang = shutil.which("clang++" if is_cxx else "clang")
         gcc = shutil.which("g++" if is_cxx else "gcc")
         cc = gcc if gcc is not None else clang
         if cc is None:
             compiler = "C++" if is_cxx else "C"
-            env_var = "CXX" if is_cxx else "CC"
+            env_var = knobs.CXX_ENV if is_cxx else knobs.CC_ENV
             raise RuntimeError(f"Failed to find {compiler} compiler. Please specify via the {env_var} environment variable.")
     # This function was renamed and made public in Python 3.10
     if hasattr(sysconfig, "get_default_scheme"):
