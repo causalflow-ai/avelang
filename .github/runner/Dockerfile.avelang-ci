@@ -1,0 +1,57 @@
+FROM rocm/pytorch:rocm7.2.2_ubuntu24.04_py3.12_pytorch_release_2.10.0
+
+ARG LLVM_TAG=rocm-7.2.2
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libedit-dev \
+        libxml2-dev \
+        ninja-build \
+        zlib1g-dev \
+        libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git init /home/llvm-project \
+    && cd /home/llvm-project \
+    && git remote add origin https://github.com/ROCm/llvm-project.git \
+    && git fetch --depth=1 origin "${LLVM_TAG}" \
+    && git checkout --detach FETCH_HEAD \
+    && cmake -S llvm -B build -G Ninja \
+        -DLLVM_ENABLE_PROJECTS="clang;lld;mlir" \
+        -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_ENABLE_ASSERTIONS=ON \
+        -DLLVM_ENABLE_LLD=ON \
+        -DLLVM_PARALLEL_LINK_JOBS=2 \
+        -DLLVM_ENABLE_RTTI=ON \
+        -DLLVM_ENABLE_EH=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_INSTALL_RPATH=/usr/local/lib \
+        -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+        -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+        -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
+        -DDEFAULT_TARGET_TRIPLE=x86_64-unknown-linux-gnu \
+        -DLLVM_ENABLE_DUMP=ON \
+        -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+    && ninja -C build -j"$(nproc)" \
+    && ninja -C build install \
+    && rm -rf /home/llvm-project
+
+RUN /opt/venv/bin/python -m pip install --no-cache-dir uv \
+    && cmake --version \
+    && ninja --version \
+    && /opt/venv/bin/python --version \
+    && /usr/local/bin/clang --version \
+    && /usr/local/bin/mlir-opt --version \
+    && useradd --create-home --uid 1001 --shell /bin/bash runner
+
+ENV LD_LIBRARY_PATH=/opt/rocm/lib
+ENV PATH=/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+USER runner
+WORKDIR /workspace/avelang
