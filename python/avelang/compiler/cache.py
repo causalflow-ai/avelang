@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import os
+import pkgutil
 import shutil
 import sysconfig
 import uuid
@@ -181,15 +182,70 @@ def _module_fingerprint(module_name: str) -> str:
     return digest.hexdigest()
 
 
-def get_cache_key(src, backend, target, options, version: str) -> str:
+def _hash_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024**2)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=None)
+def _avelang_key(version: str) -> str:
+    package_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    python_root = os.path.dirname(package_path)
+    contents = [_hash_file(__file__)]
+
+    path_prefixes = [
+        (os.path.join(package_path, "compiler"), "avelang.compiler."),
+        (os.path.join(package_path, "backends"), "avelang.backends."),
+        (os.path.join(package_path, "language"), "avelang.language."),
+        (os.path.join(package_path, "runtime"), "avelang.runtime."),
+    ]
+    for path, prefix in path_prefixes:
+        if not os.path.isdir(path):
+            continue
+        for lib in pkgutil.walk_packages([path], prefix=prefix):
+            spec = lib.module_finder.find_spec(lib.name)
+            origin = getattr(spec, "origin", None)
+            if origin and os.path.isfile(origin):
+                contents.append(_hash_file(origin))
+
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    binding_path = os.path.join(python_root, f"_avelang_bindings{ext_suffix}")
+    if os.path.exists(binding_path):
+        contents.append(_hash_file(binding_path))
+
+    return f"{version}-{'-'.join(contents)}"
+
+
+def _backend_hash(backend, target) -> str:
+    if hasattr(backend, "hash"):
+        return backend.hash()
     data = {
-        "version": version,
-        "source": src.hash(),
-        "target": target,
-        "options": options,
         "backend": f"{backend.__class__.__module__}.{backend.__class__.__qualname__}",
-        "backend_fingerprint": _module_fingerprint(backend.__class__.__module__),
-        "compiler_fingerprint": _module_fingerprint("avelang.compiler.code_generator"),
-        "environment_hashes": get_environment_hashes(),
+        "target": target,
+        "module_fingerprint": _module_fingerprint(backend.__class__.__module__),
     }
     return hashlib.sha256(stable_json(data).encode("utf-8")).hexdigest()
+
+
+def _options_hash(options) -> str:
+    if hasattr(options, "hash"):
+        return options.hash()
+    return hashlib.sha256(stable_json(options).encode("utf-8")).hexdigest()
+
+
+def get_cache_key(src, backend, target, options, version: str) -> str:
+    env_vars = get_environment_hashes()
+    key = (
+        f"{_avelang_key(version)}-"
+        f"{src.hash()}-"
+        f"{_backend_hash(backend, target)}-"
+        f"{_options_hash(options)}-"
+        f"{str(sorted(env_vars.items()))}"
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
