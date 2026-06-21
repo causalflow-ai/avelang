@@ -26,11 +26,60 @@ createAveLangMemRefType(mlir::MLIRContext *context,
     return cf::MemRefType::get(context, layoutType, elementType, memorySpace);
 }
 
+static int64_t ceilDivInt64(int64_t numerator, int64_t denominator) {
+    if (denominator <= 0) {
+        return 0;
+    }
+    return (numerator + denominator - 1) / denominator;
+}
+
+static LayoutOperation::StaticLayout
+squeezeStaticLayout(const llvm::SmallVector<int64_t> &shape,
+                    const llvm::SmallVector<int64_t> &strides) {
+    llvm::SmallVector<int64_t> squeezedShape;
+    llvm::SmallVector<int64_t> squeezedStrides;
+    for (size_t i = 0; i < shape.size() && i < strides.size(); ++i) {
+        if (shape[i] != 1) {
+            squeezedShape.push_back(shape[i]);
+            squeezedStrides.push_back(strides[i]);
+        }
+    }
+    return {squeezedShape, squeezedStrides};
+}
+
 long LayoutOperation::extractIndexValue(mlir::Value value) {
     if (auto folded = ConstantFolder::FoldIntValue(value)) {
         return *folded;
     }
     return mlir::ShapedType::kDynamic;
+}
+
+int64_t LayoutOperation::computeShapeProduct(llvm::ArrayRef<int64_t> shape) {
+    int64_t product = 1;
+    for (int64_t dim : shape) {
+        if (dim == mlir::ShapedType::kDynamic) {
+            return mlir::ShapedType::kDynamic;
+        }
+        product *= dim;
+    }
+    return product;
+}
+
+int64_t LayoutOperation::computeCoSize(llvm::ArrayRef<int64_t> shape,
+                                       llvm::ArrayRef<int64_t> strides) {
+    if (shape.empty() || shape.size() != strides.size()) {
+        return mlir::ShapedType::kDynamic;
+    }
+
+    int64_t cosize = 1;
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] == mlir::ShapedType::kDynamic ||
+            strides[i] == mlir::ShapedType::kDynamic) {
+            return mlir::ShapedType::kDynamic;
+        }
+        cosize += (shape[i] - 1) * std::abs(strides[i]);
+    }
+    return cosize;
 }
 
 // Extract values from potentially nested tuples (flattens the tuple)
@@ -53,6 +102,182 @@ bool LayoutOperation::flattenTupleValues(mlir::Value tupleValue,
     // If it's not a MakeIntTupleOp, treat it as a single value
     values.push_back(extractIndexValue(tupleValue));
     return true;
+}
+
+LayoutOperation::StaticLayout LayoutOperation::coalesceStaticLayout(
+    const llvm::SmallVector<int64_t> &shape,
+    const llvm::SmallVector<int64_t> &strides) {
+    if (shape.empty() || shape.size() != strides.size()) {
+        return {shape, strides};
+    }
+
+    llvm::SmallVector<int64_t> coalescedShape;
+    llvm::SmallVector<int64_t> coalescedStrides;
+    int64_t currentShapeProduct = shape[0];
+    int64_t currentStride = strides[0];
+
+    for (size_t i = 1; i < shape.size(); ++i) {
+        if (currentShapeProduct * currentStride == strides[i]) {
+            currentShapeProduct *= shape[i];
+        } else {
+            coalescedShape.push_back(currentShapeProduct);
+            coalescedStrides.push_back(currentStride);
+            currentShapeProduct = shape[i];
+            currentStride = strides[i];
+        }
+    }
+
+    coalescedShape.push_back(currentShapeProduct);
+    coalescedStrides.push_back(currentStride);
+    return {coalescedShape, coalescedStrides};
+}
+
+LayoutOperation::StaticLayout LayoutOperation::computeComplementLayout(
+    const llvm::SmallVector<int64_t> &shape,
+    const llvm::SmallVector<int64_t> &strides, int64_t size) {
+    if (shape.empty() || shape.size() != strides.size() || size <= 0) {
+        return {{}, {}};
+    }
+
+    llvm::SmallVector<int64_t> remainingShape(shape.begin(), shape.end());
+    llvm::SmallVector<int64_t> remainingStrides(strides.begin(), strides.end());
+    llvm::SmallVector<int64_t> resultShape;
+    llvm::SmallVector<int64_t> resultStrides = {1};
+
+    while (remainingShape.size() > 1) {
+        auto minStrideIt = std::min_element(remainingStrides.begin(),
+                                            remainingStrides.end());
+        size_t minIndex = std::distance(remainingStrides.begin(), minStrideIt);
+        int64_t minStride = *minStrideIt;
+        int64_t previousStride = resultStrides.back();
+        if (minStride <= 0 || minStride % previousStride != 0) {
+            return {{}, {}};
+        }
+
+        int64_t newShape = minStride / previousStride;
+        int64_t newStride = minStride * remainingShape[minIndex];
+        if (newShape <= 0) {
+            return {{}, {}};
+        }
+
+        resultShape.push_back(newShape);
+        resultStrides.push_back(newStride);
+        remainingShape.erase(remainingShape.begin() + minIndex);
+        remainingStrides.erase(remainingStrides.begin() + minIndex);
+    }
+
+    int64_t previousStride = resultStrides.back();
+    if (remainingStrides.front() <= 0 ||
+        remainingStrides.front() % previousStride != 0) {
+        return {{}, {}};
+    }
+    int64_t lastShape = remainingStrides.front() / previousStride;
+    if (lastShape <= 0) {
+        return {{}, {}};
+    }
+    resultShape.push_back(lastShape);
+
+    int64_t newStride = remainingStrides.front() * remainingShape.front();
+    llvm::SmallVector<int64_t> flatShape(resultShape.begin(), resultShape.end());
+    llvm::SmallVector<int64_t> flatStrides(resultStrides.begin(),
+                                           resultStrides.end());
+    int64_t restShape = ceilDivInt64(size, newStride);
+    if (restShape > 0) {
+        flatShape.push_back(restShape);
+        flatStrides.push_back(newStride);
+    }
+
+    auto [squeezedShape, squeezedStrides] =
+        squeezeStaticLayout(flatShape, flatStrides);
+    return coalesceStaticLayout(squeezedShape, squeezedStrides);
+}
+
+LayoutOperation::StaticLayout LayoutOperation::concatenateStaticLayouts(
+    const llvm::SmallVector<int64_t> &shapeA,
+    const llvm::SmallVector<int64_t> &stridesA,
+    const llvm::SmallVector<int64_t> &shapeB,
+    const llvm::SmallVector<int64_t> &stridesB) {
+    llvm::SmallVector<int64_t> resultShape(shapeA.begin(), shapeA.end());
+    llvm::SmallVector<int64_t> resultStrides(stridesA.begin(), stridesA.end());
+    resultShape.append(shapeB.begin(), shapeB.end());
+    resultStrides.append(stridesB.begin(), stridesB.end());
+    return {resultShape, resultStrides};
+}
+
+LayoutOperation::StaticLayout LayoutOperation::computeCompositionLayout(
+    const llvm::SmallVector<int64_t> &shapeA,
+    const llvm::SmallVector<int64_t> &stridesA,
+    const llvm::SmallVector<int64_t> &shapeB,
+    const llvm::SmallVector<int64_t> &stridesB) {
+    if (shapeA.empty() || shapeB.empty() || shapeA.size() != stridesA.size() ||
+        shapeB.size() != stridesB.size()) {
+        return {{}, {}};
+    }
+
+    auto [coalescedShapeA, coalescedStridesA] =
+        coalesceStaticLayout(shapeA, stridesA);
+
+    llvm::SmallVector<int64_t> resultShape;
+    llvm::SmallVector<int64_t> resultStrides;
+    for (size_t i = 0; i < shapeB.size(); ++i) {
+        int64_t rhsShape = shapeB[i];
+        int64_t rhsStride = stridesB[i];
+        if (rhsStride == 0) {
+            resultShape.push_back(rhsShape);
+            resultStrides.push_back(rhsStride);
+            continue;
+        }
+
+        llvm::SmallVector<int64_t> subShape;
+        llvm::SmallVector<int64_t> subStrides;
+        if (coalescedShapeA.size() == 1) {
+            subShape.push_back(rhsShape);
+            subStrides.push_back(rhsStride * coalescedStridesA[0]);
+        } else {
+            int64_t restShape = rhsShape;
+            int64_t restStride = rhsStride;
+            for (size_t j = 0; j + 1 < coalescedShapeA.size(); ++j) {
+                int64_t currShape = coalescedShapeA[j];
+                int64_t currStride = coalescedStridesA[j];
+                int64_t nextShape = ceilDivInt64(currShape, std::abs(restStride));
+                int64_t nextStride =
+                    ceilDivInt64(std::abs(restStride), currShape);
+                if (restStride < 0) {
+                    nextStride = -nextStride;
+                }
+
+                if (nextShape == 1 || restShape == 1) {
+                    restStride = nextStride;
+                    continue;
+                }
+
+                int64_t newShape = std::min(nextShape, restShape);
+                if (newShape <= 0 || restShape % newShape != 0) {
+                    return {{}, {}};
+                }
+
+                subShape.push_back(newShape);
+                subStrides.push_back(restStride * currStride);
+                restShape /= newShape;
+                restStride = nextStride;
+            }
+
+            if (subShape.empty()) {
+                subShape.push_back(restShape);
+                subStrides.push_back(restStride * coalescedStridesA.back());
+            } else if (restShape != 1) {
+                subShape.push_back(restShape);
+                subStrides.push_back(restStride * coalescedStridesA.back());
+            }
+        }
+
+        resultShape.append(subShape.begin(), subShape.end());
+        resultStrides.append(subStrides.begin(), subStrides.end());
+    }
+
+    auto [squeezedShape, squeezedStrides] =
+        squeezeStaticLayout(resultShape, resultStrides);
+    return {squeezedShape, squeezedStrides};
 }
 
 mlir::Value LayoutOperation::CastToIndex(mlir::OpBuilder &builder,
