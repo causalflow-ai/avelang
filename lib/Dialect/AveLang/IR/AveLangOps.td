@@ -131,7 +131,7 @@ def MakeLayoutOp : AveLang_Op<"make_layout", [Pure]> {
     let hasVerifier = 1;
 }
 
-def FullOp : AveLang_Op<"full", [Pure]> {
+def FullOp : AveLang_Op<"full"> {
     let summary = "Create a memref filled with a constant value";
     let description = [{
         The `ave.full` operation creates an ave-lang memref filled with a constant scalar value.

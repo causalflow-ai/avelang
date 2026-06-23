@@ -2129,6 +2129,44 @@ def full_test(data: S.Tensor((16,), S.i32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, CSEKeepsDistinctFullOps) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def full_test(data: S.Tensor((2,), S.i32)):
+    left = S.full((2,), 1, S.i32)
+    right = S.full((2,), 1, S.i32)
+    left[0] = 2
+    data[0] = left[0]
+    data[1] = right[0]
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(mlir::createCSEPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "CSE pass failed";
+
+    std::string mlir_dump;
+    llvm::raw_string_ostream os(mlir_dump);
+    mlir->print(os);
+
+    EXPECT_EQ(llvm::StringRef(mlir_dump).count("ave.full"), 2u) << mlir_dump;
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRViewFromTensor) {
     static const std::string kSourceCode = R"""""(
 import avelang
