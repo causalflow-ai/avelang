@@ -71,3 +71,7 @@ def sched_group_barrier(mask, size, group_id):
 
 def sched_barrier(mask):
     pass
+
+
+def s_setprio(priority):
+    pass

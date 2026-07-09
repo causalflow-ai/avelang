@@ -120,6 +120,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value
     CreateSchedBarrierFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateSetPrioFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     mlir::Value
@@ -163,6 +166,9 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSchedBarrierFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckSetPrioFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 };
@@ -344,6 +350,17 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckSchedBarrierFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "s_setprio",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateSetPrioFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckSetPrioFunction(call_expr, gen_ctx, resolved_args);
         });
 
 }
@@ -720,6 +737,30 @@ mlir::Value AMDGPUIntrinsic::CreateSchedBarrierFunction(
 
     mlir::ROCDL::SchedBarrier::create(builder, location,
                                       static_cast<uint32_t>(*mask));
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateSetPrioFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto priority = ConstantFolder::FoldIntValue(resolved_args[0]);
+
+    if (!priority || *priority < 0 ||
+        static_cast<uint64_t>(*priority) >
+            static_cast<uint64_t>(std::numeric_limits<uint16_t>::max())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "s_setprio(priority) requires a compile-time non-negative "
+               "integer argument <= 2^16-1";
+        return nullptr;
+    }
+
+    mlir::ROCDL::SetPrioOp::create(builder, location,
+                                   static_cast<uint16_t>(*priority));
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -1164,6 +1205,26 @@ bool AMDGPUIntrinsic::CheckSchedBarrierFunction(
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "Failed to generate operand for sched_barrier()";
+        return false;
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckSetPrioFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "s_setprio() requires exactly 1 argument: priority";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operand for s_setprio()";
         return false;
     }
 
