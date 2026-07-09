@@ -2037,6 +2037,55 @@ def make_layout_empty_test():
                                "Empty tuple expressions are not supported");
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUGetDpp) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def get_dpp_i32(old: S.i32, src: S.i32):
+    result = S.amdgpu.get_dpp(old, src, 0x101, 0xF, 0xF, 1)
+
+@avelang.jit
+def get_dpp_f32(old: S.f32, src: S.f32):
+    result = S.amdgpu.get_dpp(old, src, 0x101, 0xF, 0xF, 1)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUGetDppRejectsInvalidOperands) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def get_dpp_invalid(old: S.i32, src: S.f32):
+    result = S.amdgpu.get_dpp(old, src, 0x101, 0x10, 0xF, 1)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode,
+        "get_dpp() expects old and src to have the same i32 or f32 scalar "
+        "type");
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUGetDppRejectsInvalidControl) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def get_dpp_invalid(old: S.i32, src: S.i32):
+    result = S.amdgpu.get_dpp(old, src, 0x101, 0x10, 0xF, 1)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode,
+        "get_dpp() requires dpp_ctrl in [0, 2^32-1], row_mask and "
+        "bank_mask in [0, 15], and bound_ctrl in {0, 1}");
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRWithConstexpr) {
     static const std::string kSourceCode = R""""(
 import avelang

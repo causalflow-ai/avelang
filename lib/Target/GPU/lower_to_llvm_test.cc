@@ -545,6 +545,31 @@ module {
               std::string::npos);
 }
 
+TEST_F(LLVMTargetTest, AMDGPUUpdateDppLowersToIntrinsic) {
+    const std::string mlirCode = R"(
+module {
+  gpu.module @kernels {
+    gpu.func @update_dpp_kernel(%arg0: memref<1xi32>, %arg1: i32, %arg2: i32) kernel {
+      %dpp_ctrl = arith.constant 257 : i32
+      %row_mask = arith.constant 15 : i32
+      %bank_mask = arith.constant 15 : i32
+      %bound_ctrl = arith.constant true
+      %result = llvm.call_intrinsic "llvm.amdgcn.update.dpp"(%arg1, %arg2, %dpp_ctrl, %row_mask, %bank_mask, %bound_ctrl) : (i32, i32, i32, i32, i32, i1) -> i32
+      %c0 = arith.constant 0 : index
+      memref.store %result, %arg0[%c0] : memref<1xi32>
+      gpu.return
+    }
+  }
+}
+    )";
+
+    std::string llvmDump;
+    auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
+    ASSERT_NE(llvmModule, nullptr);
+
+    EXPECT_NE(llvmDump.find("llvm.amdgcn.update.dpp"), std::string::npos);
+}
+
 TEST_F(LLVMTargetTest, AMDGPUExp2LowersToIntrinsic) {
     const std::string mlirCode = R"(
 module {

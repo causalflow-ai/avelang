@@ -106,6 +106,17 @@ r = al.amdgpu.rcp(x)
 out = al.amdgpu.perm(lhs, rhs, sel)
 ```
 
+`al.amdgpu.get_dpp(old, src, dpp_ctrl, row_mask, bank_mask, bound_ctrl)`
+applies AMDGPU data-parallel primitive lane selection to an `i32`/`u32` or
+`f32` scalar. `src` supplies the selected lane value; `old` is preserved when
+the selection is masked or out of bounds. The control operands must be
+compile-time integers: `dpp_ctrl` is a `u32`, `row_mask` and `bank_mask` are
+in `[0, 15]`, and `bound_ctrl` is `0` or `1`.
+
+```python
+shifted = al.amdgpu.get_dpp(value, value, 0x101, 0xF, 0xF, 1)
+```
+
 `al.amdgpu.cvt_pk_fp8_f32(src_a, src_b, old, opsel)` and
 `al.amdgpu.cvt_pk_bf8_f32(src_a, src_b, old, opsel)` convert two scalar `f32`
 values into a packed FP8 or BF8 pair and return the resulting `u32` word.

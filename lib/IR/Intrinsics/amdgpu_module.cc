@@ -111,6 +111,9 @@ class AMDGPUIntrinsic : public NamedModule {
     CreatePermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
+    CreateGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
     CreateRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                       llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
@@ -162,6 +165,8 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckPermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
@@ -218,6 +223,17 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckPermFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "get_dpp",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateGetDppFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckGetDppFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -741,6 +757,55 @@ mlir::Value AMDGPUIntrinsic::CreatePermFunction(
     return callOp.getResult(0);
 }
 
+mlir::Value AMDGPUIntrinsic::CreateGetDppFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto oldValue = resolved_args[0];
+    auto src = resolved_args[1];
+
+    auto dppCtrl = ConstantFolder::FoldIntValue(resolved_args[2]);
+    auto rowMask = ConstantFolder::FoldIntValue(resolved_args[3]);
+    auto bankMask = ConstantFolder::FoldIntValue(resolved_args[4]);
+    auto boundCtrl = ConstantFolder::FoldIntValue(resolved_args[5]);
+    SS_ASSERT(dppCtrl && rowMask && bankMask && boundCtrl);
+
+    auto i32Type = builder.getI32Type();
+    auto oldBits = oldValue;
+    auto srcBits = src;
+    if (oldValue.getType().isF32()) {
+        oldBits = mlir::arith::BitcastOp::create(builder, location, i32Type,
+                                                  oldValue);
+        srcBits = mlir::arith::BitcastOp::create(builder, location, i32Type,
+                                                  src);
+    }
+
+    auto intrinsic = builder.create<mlir::LLVM::CallIntrinsicOp>(
+        location, i32Type, "llvm.amdgcn.update.dpp",
+        mlir::ValueRange{
+            oldBits, srcBits,
+            mlir::arith::ConstantIntOp::create(
+                builder, location, static_cast<uint32_t>(*dppCtrl), 32),
+            mlir::arith::ConstantIntOp::create(
+                builder, location, static_cast<uint32_t>(*rowMask), 32),
+            mlir::arith::ConstantIntOp::create(
+                builder, location, static_cast<uint32_t>(*bankMask), 32),
+            mlir::arith::ConstantOp::create(
+                builder, location, builder.getI1Type(),
+                builder.getBoolAttr(*boundCtrl != 0))},
+        mlir::LLVM::FastmathFlags::none, llvm::ArrayRef<mlir::ValueRange>{},
+        mlir::ArrayAttr{}, mlir::ArrayAttr{}, mlir::ArrayAttr{});
+
+    mlir::Value result = intrinsic.getResult(0);
+    if (oldValue.getType().isF32()) {
+        result = mlir::arith::BitcastOp::create(builder, location,
+                                                oldValue.getType(), result);
+    }
+    SetTypeInfo(result, GetTypeInfo(oldValue));
+    return result;
+}
+
 mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -1206,6 +1271,78 @@ bool AMDGPUIntrinsic::CheckPermFunction(
                 << "perm() expects 32-bit integer arguments";
             return false;
         }
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckGetDppFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 6 || resolved_args.size() != 6) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "get_dpp() requires exactly 6 arguments: old, src, dpp_ctrl, "
+               "row_mask, bank_mask, bound_ctrl";
+        return false;
+    }
+
+    for (auto value : resolved_args) {
+        if (!value) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "Failed to generate operands for get_dpp()";
+            return false;
+        }
+    }
+
+    auto valueType = resolved_args[0].getType();
+    if ((!valueType.isInteger(32) && !valueType.isF32()) ||
+        resolved_args[1].getType() != valueType) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "get_dpp() expects old and src to have the same i32 or f32 "
+               "scalar type";
+        return false;
+    }
+
+    for (auto operand : {resolved_args[2], resolved_args[3], resolved_args[4],
+                         resolved_args[5]}) {
+        if (!operand.getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "get_dpp() control operands must be integer or index "
+                   "types";
+            return false;
+        }
+    }
+
+    auto dppCtrl = ConstantFolder::FoldIntValue(resolved_args[2]);
+    auto rowMask = ConstantFolder::FoldIntValue(resolved_args[3]);
+    auto bankMask = ConstantFolder::FoldIntValue(resolved_args[4]);
+    auto boundCtrl = ConstantFolder::FoldIntValue(resolved_args[5]);
+    if (!dppCtrl || !rowMask || !bankMask || !boundCtrl) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "get_dpp() requires compile-time control operands";
+        return false;
+    }
+
+    auto isValidU32 = [](int64_t value) {
+        return value >= 0 &&
+               static_cast<uint64_t>(value) <=
+                   static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    };
+    if (!isValidU32(*dppCtrl) || *rowMask < 0 || *rowMask > 0xF ||
+        *bankMask < 0 || *bankMask > 0xF ||
+        (*boundCtrl != 0 && *boundCtrl != 1)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "get_dpp() requires dpp_ctrl in [0, 2^32-1], row_mask and "
+               "bank_mask in [0, 15], and bound_ctrl in {0, 1}";
+        return false;
     }
 
     return true;

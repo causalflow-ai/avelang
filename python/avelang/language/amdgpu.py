@@ -39,6 +39,10 @@ def perm(lhs, rhs, sel):
     pass
 
 
+def get_dpp(old, src, dpp_ctrl, row_mask, bank_mask, bound_ctrl):
+    pass
+
+
 def rcp(value):
     pass
 
