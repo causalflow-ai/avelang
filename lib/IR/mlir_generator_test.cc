@@ -1664,6 +1664,51 @@ def perm_test(out: S.Tensor((1,), S.u32),
         << "MLIR verification failed!";
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUEagerMaterializeI32) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def eager_materialize_test(value: S.u32):
+    S.amdgpu.eager_materialize_i32(value)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool found_materialize_call = false;
+    mlir->walk([&](mlir::func::CallOp op) {
+        if (op.getCallee() == "_avelang_amdgpu_eager_materialize_i32") {
+            found_materialize_call = true;
+            EXPECT_EQ(op.getNumOperands(), 1u);
+            EXPECT_EQ(op.getNumResults(), 0u);
+            EXPECT_TRUE(op.getOperand(0).getType().isInteger(32));
+        }
+    });
+
+    EXPECT_TRUE(found_materialize_call);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createSymbolDCEPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPURawBufferLoadLds) {
     static const std::string kSourceCode = R"""""(
 import avelang

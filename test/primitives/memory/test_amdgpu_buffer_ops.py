@@ -79,6 +79,13 @@ def kernel_amdgpu_readfirstlane(out: S.Tensor((128,), S.i32)):
     out[tid] = S.amdgpu.readfirstlane(tid_i32)
 
 
+@avelang.jit
+def kernel_amdgpu_eager_materialize(out: S.Tensor((1,), S.i32)):
+    value = S.convert(17, S.i32)
+    S.amdgpu.eager_materialize_i32(value)
+    out[0] = value
+
+
 def generate_mlir(jit_fn) -> str:
     jit_deps = _collect_jit_dependencies(jit_fn)
     import_module = _build_import_module([jit_fn, *jit_deps])
@@ -93,6 +100,12 @@ def generate_mlir(jit_fn) -> str:
     kernel_func = _get_function_def(jit_fn.parse())
     generator.visit_function_def(kernel_func, "[]", "kernel")
     return generator.get_mlir()
+
+
+class TestAMDGPUBufferOpsMLIR(unittest.TestCase):
+    def test_eager_materialize_i32_generates_call(self):
+        mlir = generate_mlir(kernel_amdgpu_eager_materialize)
+        self.assertIn("_avelang_amdgpu_eager_materialize_i32", mlir)
 
 
 @unittest.skipUnless(

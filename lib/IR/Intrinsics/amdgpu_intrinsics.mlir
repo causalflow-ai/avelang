@@ -16,6 +16,11 @@ module {
     return
   }
 
+  func.func private @_avelang_amdgpu_eager_materialize_i32(%arg0: i32) attributes {func.inline = "always"} {
+    llvm.inline_asm has_side_effects "", "r" %arg0 : (i32) -> ()
+    return
+  }
+
   func.func private @_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32(%arg0: vector<4xi32>, %arg1: index, %arg2: i32, %arg3: i32, %arg4: i32) attributes {func.inline = "always"} {
     %lds_offset = arith.index_cast %arg2 : i32 to index
     %lds_addr = arith.addi %arg1, %lds_offset : index

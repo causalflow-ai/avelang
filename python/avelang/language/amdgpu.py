@@ -41,6 +41,10 @@ def readfirstlane(value):
     pass
 
 
+def eager_materialize_i32(value):
+    pass
+
+
 def raw_buffer_load_x1(rsrc, vindex, soffset, aux):
     pass
 
