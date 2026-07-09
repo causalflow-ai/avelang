@@ -1613,7 +1613,7 @@ import avelang.language as S
 
 @avelang.jit
 def s_waitcnt_test():
-    S.amdgpu.s_waitcnt(0, 7, 15)
+    S.amdgpu.s_waitcnt(0, -1, -1)
 )""""";
 
     ast::ASTNode *root;

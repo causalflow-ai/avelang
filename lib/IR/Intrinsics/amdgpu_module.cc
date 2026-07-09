@@ -718,25 +718,37 @@ mlir::Value AMDGPUIntrinsic::CreateSWaitcntFunction(
     auto expcnt = ConstantFolder::FoldIntValue(resolved_args[1]);
     auto lgkmcnt = ConstantFolder::FoldIntValue(resolved_args[2]);
 
-    auto is_valid = [](std::optional<int64_t> value, int64_t max) {
-        return value && *value >= 0 && *value <= max;
+    auto normalize_waitcnt = [](std::optional<int64_t> value, int64_t max)
+        -> std::optional<uint32_t> {
+        if (!value) {
+            return std::nullopt;
+        }
+        if (*value == -1) {
+            return static_cast<uint32_t>(max);
+        }
+        if (*value >= 0 && *value <= max) {
+            return static_cast<uint32_t>(*value);
+        }
+        return std::nullopt;
     };
 
-    if (!is_valid(vmcnt, 63) || !is_valid(expcnt, 7) ||
-        !is_valid(lgkmcnt, 15)) {
+    auto vmcntU = normalize_waitcnt(vmcnt, 63);
+    auto expcntU = normalize_waitcnt(expcnt, 7);
+    auto lgkmcntU = normalize_waitcnt(lgkmcnt, 15);
+
+    if (!vmcntU || !expcntU || !lgkmcntU) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "s_waitcnt(vmcnt, expcnt, lgkmcnt) requires compile-time "
                "integer arguments in ranges vmcnt=[0,63], expcnt=[0,7], "
-               "lgkmcnt=[0,15]";
+               "lgkmcnt=[0,15], with -1 allowed to keep a field unchanged";
         return nullptr;
     }
 
-    auto vmcntU = static_cast<uint32_t>(*vmcnt);
-    auto waitcntValue = ((vmcntU & 48u) << 10) |
-                        ((static_cast<uint32_t>(*lgkmcnt) & 15u) << 8) |
-                        ((static_cast<uint32_t>(*expcnt) & 7u) << 4) |
-                        (vmcntU & 15u);
+    auto waitcntValue = (((*vmcntU) & 48u) << 10) |
+                        (((*lgkmcntU) & 15u) << 8) |
+                        (((*expcntU) & 7u) << 4) |
+                        ((*vmcntU) & 15u);
     auto waitcntAttr =
         mlir::IntegerAttr::get(builder.getI32Type(), waitcntValue);
     mlir::ROCDL::SWaitcntOp::create(builder, location, waitcntAttr);
@@ -1236,7 +1248,7 @@ bool AMDGPUIntrinsic::CheckSWaitcntFunction(
     auto expcnt = ConstantFolder::FoldIntValue(resolved_args[1]);
     auto lgkmcnt = ConstantFolder::FoldIntValue(resolved_args[2]);
     auto is_valid = [](std::optional<int64_t> value, int64_t max) {
-        return value && *value >= 0 && *value <= max;
+        return value && ((*value == -1) || (*value >= 0 && *value <= max));
     };
     if (!is_valid(vmcnt, 63) || !is_valid(expcnt, 7) ||
         !is_valid(lgkmcnt, 15)) {
@@ -1244,7 +1256,7 @@ bool AMDGPUIntrinsic::CheckSWaitcntFunction(
                                         call_expr->GetSourceRange().getBegin())
             << "s_waitcnt(vmcnt, expcnt, lgkmcnt) requires compile-time "
                "integer arguments in ranges vmcnt=[0,63], expcnt=[0,7], "
-               "lgkmcnt=[0,15]";
+               "lgkmcnt=[0,15], with -1 allowed to keep a field unchanged";
         return false;
     }
 
