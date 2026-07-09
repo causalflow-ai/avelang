@@ -1546,9 +1546,9 @@ import avelang
 import avelang.language as S
 
 @avelang.jit
-def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32)):
+def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32), lds_offset: S.i32):
     shared_mem = S.make_shared((16,), S.u32)
-    S.amdgpu.raw_buffer_load_x1_lds(rsrc, shared_mem, 4, 0, 0, 16, 0)
+    S.amdgpu.raw_buffer_load_x1_lds(rsrc, shared_mem, 4, 0, 0, lds_offset, 0)
 )""""";
 
     ast::ASTNode *root;
@@ -1570,7 +1570,7 @@ def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32)):
         if (op.getCallee() ==
             "_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32") {
             foundLoadLdsCall = true;
-            EXPECT_EQ(op.getNumOperands(), 4u);
+            EXPECT_EQ(op.getNumOperands(), 5u);
             EXPECT_EQ(op.getNumResults(), 0u);
         }
     });

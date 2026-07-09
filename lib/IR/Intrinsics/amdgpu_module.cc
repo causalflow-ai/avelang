@@ -389,18 +389,6 @@ mlir::Value ConvertToI32(mlir::OpBuilder &builder, mlir::Location location,
                                          builder.getI32Type(), value);
 }
 
-mlir::Value ConvertToIndex(mlir::OpBuilder &builder, mlir::Location location,
-                           mlir::Value value) {
-    if (value.getType().isIndex()) {
-        return value;
-    }
-    auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
-    if (!intType) {
-        return value;
-    }
-    return mlir::arith::IndexCastOp::create(builder, location,
-                                            builder.getIndexType(), value);
-}
 } // namespace
 
 mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
@@ -504,15 +492,13 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
 
     auto ldsPtr = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
         builder, location, builder.getIndexType(), resolved_args[1]);
-    auto rawOffset = ConvertToIndex(builder, location, resolved_args[5]);
-    auto ldsPtrWithOffset =
-        mlir::arith::AddIOp::create(builder, location, ldsPtr, rawOffset);
 
     auto funcName = intrinsics::MakeIntrinsicFuncName(
         "amdgpu", "llvm_amdgcn_raw_buffer_load_lds_u32");
     mlir::func::CallOp::create(
         builder, location, funcName, mlir::TypeRange{},
-        mlir::ValueRange{resolved_args[0], ldsPtrWithOffset,
+        mlir::ValueRange{resolved_args[0], ldsPtr,
+                         ConvertToI32(builder, location, resolved_args[5]),
                          ConvertToI32(builder, location, resolved_args[3]),
                          ConvertToI32(builder, location, resolved_args[4])});
 

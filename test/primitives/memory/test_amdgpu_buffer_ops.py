@@ -53,6 +53,25 @@ def kernel_amdgpu_raw_buffer_bf16_view(
             dst[i * 4 + j] = frag[i, j, 0]
 
 
+@avelang.jit
+def kernel_amdgpu_raw_buffer_load_lds_offset(
+    src: S.Tensor((2,), S.i32),
+    dst: S.Tensor((1,), S.i32),
+    range_bytes: S.i32,
+    lds_offset: S.i32,
+):
+    src_rsrc = S.amdgpu.make_rsrc(src, range_bytes)
+    shared = S.make_shared((2,), S.i32)
+
+    zero = S.convert(0, S.i32)
+    src_offset = S.convert(4, S.i32)
+    shared[0] = S.convert(-1, S.i32)
+    shared[1] = S.convert(-1, S.i32)
+    S.amdgpu.raw_buffer_load_x1_lds(src_rsrc, shared, 4, zero, src_offset, lds_offset, 0)
+    S.amdgpu.s_waitcnt(0, 7, 15)
+    dst[0] = shared[1]
+
+
 def generate_mlir(jit_fn) -> str:
     jit_deps = _collect_jit_dependencies(jit_fn)
     import_module = _build_import_module([jit_fn, *jit_deps])
@@ -108,6 +127,20 @@ class TestAMDGPUBufferOps(unittest.TestCase):
             torch.equal(dst.cpu(), src.cpu()),
             f"Expected: {src.tolist()}, Actual: {dst.tolist()}",
         )
+
+    def test_raw_buffer_load_lds_offset(self):
+        src = torch.tensor([17, 29], dtype=torch.int32, device="cuda")
+        dst = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+        range_bytes = src.numel() * src.element_size()
+
+        kernel_amdgpu_raw_buffer_load_lds_offset[lambda: ((1, 1, 1), (1, 1, 1))](
+            src,
+            dst,
+            range_bytes,
+            4,
+        )
+
+        self.assertEqual(dst.item(), 29)
 
 
 if __name__ == "__main__":

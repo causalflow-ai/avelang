@@ -16,12 +16,14 @@ module {
     return
   }
 
-  func.func private @_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32(%arg0: vector<4xi32>, %arg1: index, %arg2: i32, %arg3: i32) attributes {func.inline = "always"} {
-    %ptr_i64 = arith.index_cast %arg1 : index to i64
+  func.func private @_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32(%arg0: vector<4xi32>, %arg1: index, %arg2: i32, %arg3: i32, %arg4: i32) attributes {func.inline = "always"} {
+    %lds_offset = arith.index_cast %arg2 : i32 to index
+    %lds_addr = arith.addi %arg1, %lds_offset : index
+    %ptr_i64 = arith.index_cast %lds_addr : index to i64
     %llvm_ptr = llvm.inttoptr %ptr_i64 : i64 to !llvm.ptr<3>
     %c4_i32 = arith.constant 4 : i32
     %c0_i32 = arith.constant 0 : i32
-    llvm.call_intrinsic "llvm.amdgcn.raw.buffer.load.lds"(%arg0, %llvm_ptr, %c4_i32, %arg2, %arg3, %c0_i32, %c0_i32) : (vector<4xi32>, !llvm.ptr<3>, i32, i32, i32, i32, i32) -> ()
+    llvm.call_intrinsic "llvm.amdgcn.raw.buffer.load.lds"(%arg0, %llvm_ptr, %c4_i32, %arg3, %arg4, %c0_i32, %c0_i32) : (vector<4xi32>, !llvm.ptr<3>, i32, i32, i32, i32, i32) -> ()
     return
   }
 
