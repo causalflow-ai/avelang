@@ -148,6 +148,11 @@ def fma(a, b, c):
     pass
 
 
+def fmax(lhs, rhs):
+    """Compute the floating-point maximum of two scalar GPU values."""
+    pass
+
+
 def exp(x):
     """Compute e**x for scalar GPU values."""
     pass
