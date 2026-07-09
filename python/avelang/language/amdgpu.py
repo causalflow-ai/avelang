@@ -37,6 +37,10 @@ def s_waitcnt(vmcnt, expcnt, lgkmcnt):
     pass
 
 
+def readfirstlane(value):
+    pass
+
+
 def raw_buffer_load_x1(rsrc, vindex, soffset, aux):
     pass
 

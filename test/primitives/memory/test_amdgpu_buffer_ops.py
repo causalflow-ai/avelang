@@ -72,6 +72,13 @@ def kernel_amdgpu_raw_buffer_load_lds_offset(
     dst[0] = shared[1]
 
 
+@avelang.jit
+def kernel_amdgpu_readfirstlane(out: S.Tensor((128,), S.i32)):
+    tid = S.thread_id(0)
+    tid_i32 = S.convert(tid, S.i32)
+    out[tid] = S.amdgpu.readfirstlane(tid_i32)
+
+
 def generate_mlir(jit_fn) -> str:
     jit_deps = _collect_jit_dependencies(jit_fn)
     import_module = _build_import_module([jit_fn, *jit_deps])
@@ -141,6 +148,22 @@ class TestAMDGPUBufferOps(unittest.TestCase):
         )
 
         self.assertEqual(dst.item(), 29)
+
+    def test_readfirstlane(self):
+        out = torch.full((128,), -1, dtype=torch.int32, device="cuda")
+
+        kernel_amdgpu_readfirstlane[lambda: ((1, 1, 1), (128, 1, 1))](out)
+
+        expected = torch.cat(
+            [
+                torch.zeros((64,), dtype=torch.int32),
+                torch.full((64,), 64, dtype=torch.int32),
+            ]
+        )
+        self.assertTrue(
+            torch.equal(out.cpu(), expected),
+            f"Expected: {expected.tolist()}, Actual: {out.cpu().tolist()}",
+        )
 
 
 if __name__ == "__main__":

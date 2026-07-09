@@ -114,6 +114,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value
     CreateSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateReadFirstLaneFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -161,6 +164,9 @@ class AMDGPUIntrinsic : public NamedModule {
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckReadFirstLaneFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -234,6 +240,19 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckSWaitcntFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "readfirstlane",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateReadFirstLaneFunction(call_expr, gen_ctx,
+                                               resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckReadFirstLaneFunction(call_expr, gen_ctx,
+                                              resolved_args);
         });
 
     AddFunction(
@@ -683,6 +702,17 @@ mlir::Value AMDGPUIntrinsic::CreatePermFunction(
     auto callOp = mlir::func::CallOp::create(
         builder, location, funcName, builder.getI32Type(), resolved_args);
     return callOp.getResult(0);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateReadFirstLaneFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto value = ConvertToI32(builder, location, resolved_args[0]);
+    auto op = mlir::ROCDL::ReadfirstlaneOp::create(builder, location,
+                                                   value.getType(), value);
+    return op.getResult();
 }
 
 mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
@@ -1165,6 +1195,27 @@ bool AMDGPUIntrinsic::CheckPermFunction(
                 << "perm() expects 32-bit integer arguments";
             return false;
         }
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckReadFirstLaneFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1 ||
+        !resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "readfirstlane() requires exactly 1 argument";
+        return false;
+    }
+
+    if (!resolved_args[0].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "readfirstlane() expects an integer or index argument";
+        return false;
     }
 
     return true;

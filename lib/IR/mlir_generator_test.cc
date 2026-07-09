@@ -1574,6 +1574,48 @@ def setprio_test():
         << "MLIR verification failed!";
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUReadFirstLane) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def readfirstlane_test(out: S.Tensor((1,), S.u32), value: S.u32):
+    out[0] = S.amdgpu.readfirstlane(value)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool found_readfirstlane = false;
+    mlir->walk([&](mlir::ROCDL::ReadfirstlaneOp op) {
+        found_readfirstlane = true;
+        EXPECT_TRUE(op.getSrc().getType().isInteger(32));
+        EXPECT_TRUE(op.getResult().getType().isInteger(32));
+    });
+
+    EXPECT_TRUE(found_readfirstlane);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createSymbolDCEPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUPerm) {
     static const std::string kSourceCode = R"""""(
 import avelang
