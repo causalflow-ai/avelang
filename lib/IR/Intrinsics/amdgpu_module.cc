@@ -108,6 +108,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value
     CreatePermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateDsPermuteB32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
     CreateRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                       llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -163,6 +166,9 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckPermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckDsPermuteB32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
@@ -224,6 +230,19 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckPermFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "ds_permute_b32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateDsPermuteB32Function(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckDsPermuteB32Function(call_expr, gen_ctx,
+                                             resolved_args);
         });
 
     AddFunction(
@@ -718,6 +737,18 @@ mlir::Value AMDGPUIntrinsic::CreatePermFunction(
     auto location = GetCallLocation(ctx, call_expr);
     auto funcName =
         intrinsics::MakeIntrinsicFuncName("amdgpu", "llvm_amdgcn_perm");
+    auto callOp = mlir::func::CallOp::create(
+        builder, location, funcName, builder.getI32Type(), resolved_args);
+    return callOp.getResult(0);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateDsPermuteB32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto funcName =
+        intrinsics::MakeIntrinsicFuncName("amdgpu", "ds_permute_b32");
     auto callOp = mlir::func::CallOp::create(
         builder, location, funcName, builder.getI32Type(), resolved_args);
     return callOp.getResult(0);
@@ -1227,6 +1258,31 @@ bool AMDGPUIntrinsic::CheckPermFunction(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
                 << "perm() expects 32-bit integer arguments";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckDsPermuteB32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
+        !resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "ds_permute_b32() requires exactly 2 arguments";
+        return false;
+    }
+
+    for (auto arg : resolved_args) {
+        auto intType = mlir::dyn_cast<mlir::IntegerType>(arg.getType());
+        if (!intType || intType.getWidth() != 32) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "ds_permute_b32() expects 32-bit integer arguments";
             return false;
         }
     }

@@ -29,6 +29,10 @@ def perm(lhs, rhs, sel):
     pass
 
 
+def ds_permute_b32(index, value):
+    pass
+
+
 def rcp(value):
     pass
 

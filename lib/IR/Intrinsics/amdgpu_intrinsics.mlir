@@ -6,6 +6,11 @@ module {
     return %0 : i32
   }
 
+  func.func private @_avelang_amdgpu_ds_permute_b32(%arg0: i32, %arg1: i32) -> i32 attributes {func.inline = "always"} {
+    %0 = llvm.call_intrinsic "llvm.amdgcn.ds.permute"(%arg0, %arg1) : (i32, i32) -> i32
+    return %0 : i32
+  }
+
   func.func private @_avelang_amdgpu_llvm_amdgcn_rcp_f32(%arg0: f32) -> f32 attributes {func.inline = "always"} {
     %0 = llvm.call_intrinsic "llvm.amdgcn.rcp.f32"(%arg0) : (f32) -> f32
     return %0 : f32
