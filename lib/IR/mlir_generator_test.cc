@@ -1492,6 +1492,47 @@ def sched_group_barrier_test():
         << "MLIR verification failed!";
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUSchedBarrier) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def sched_barrier_test():
+    S.amdgpu.sched_barrier(0)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool found_sched_barrier = false;
+    mlir->walk([&](mlir::ROCDL::SchedBarrier op) {
+        found_sched_barrier = true;
+        EXPECT_EQ(op.getMask(), 0u);
+    });
+
+    EXPECT_TRUE(found_sched_barrier);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createSymbolDCEPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
+
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUPerm) {
     static const std::string kSourceCode = R"""""(
 import avelang

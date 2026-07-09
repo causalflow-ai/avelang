@@ -67,3 +67,7 @@ def raw_buffer_store_x4(vdata, rsrc, vindex, soffset, aux):
 
 def sched_group_barrier(mask, size, group_id):
     pass
+
+
+def sched_barrier(mask):
+    pass

@@ -117,6 +117,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateSchedBarrierFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                               llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     mlir::Value
@@ -157,6 +160,9 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckSchedGroupBarrierFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckSchedBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 };
@@ -327,6 +333,19 @@ void AMDGPUIntrinsic::Initialize() {
             return CheckSchedGroupBarrierFunction(call_expr, gen_ctx,
                                                   resolved_args);
         });
+
+    AddFunction(
+        "sched_barrier",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateSchedBarrierFunction(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckSchedBarrierFunction(call_expr, gen_ctx, resolved_args);
+        });
+
 }
 
 void AMDGPUIntrinsic::DeclareModules(mlir::ModuleOp module) {
@@ -677,6 +696,30 @@ mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
         builder, location, static_cast<uint32_t>(*mask),
         static_cast<uint32_t>(*size), static_cast<uint32_t>(*group_id));
 
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateSchedBarrierFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto mask = ConstantFolder::FoldIntValue(resolved_args[0]);
+
+    if (!mask || *mask < 0 ||
+        static_cast<uint64_t>(*mask) >
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "sched_barrier(mask) requires a compile-time non-negative "
+               "integer argument <= 2^32-1";
+        return nullptr;
+    }
+
+    mlir::ROCDL::SchedBarrier::create(builder, location,
+                                      static_cast<uint32_t>(*mask));
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -1101,6 +1144,26 @@ bool AMDGPUIntrinsic::CheckSchedGroupBarrierFunction(
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "Failed to generate operands for sched_group_barrier()";
+        return false;
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckSchedBarrierFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "sched_barrier() requires exactly 1 argument: mask";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operand for sched_barrier()";
         return false;
     }
 
