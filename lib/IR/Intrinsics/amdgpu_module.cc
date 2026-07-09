@@ -93,6 +93,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateRawBufferLoadX1LdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateMaskLowerBoundF32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateRawBufferStoreX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -155,6 +158,9 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
     bool CheckRawBufferLoadX1LdsFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckMaskBoundF32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -343,6 +349,19 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
                                                    resolved_args);
+        });
+
+    AddFunction(
+        "mask_lower_bound_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMaskLowerBoundF32Function(call_expr, gen_ctx,
+                                                   resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMaskBoundF32Function(call_expr, gen_ctx,
+                                             resolved_args);
         });
 
     AddFunction(
@@ -598,6 +617,34 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateMaskLowerBoundF32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+
+    auto threshold = ConstantFolder::FoldIntValue(resolved_args[3]);
+    if (!threshold) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask_lower_bound_f32 requires a compile-time threshold";
+        return nullptr;
+    }
+
+    auto value = resolved_args[2];
+    auto rel = ConvertToI32(builder, location, resolved_args[0]);
+    auto negInf = resolved_args[1];
+    auto asmString =
+        "v_cmp_lt_i32_e64 vcc, $1, " + std::to_string(*threshold) +
+        "\n\tv_cndmask_b32_e64 $0, $2, $3, vcc";
+    auto asmOp = mlir::LLVM::InlineAsmOp::create(
+        builder, location, builder.getF32Type(),
+        mlir::ValueRange{rel, value, negInf}, asmString, "=v,v,v,v,~{vcc}",
+        true, false,
+        mlir::LLVM::tailcallkind::TailCallKind::None, nullptr, nullptr);
+    return asmOp.getResult(0);
 }
 
 mlir::Value AMDGPUIntrinsic::CreateRawBufferStoreX1Function(
@@ -1047,6 +1094,51 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
                                         call_expr->GetSourceRange().getBegin())
             << "raw_buffer_load_x1_lds currently requires compile-time "
                "size=4 and aux=0";
+        return false;
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckMaskBoundF32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask bound f32 requires exactly 4 arguments: rel/remaining, "
+               "neg_inf, value, threshold";
+        return false;
+    }
+
+    for (auto value : resolved_args) {
+        if (!value) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "Failed to generate operands for mask bound f32";
+            return false;
+        }
+    }
+
+    if (!resolved_args[0].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask bound f32 expects rel/remaining to be an integer";
+        return false;
+    }
+    if (!mlir::isa<mlir::Float32Type>(resolved_args[1].getType()) ||
+        !mlir::isa<mlir::Float32Type>(resolved_args[2].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask bound f32 expects neg_inf and value to be f32";
+        return false;
+    }
+    if (!resolved_args[3].getType().isIntOrIndex() ||
+        !ConstantFolder::FoldIntValue(resolved_args[3])) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask bound f32 requires a compile-time integer threshold";
         return false;
     }
 

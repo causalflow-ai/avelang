@@ -65,6 +65,10 @@ def raw_buffer_load_x1_lds(rsrc, lds_ptr, size, vindex, soffset, offset, aux):
     pass
 
 
+def mask_lower_bound_f32(rel, neg_inf, value, threshold):
+    pass
+
+
 def raw_buffer_store_x1(vdata, rsrc, vindex, soffset, aux):
     pass
 
