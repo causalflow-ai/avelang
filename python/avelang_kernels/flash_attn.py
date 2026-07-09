@@ -738,12 +738,26 @@ def _gemm_o_mfma_v_word_regs_batch0_direct(
 ):
     score_frag = al.make_local((4,), al.bf16)
 
-    for o_batch in al.range(O_BATCHES):
-        for k_slice in al.range(4):
-            v_frag = al.view(v_regs[o_batch, k_slice], al.Tensor((4,), al.bf16))
-            for elem in al.range(4):
-                score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
-            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[o_batch])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[0, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[0])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[1, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[1])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[2, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[2])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[3, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[3])
     _hot_loop_scheduler_gemm_o()
 
 
@@ -755,12 +769,26 @@ def _gemm_o_mfma_v_word_regs_batch1_direct(
 ):
     score_frag = al.make_local((4,), al.bf16)
 
-    for o_batch in al.range(O_BATCHES):
-        for k_slice in al.range(4):
-            v_frag = al.view(v_regs[o_batch, k_slice], al.Tensor((4,), al.bf16))
-            for elem in al.range(4):
-                score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
-            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[o_batch])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[0, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[0])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[1, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[1])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[2, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[2])
+    for k_slice in al.range(4):
+        v_frag = al.view(v_regs[3, k_slice], al.Tensor((4,), al.bf16))
+        for elem in al.range(4):
+            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[3])
     _hot_loop_scheduler_gemm_o()
 
 
@@ -1042,7 +1070,6 @@ def _flash_attn_compute_qk_page(
     k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
     k_rsrc: al.Tensor((4,), al.u32),
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
-    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
     tid: al.u32,
     key_row_local: al.u32,
@@ -1064,6 +1091,7 @@ def _flash_attn_compute_qk_page(
     )
     al.amdgpu.s_waitcnt(0, 7, 15)
     al.syncthreads()
+    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
     _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
     if page == 0:
         _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
@@ -1090,7 +1118,6 @@ def _flash_attn_compute_qk_page(
 def _flash_attn_compute_qk_page_loaded(
     k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
-    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
     key_row_local: al.u32,
     lane_half: al.u32,
@@ -1100,6 +1127,7 @@ def _flash_attn_compute_qk_page_loaded(
     first_causal_key_base: al.u32,
     page: al.u32,
 ):
+    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
     _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
     if page == 0:
         _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
@@ -1130,7 +1158,6 @@ def _flash_attn_packed_pair_step_wg0(
     k_rsrc: al.Tensor((4,), al.u32),
     v_rsrc: al.Tensor((4,), al.u32),
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
-    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
     g_v0: al.Tensor((4,), al.u32),
     g_v1: al.Tensor((4,), al.u32),
@@ -1151,14 +1178,13 @@ def _flash_attn_packed_pair_step_wg0(
     first_causal_key_base: al.u32,
     kv_row_stride_words: al.u32,
     scale_log2: al.f32,
-) -> (al.f32, al.f32):
+):
     odd_slice = pair_idx * 2 + 1
     next_even_slice = odd_slice + 1
 
     _flash_attn_compute_qk_page_loaded(
         k_stage_words,
         q_regs,
-        k_regs,
         score_acc,
         key_row_local,
         lane_half,
@@ -1184,7 +1210,7 @@ def _flash_attn_packed_pair_step_wg0(
     _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
     al.syncthreads()
     _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
-    mi, l = _flash_attn_update_o_batch0(
+    _flash_attn_update_o_batch0(
         score_acc,
         out_acc,
         v_regs,
@@ -1204,7 +1230,6 @@ def _flash_attn_packed_pair_step_wg0(
         _flash_attn_compute_qk_page_loaded(
             k_stage_words,
             q_regs,
-            k_regs,
             score_acc,
             key_row_local,
             lane_half,
@@ -1231,7 +1256,7 @@ def _flash_attn_packed_pair_step_wg0(
         _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
         al.syncthreads()
         _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
-        mi, l = _flash_attn_update_o_batch1(
+        _flash_attn_update_o_batch1(
             score_acc,
             out_acc,
             v_regs,
@@ -1244,7 +1269,6 @@ def _flash_attn_packed_pair_step_wg0(
         al.syncthreads()
         al.amdgpu.eager_materialize_i32(odd_slice)
         al.syncthreads()
-    return mi, l
 
 
 @avelang.jit
@@ -1255,7 +1279,6 @@ def _flash_attn_packed_pair_step_wg1(
     k_rsrc: al.Tensor((4,), al.u32),
     v_rsrc: al.Tensor((4,), al.u32),
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
-    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
     g_v0: al.Tensor((4,), al.u32),
     g_v1: al.Tensor((4,), al.u32),
@@ -1276,7 +1299,7 @@ def _flash_attn_packed_pair_step_wg1(
     first_causal_key_base: al.u32,
     kv_row_stride_words: al.u32,
     scale_log2: al.f32,
-) -> (al.f32, al.f32):
+):
     odd_slice = pair_idx * 2 + 1
     next_even_slice = odd_slice + 1
 
@@ -1293,7 +1316,6 @@ def _flash_attn_packed_pair_step_wg1(
     _flash_attn_compute_qk_page_loaded(
         k_stage_words,
         q_regs,
-        k_regs,
         score_acc,
         key_row_local,
         lane_half,
@@ -1309,7 +1331,7 @@ def _flash_attn_packed_pair_step_wg1(
     _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
     al.syncthreads()
     _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
-    mi, l = _flash_attn_update_o_batch0(
+    _flash_attn_update_o_batch0(
         score_acc,
         out_acc,
         v_regs,
@@ -1339,7 +1361,6 @@ def _flash_attn_packed_pair_step_wg1(
         _flash_attn_compute_qk_page_loaded(
             k_stage_words,
             q_regs,
-            k_regs,
             score_acc,
             key_row_local,
             lane_half,
@@ -1356,7 +1377,7 @@ def _flash_attn_packed_pair_step_wg1(
         _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
         al.syncthreads()
         _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
-        mi, l = _flash_attn_update_o_batch1(
+        _flash_attn_update_o_batch1(
             score_acc,
             out_acc,
             v_regs,
@@ -1369,7 +1390,6 @@ def _flash_attn_packed_pair_step_wg1(
         al.syncthreads()
         al.amdgpu.eager_materialize_i32(odd_slice)
         al.syncthreads()
-    return mi, l
 
 
 @avelang.jit
@@ -1388,12 +1408,10 @@ def _flash_attn_packed_drain_epilogue(
     lane_half: al.u32,
     max_k_slice: al.u32,
     scale_log2: al.f32,
-) -> (al.f32, al.f32):
-    mi = softmax_state[0]
-    l = softmax_state[1]
+):
     epilogue_uses_s1 = (max_k_slice & 1) != 0
     if epilogue_uses_s1:
-        mi, l = _flash_attn_prepare_o_batch1(
+        _flash_attn_prepare_o_batch1(
             score_acc,
             out_acc,
             softmax_state,
@@ -1403,7 +1421,7 @@ def _flash_attn_packed_drain_epilogue(
             scale_log2,
         )
     else:
-        mi, l = _flash_attn_prepare_o_batch0(
+        _flash_attn_prepare_o_batch0(
             score_acc,
             out_acc,
             softmax_state,
@@ -1424,7 +1442,6 @@ def _flash_attn_packed_drain_epilogue(
         al.syncthreads()
         _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
         _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
-    return mi, l
 
 
 @avelang.jit
@@ -1530,7 +1547,6 @@ def _flash_attn_packed_process_tile(
     v_words = al.subview(kv_words, (SHM_V_OFFSET_WORDS,), (SHM_V_WORDS,), (1,))
 
     q_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
-    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
     v_regs = al.make_local((O_BATCHES, 4, 2), al.u32)
     g_v0 = al.make_local((4,), al.u32)
     g_v1 = al.make_local((4,), al.u32)
@@ -1572,7 +1588,6 @@ def _flash_attn_packed_process_tile(
         k_stage_words,
         k_rsrc,
         q_regs,
-        k_regs,
         score_acc,
         tid,
         key_row_local,
@@ -1622,43 +1637,42 @@ def _flash_attn_packed_process_tile(
             0,
         )
 
-    for pair_idx in al.range(pair_count):
-        odd_slice_pre = pair_idx * 2 + 1
-        actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
-        actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
-        if pair_idx != 0:
-            if odd_slice_pre <= max_k_slice:
+    if wid < (NUM_WARPS // 2):
+        for pair_idx in al.range(pair_count):
+            odd_slice_pre = pair_idx * 2 + 1
+            actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
+            actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
+            if pair_idx != 0:
+                if odd_slice_pre <= max_k_slice:
+                    _load_k_page_strided(
+                        k_stage_words,
+                        k_rsrc,
+                        tid,
+                        actual_odd_key_base,
+                        kv_row_stride_words,
+                        1,
+                    )
+                    al.amdgpu.s_waitcnt(0, 7, 15)
+                    al.syncthreads()
+            next_even_slice_pre = pair_idx * 2 + 2
+            actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
+            actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
+            if next_even_slice_pre <= max_k_slice:
                 _load_k_page_strided(
                     k_stage_words,
                     k_rsrc,
                     tid,
-                    actual_odd_key_base,
+                    actual_next_even_key_base,
                     kv_row_stride_words,
-                    1,
+                    0,
                 )
-                al.amdgpu.s_waitcnt(0, 7, 15)
-                al.syncthreads()
-        next_even_slice_pre = pair_idx * 2 + 2
-        actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
-        actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
-        if next_even_slice_pre <= max_k_slice:
-            _load_k_page_strided(
-                k_stage_words,
-                k_rsrc,
-                tid,
-                actual_next_even_key_base,
-                kv_row_stride_words,
-                0,
-            )
-        if wid < (NUM_WARPS // 2):
-            mi, l = _flash_attn_packed_pair_step_wg0(
+            _flash_attn_packed_pair_step_wg0(
                 k_stage_words,
                 kv_words,
                 v_words,
                 k_rsrc,
                 v_rsrc,
                 q_regs,
-                k_regs,
                 v_regs,
                 g_v0,
                 g_v1,
@@ -1680,15 +1694,42 @@ def _flash_attn_packed_process_tile(
                 kv_row_stride_words,
                 scale_log2,
             )
-        else:
-            mi, l = _flash_attn_packed_pair_step_wg1(
+    else:
+        for pair_idx in al.range(pair_count):
+            odd_slice_pre = pair_idx * 2 + 1
+            actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
+            actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
+            if pair_idx != 0:
+                if odd_slice_pre <= max_k_slice:
+                    _load_k_page_strided(
+                        k_stage_words,
+                        k_rsrc,
+                        tid,
+                        actual_odd_key_base,
+                        kv_row_stride_words,
+                        1,
+                    )
+                    al.amdgpu.s_waitcnt(0, 7, 15)
+                    al.syncthreads()
+            next_even_slice_pre = pair_idx * 2 + 2
+            actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
+            actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
+            if next_even_slice_pre <= max_k_slice:
+                _load_k_page_strided(
+                    k_stage_words,
+                    k_rsrc,
+                    tid,
+                    actual_next_even_key_base,
+                    kv_row_stride_words,
+                    0,
+                )
+            _flash_attn_packed_pair_step_wg1(
                 k_stage_words,
                 kv_words,
                 v_words,
                 k_rsrc,
                 v_rsrc,
                 q_regs,
-                k_regs,
                 v_regs,
                 g_v0,
                 g_v1,
@@ -1711,7 +1752,7 @@ def _flash_attn_packed_process_tile(
                 scale_log2,
             )
 
-    mi, l = _flash_attn_packed_drain_epilogue(
+    _flash_attn_packed_drain_epilogue(
         kv_words,
         v_words,
         score_acc,

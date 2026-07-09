@@ -51,12 +51,15 @@ class OverrideRocdlMaxFlatWorkgroupSizePass
         auto *rocdlDialect = context->getOrLoadDialect<ROCDL::ROCDLDialect>();
         auto maxFlatWorkgroupSizeAttr =
             rocdlDialect->getMaxFlatWorkGroupSizeAttrHelper();
+        auto wavesPerEuAttr = rocdlDialect->getWavesPerEuAttrHelper();
         Builder builder(context);
         IntegerAttr attr = builder.getI32IntegerAttr(maxFlatWorkgroupSize);
+        IntegerAttr wavesAttr = builder.getI32IntegerAttr(1);
 
         gpuModule.walk([&](gpu::GPUFuncOp func) {
             if (func.isKernel()) {
                 maxFlatWorkgroupSizeAttr.setAttr(func, attr);
+                wavesPerEuAttr.setAttr(func, wavesAttr);
             }
         });
     }
