@@ -59,8 +59,8 @@ def gemm_mfma_128_bf16_mfma(
 
         a_words = a_smem[lane]
         b_words = b_smem[lane]
-        a_frag = al.view(a_words, al.Tensor((2, 4, 1), al.bf16))
-        b_frag = al.view(b_words, al.Tensor((2, 4, 1), al.bf16))
+        a_frag = al.view(a_words, al.Tensor((2, 2, 1), al.u32))
+        b_frag = al.view(b_words, al.Tensor((2, 2, 1), al.u32))
 
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[0], a_frag[0], acc)
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[1], a_frag[1], acc)
@@ -178,8 +178,8 @@ def gemm_runtime_shape(
 
         a_words = a_smem[lane]
         b_words = b_smem[lane]
-        a_frag = al.view(a_words, al.Tensor((2, 4, 1), al.bf16))
-        b_frag = al.view(b_words, al.Tensor((2, 4, 1), al.bf16))
+        a_frag = al.view(a_words, al.Tensor((2, 2, 1), al.u32))
+        b_frag = al.view(b_words, al.Tensor((2, 2, 1), al.u32))
 
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[0], a_frag[0], acc)
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[1], a_frag[1], acc)
@@ -301,8 +301,8 @@ def gemm_runtime_shape_guarded_loads(
 
         a_words = a_smem[lane]
         b_words = b_smem[lane]
-        a_frag = al.view(a_words, al.Tensor((2, 4, 1), al.bf16))
-        b_frag = al.view(b_words, al.Tensor((2, 4, 1), al.bf16))
+        a_frag = al.view(a_words, al.Tensor((2, 2, 1), al.u32))
+        b_frag = al.view(b_words, al.Tensor((2, 2, 1), al.u32))
 
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[0], a_frag[0], acc)
         acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[1], a_frag[1], acc)
@@ -360,4 +360,3 @@ gemm_runtime_shape_guarded_loads[lambda: ((grid_x, grid_y, 1), (64, 1, 1))](
 expected = A.to(torch.float32) @ B.to(torch.float32).T
 torch.testing.assert_close(C.cpu(), expected.cpu(), rtol=1e-2, atol=1e-2)
 ```
-

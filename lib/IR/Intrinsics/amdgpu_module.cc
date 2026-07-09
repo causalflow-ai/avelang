@@ -380,6 +380,8 @@ mlir::Type GetMfmaElemType(amdgpu_mfma::VectorElemKind kind,
     switch (kind) {
     case amdgpu_mfma::VectorElemKind::I32:
         return builder.getI32Type();
+    case amdgpu_mfma::VectorElemKind::FP8:
+        return builder.getI8Type();
     case amdgpu_mfma::VectorElemKind::F16:
         return builder.getF16Type();
     case amdgpu_mfma::VectorElemKind::F32:
@@ -469,30 +471,14 @@ mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
     auto b = resolved_args[1];
     auto c = resolved_args[2];
 
-    auto type_a = GetMfmaElemType(config.aElem, builder);
     auto type_c = GetMfmaElemType(config.cElem, builder);
 
     int64_t c_elements = config.GetCElementCount();
     auto result_vector_type = mlir::VectorType::get({c_elements}, type_c);
 
     // Convert MLIR types to string representations for attributes
-    std::string type_a_str, type_c_str;
-    llvm::raw_string_ostream type_a_stream(type_a_str);
+    std::string type_c_str;
     llvm::raw_string_ostream type_c_stream(type_c_str);
-
-    if (type_a.isF16()) {
-        type_a_stream << "f16";
-    } else if (type_a.isBF16()) {
-        type_a_stream << "bf16";
-    } else if (type_a.isF32()) {
-        type_a_stream << "f32";
-    } else if (type_a.isInteger(32)) {
-        type_a_stream << "i32";
-    } else if (type_a.isInteger(8)) {
-        type_a_stream << "i8";
-    } else {
-        type_a_stream << type_a;
-    }
 
     if (type_c.isF32()) {
         type_c_stream << "f32";
@@ -510,7 +496,7 @@ mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
         mlir::IntegerAttr::get(builder.getI32Type(), config.m),
         mlir::IntegerAttr::get(builder.getI32Type(), config.n),
         mlir::IntegerAttr::get(builder.getI32Type(), config.k),
-        mlir::StringAttr::get(builder.getContext(), type_a_str),
+        mlir::StringAttr::get(builder.getContext(), config.typeA),
         mlir::StringAttr::get(builder.getContext(), type_c_str));
 
     return mfma_op.getResult();

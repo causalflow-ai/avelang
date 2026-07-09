@@ -10,6 +10,7 @@ namespace causalflow::avelang::amdgpu::mfma {
 
 enum class VectorElemKind {
     I32,
+    FP8,
     F16,
     F32,
     BF16,
@@ -30,14 +31,20 @@ struct MFMAConfig {
 
     unsigned GetAElementCount() const { return (m * k) / kWarpSize; }
 
+    unsigned GetAStorageElementCount() const {
+        return GetAElementCount() * GetElementBitWidth(aElem) / 32;
+    }
+
     unsigned GetCElementCount() const { return (m * n) / kWarpSize; }
 
     bool MatchesAType(mlir::Type type) const {
-        return MatchesVectorType(type, aElem, GetAElementCount());
+        return MatchesVectorType(type, VectorElemKind::I32,
+                                 GetAStorageElementCount());
     }
 
     bool MatchesBType(mlir::Type type) const {
-        return MatchesVectorType(type, aElem, GetAElementCount());
+        return MatchesVectorType(type, VectorElemKind::I32,
+                                 GetAStorageElementCount());
     }
 
     bool MatchesCType(mlir::Type type) const {
@@ -101,6 +108,28 @@ struct MFMAConfig {
                 VectorElemKind::BF16,
                 VectorElemKind::F32,
             },
+            {
+                "mfma_16x16x32_fp8_fp8",
+                16,
+                16,
+                32,
+                "fp8",
+                "f32",
+                "rocdl_mfma_f32_16x16x32_fp8_fp8",
+                VectorElemKind::FP8,
+                VectorElemKind::F32,
+            },
+            {
+                "mfma_f32_16x16x32_fp8_fp8",
+                16,
+                16,
+                32,
+                "fp8",
+                "f32",
+                "rocdl_mfma_f32_16x16x32_fp8_fp8",
+                VectorElemKind::FP8,
+                VectorElemKind::F32,
+            },
         };
 
         return llvm::ArrayRef(kConfigs);
@@ -119,6 +148,20 @@ struct MFMAConfig {
     }
 
   private:
+    static unsigned GetElementBitWidth(VectorElemKind elem) {
+        switch (elem) {
+        case VectorElemKind::I32:
+        case VectorElemKind::F32:
+            return 32;
+        case VectorElemKind::FP8:
+            return 8;
+        case VectorElemKind::F16:
+        case VectorElemKind::BF16:
+            return 16;
+        }
+        return 0;
+    }
+
     static bool MatchesVectorType(mlir::Type type, VectorElemKind elem,
                                   int64_t elements) {
         auto vec = mlir::dyn_cast<mlir::VectorType>(type);
@@ -130,6 +173,8 @@ struct MFMAConfig {
         switch (elem) {
         case VectorElemKind::I32:
             return elemType.isInteger(32);
+        case VectorElemKind::FP8:
+            return elemType.isInteger(8);
         case VectorElemKind::F16:
             return elemType.isF16();
         case VectorElemKind::F32:

@@ -276,8 +276,8 @@ def _matmul_from_regs_batch(
 ):
     for tile_m in al.range(M_TILES_PER_WARP):
         for tile_n in al.range(N_TILES_PER_WARP):
-            frag_a = al.view(data_a[tile_m], al.Tensor((2, 4, 1), al.bf16))
-            frag_b = al.view(data_b[tile_n], al.Tensor((2, 4, 1), al.bf16))
+            frag_a = al.view(data_a[tile_m], al.Tensor((2, 2, 1), al.u32))
+            frag_b = al.view(data_b[tile_n], al.Tensor((2, 2, 1), al.u32))
             acc[tile_m, tile_n] = al.amdgpu.mfma_16x16x16_bf16_f32(
                 frag_a[0],
                 frag_b[0],

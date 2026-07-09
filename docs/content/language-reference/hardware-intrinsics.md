@@ -20,7 +20,7 @@ AMDGPU intrinsics live under `al.amdgpu`. The main families are MFMA matrix inst
 
 ## MFMA
 
-MFMA instructions let one AMD wave cooperatively compute a matrix multiply. Each lane passes fragments for `A`, `B`, and `C`, and receives its accumulator fragment in the hardware layout for that instruction.
+MFMA instructions let one AMD wave cooperatively compute a matrix multiply. Each lane passes two packed `u32` dwords for `A` and `B`, plus an accumulator fragment `C`, and receives its accumulator fragment in the hardware layout for that instruction.
 
 ```python
 acc = al.amdgpu.mfma_32x32x8_bf16_f32(a_frag, b_frag, acc)
@@ -34,21 +34,25 @@ mfma_16x16x16_bf16_f32
 mfma_f32_16x16x16_bf16
 mfma_32x32x8_bf16_f32
 mfma_f32_32x32x8_bf16
+mfma_16x16x32_fp8_fp8
+mfma_f32_16x16x32_fp8_fp8
 ```
 
-The name encodes the matrix shape and operand types. For example, `mfma_32x32x8_bf16_f32` consumes BF16 input fragments for a `32 x 32 x 8` operation and accumulates into F32. The fragment shapes must match the instruction. For `mfma_32x32x8_bf16_f32`, each lane contributes four BF16 values from `A`, four BF16 values from `B`, and holds sixteen F32 accumulator values.
+The name encodes the matrix shape and logical operand types. For example, `mfma_32x32x8_bf16_f32` consumes two packed `u32` dwords for each BF16 input fragment in a `32 x 32 x 8` operation and accumulates into F32. Each lane's dwords contain four BF16 values for `A` and four for `B`, and hold sixteen F32 accumulator values.
 
 Use `al.view` to reinterpret packed words as the fragment shape expected by the instruction:
 
 ```python
-a_frag = al.view(a_words, al.Tensor((2, 4, 1), al.bf16))
-b_frag = al.view(b_words, al.Tensor((2, 4, 1), al.bf16))
+a_frag = al.view(a_words, al.Tensor((2, 2, 1), al.u32))
+b_frag = al.view(b_words, al.Tensor((2, 2, 1), al.u32))
 
 acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[0], a_frag[0], acc)
 acc = al.amdgpu.mfma_32x32x8_bf16_f32(b_frag[1], a_frag[1], acc)
 ```
 
 The operand order is part of the layout decision. In the GEMM tutorial, the operands are swapped so the MFMA accumulator fragment can be shuffled back into row-major `C`.
+
+`mfma_16x16x32_fp8_fp8` and its `mfma_f32_...` alias consume two packed `u32` dwords per lane for each input and produce four `f32` accumulator values. They lower to the AMDGPU FP8 MFMA instruction.
 
 ## Raw-Buffer Resources
 
@@ -145,4 +149,3 @@ ldmatrix_m8n8_x4_b16_trans
 ```
 
 The corresponding store wrappers use `stmatrix_m8n8_x1_b16`, `stmatrix_m8n8_x2_b16`, and `stmatrix_m8n8_x4_b16`, with `_trans` variants for the transposed layout.
-

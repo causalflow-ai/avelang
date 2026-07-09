@@ -231,6 +231,8 @@ static mlir::Type getMfmaElemType(amdgpu_mfma::VectorElemKind kind,
     switch (kind) {
     case amdgpu_mfma::VectorElemKind::I32:
         return builder.getI32Type();
+    case amdgpu_mfma::VectorElemKind::FP8:
+        return builder.getI8Type();
     case amdgpu_mfma::VectorElemKind::F16:
         return builder.getF16Type();
     case amdgpu_mfma::VectorElemKind::F32:
@@ -481,7 +483,6 @@ class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
         auto c = op.getC();
         auto resultType = op.getResult().getType();
 
-        // Get config parameters from operation attributes
         int m = op.getMAttr().getInt();
         int n = op.getNAttr().getInt();
         int k = op.getKAttr().getInt();
@@ -505,10 +506,10 @@ class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
             return mlir::failure();
         }
 
-        auto desiredAElem = getMfmaElemType(config->aElem, rewriter);
+        auto desiredAElem = rewriter.getI32Type();
         auto desiredBElem = desiredAElem;
         auto desiredCElem = getMfmaElemType(config->cElem, rewriter);
-        int64_t desiredACount = config->GetAElementCount();
+        int64_t desiredACount = config->GetAStorageElementCount();
         int64_t desiredBCount = desiredACount;
         int64_t desiredCCount = config->GetCElementCount();
 

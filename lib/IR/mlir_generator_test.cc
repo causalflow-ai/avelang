@@ -1354,8 +1354,8 @@ import avelang
 import avelang.language as S
 
 @avelang.jit
-def mfma_test(a: S.Tensor((4,), S.f16),
-             b: S.Tensor((4,), S.f16),
+def mfma_test(a: S.Tensor((2,), S.u32),
+             b: S.Tensor((2,), S.u32),
              c: S.Tensor((4,), S.f32)):
     c = S.amdgpu.mfma_16x16x16_f16_f32(a, b, c)
 )""""";
@@ -1369,11 +1369,11 @@ import avelang
 import avelang.language as S
 
 @avelang.jit
-def mfma_test(a: S.Tensor((4,), S.f16),
-             b: S.Tensor((4,), S.f16),
+def mfma_test(a: S.Tensor((2,), S.u32),
+             b: S.Tensor((2,), S.u32),
              c: S.Tensor((4,), S.f32)):
-    a_cast = S.view(a, S.Tensor((1, 4, 1), S.f16))
-    b_cast = S.view(b, S.Tensor((1, 4, 1), S.f16))
+    a_cast = S.view(a, S.Tensor((1, 2, 1), S.u32))
+    b_cast = S.view(b, S.Tensor((1, 2, 1), S.u32))
     c = S.amdgpu.mfma_16x16x16_f16_f32(a_cast[0], b_cast[0], c)
 )""""";
 
@@ -1386,8 +1386,8 @@ import avelang
 import avelang.language as S
 
 @avelang.jit
-def mfma_bf16_test(a: S.Tensor((4,), S.bf16),
-                  b: S.Tensor((4,), S.bf16),
+def mfma_bf16_test(a: S.Tensor((2,), S.u32),
+                  b: S.Tensor((2,), S.u32),
                   c: S.Tensor((4,), S.f32)):
     c = S.amdgpu.mfma_16x16x16_bf16_f32(a, b, c)
 )""""";
@@ -1401,10 +1401,30 @@ import avelang
 import avelang.language as S
 
 @avelang.jit
-def mfma_bf16_test(a: S.Tensor((4,), S.bf16),
-                  b: S.Tensor((4,), S.bf16),
+def mfma_bf16_test(a: S.Tensor((2,), S.u32),
+                  b: S.Tensor((2,), S.u32),
                   c: S.Tensor((4,), S.f32)):
     c = S.amdgpu.mfma_f32_16x16x16_bf16(a, b, c)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUMFMAFP8And32x32BF16) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def mfma_test(a_fp8: S.Tensor((2,), S.u32),
+              b_fp8: S.Tensor((2,), S.u32),
+              c_fp8: S.Tensor((4,), S.f32),
+              a_bf16: S.Tensor((2,), S.u32),
+              b_bf16: S.Tensor((2,), S.u32),
+              c_bf16: S.Tensor((16,), S.f32)):
+    c_fp8 = S.amdgpu.mfma_16x16x32_fp8_fp8(a_fp8, b_fp8, c_fp8)
+    c_fp8 = S.amdgpu.mfma_f32_16x16x32_fp8_fp8(a_fp8, b_fp8, c_fp8)
+    c_bf16 = S.amdgpu.mfma_32x32x8_bf16_f32(a_bf16, b_bf16, c_bf16)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
