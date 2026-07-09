@@ -137,6 +137,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateCvtPkBf8F32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateSetPrioFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     mlir::Value
@@ -193,6 +196,9 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args,
         llvm::StringRef intrinsic_name) const;
+    bool CheckSetPrioFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 };
 
 AMDGPUIntrinsic::AMDGPUIntrinsic() : NamedModule("amdgpu") {}
@@ -434,6 +440,17 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckCvtPkF8F32Function(call_expr, gen_ctx, resolved_args,
                                             "cvt_pk_bf8_f32");
+        });
+
+    AddFunction(
+        "s_setprio",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateSetPrioFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckSetPrioFunction(call_expr, gen_ctx, resolved_args);
         });
 }
 
@@ -960,6 +977,30 @@ mlir::Value AMDGPUIntrinsic::CreateCvtPkBf8F32Function(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateCvtPkF8F32<mlir::ROCDL::CvtPkBf8F32Op>(
         call_expr, ctx, resolved_args);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateSetPrioFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto priority = ConstantFolder::FoldIntValue(resolved_args[0]);
+
+    if (!priority || *priority < 0 ||
+        static_cast<uint64_t>(*priority) >
+            static_cast<uint64_t>(std::numeric_limits<uint16_t>::max())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "s_setprio(priority) requires a compile-time non-negative "
+               "integer argument <= 2^16-1";
+        return nullptr;
+    }
+
+    mlir::ROCDL::SetPrioOp::create(builder, location,
+                                   static_cast<uint16_t>(*priority));
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
 }
 
 mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferLoadFunction(
@@ -1647,6 +1688,26 @@ bool AMDGPUIntrinsic::CheckGlobalAtomicAddFunction(
                "or 2 (system)";
         return false;
     }
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckSetPrioFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "s_setprio() requires exactly 1 argument: priority";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operand for s_setprio()";
+        return false;
+    }
+
     return true;
 }
 
