@@ -6,73 +6,103 @@ import avelang.language as al
 import torch
 
 WARP_SIZE = 64
-NUM_WARPS = 4
+NUM_WARPS = 8
 THREADS = WARP_SIZE * NUM_WARPS
 
-BLOCK_ROWS = 128
-BLOCK_COLS = 128
-HEAD_DIM = 64
+BLOCK_ROWS = 256
+BLOCK_COLS = 64
+HEAD_DIM = 128
+Q_HEADS = 8
+KV_HEADS = 1
 VEC_SIZE = 16 // 2
 BF16_BYTES = 2
 U128_BYTES = VEC_SIZE * BF16_BYTES
+U32_BYTES = 4
 
+K_SLICES = 2
 SHM_Q_WORDS = BLOCK_ROWS * HEAD_DIM // 2
 SHM_K_WORDS = BLOCK_COLS * HEAD_DIM // 2
+Q_STAGE_ROWS = BLOCK_ROWS // K_SLICES
+Q_STAGE_DATA_WORDS = Q_STAGE_ROWS * HEAD_DIM // 2
+Q_STAGE_PADDING_U32 = (Q_STAGE_ROWS * HEAD_DIM) // (WARP_SIZE * 2) * (U128_BYTES // U32_BYTES)
+SHM_Q_STAGE_WORDS = Q_STAGE_DATA_WORDS + Q_STAGE_PADDING_U32
+K_SLICE_ROWS = BLOCK_COLS // K_SLICES
+K_SLICE_DATA_WORDS = K_SLICE_ROWS * HEAD_DIM // 2
+K_SLICE_PADDING_U32 = (K_SLICE_ROWS * HEAD_DIM) // (WARP_SIZE * 2) * (U128_BYTES // U32_BYTES)
+K_PAGE_WORDS = K_SLICE_DATA_WORDS + K_SLICE_PADDING_U32
+V_COLS_U32 = HEAD_DIM // 2
+V_PADDING_U32 = 1
+V_LOGICAL_ROW_STRIDE_U32 = V_COLS_U32
+V_ROW_GROUPS = BLOCK_COLS // 4
+V_SLICE_ROW_GROUPS = K_SLICE_ROWS // 4
+V_TILE_HALF_PADDING_U2 = V_ROW_GROUPS * V_PADDING_U32
+V_HALF_PADDING_U2 = V_SLICE_ROW_GROUPS * V_PADDING_U32
+V_TILE_HALF_U2 = V_ROW_GROUPS * V_LOGICAL_ROW_STRIDE_U32 + V_TILE_HALF_PADDING_U2
+V_HALF_U2 = V_SLICE_ROW_GROUPS * V_LOGICAL_ROW_STRIDE_U32 + V_HALF_PADDING_U2
+V_SHM_U2 = 2 * V_HALF_U2
+SHM_V_WORDS = V_SHM_U2 * 2
+V_TILE_SHM_U2 = 2 * V_TILE_HALF_U2
+SHM_V_TILE_WORDS = V_TILE_SHM_U2 * 2
+SHM_V_OFFSET_WORDS = K_SLICES * K_PAGE_WORDS
+SHM_QV_WORDS = max(SHM_Q_STAGE_WORDS, SHM_V_TILE_WORDS)
+SHM_KV_WORDS = SHM_V_OFFSET_WORDS + SHM_QV_WORDS
+SHM_O_WORDS = BLOCK_ROWS * HEAD_DIM // 2
+SHM_O_VECS = BLOCK_ROWS * HEAD_DIM // VEC_SIZE
+SHM_WORK_WORDS = max(SHM_KV_WORDS, SHM_O_WORDS)
 SHM_Q_VECS = BLOCK_ROWS * HEAD_DIM // VEC_SIZE
 SHM_K_VECS = BLOCK_COLS * HEAD_DIM // VEC_SIZE
+V_LOAD_GLOBAL = BLOCK_COLS * HEAD_DIM // (VEC_SIZE * THREADS)
+V_ROWPAIR_GROUP_STRIDE = THREADS // V_COLS_U32
+V_ROWPAIR_GROUPS_PER_WARP = WARP_SIZE // V_COLS_U32
 
 WARP_ROWS = 32
 HALF_WARP_ROWS = 16
 SCORE_TILE_COLS = 16
+QK_TILE_DWORDS = SCORE_TILE_COLS // 2
+QK_ROW_DATA_WORDS = HEAD_DIM // 2
+QK_ROW_PADDING_WORDS = U128_BYTES // U32_BYTES
+QK_ROW_STRIDE_WORDS = QK_ROW_DATA_WORDS + QK_ROW_PADDING_WORDS
+QK_TILE_ROW_STRIDE_WORDS = WARP_ROWS * QK_ROW_STRIDE_WORDS
 Q_BATCHES = HEAD_DIM // SCORE_TILE_COLS
 K_BATCHES = BLOCK_COLS // WARP_ROWS
 O_BATCHES = HEAD_DIM // WARP_ROWS
+QK_MFMAS_PER_SLICE = Q_BATCHES * 2
+QK_MAJOR_MFMAS_PER_SLICE = (QK_MFMAS_PER_SLICE * 3) // 4
+QK_MINOR_MFMAS_PER_SLICE = QK_MFMAS_PER_SLICE - QK_MAJOR_MFMAS_PER_SLICE
+QK_MAJOR_K_BATCHES = (K_BATCHES * 3) // 4
+QK_TOTAL_MFMAS = K_BATCHES * Q_BATCHES * 2
+QK_MAJOR_MFMAS = (QK_TOTAL_MFMAS * 3) // 4
+QK_MINOR_MFMAS = QK_TOTAL_MFMAS - QK_MAJOR_MFMAS
+GEMM_O_MFMAS = O_BATCHES * K_BATCHES * 4
 NEG_INF = -1.0e30
 SCALE_LOG2 = math.log2(math.e) / math.sqrt(HEAD_DIM)
 
-
-def _validate_qk_shape(q: torch.Tensor, k: torch.Tensor) -> None:
-    if q.ndim != 4 or k.ndim != 4:
-        raise ValueError(
-            "q and k must be rank-4 tensors shaped [batch, heads, seq, dim] "
-            f"(got q.ndim={q.ndim}, k.ndim={k.ndim})"
-        )
-    if q.shape != k.shape:
-        raise ValueError(f"q and k must have identical shapes (got {q.shape}, {k.shape})")
-    if q.shape[-1] != HEAD_DIM:
-        raise ValueError(
-            f"BF16 flash attention debug currently requires head_dim={HEAD_DIM} "
-            f"(got {q.shape[-1]})"
-        )
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
-        raise TypeError(f"q and k must be torch.bfloat16 (got q={q.dtype}, k={k.dtype})")
-    if q.device.type != "cuda" or k.device.type != "cuda":
-        raise ValueError(f"q and k must be CUDA tensors (got q={q.device}, k={k.device})")
-    if q.device != k.device:
-        raise ValueError(f"q and k must be on the same device (got {q.device}, {k.device})")
-    if not q.is_contiguous() or not k.is_contiguous():
-        raise ValueError("q and k must be contiguous")
+SCHED_MASK_MFMA = 0x8
+SCHED_MASK_BUFFER_LOAD = 0x20
+SCHED_MASK_DS_READ = 0x100
+SCHED_MASK_DS_WRITE = 0x200
+SCHED_MASK_TRANS = 0x400
+SCHED_MASK_VALU = 0x1
+SCHED_INST_ALU_LIGHT = 2
+SCHED_INST_ALU_MEDIUM = 4
+SCHED_INST_TRANS_HEAVY = 1
 
 
-def flash_attn_validate_shape(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-) -> None:
-    _validate_qk_shape(q, k)
-    if v.ndim != 4:
-        raise ValueError(
-            "v must be a rank-4 tensor shaped [batch, heads, seq, dim] "
-            f"(got v.ndim={v.ndim})"
-        )
-    if v.shape != q.shape:
-        raise ValueError(f"v must have shape {q.shape} (got {v.shape})")
-    if v.dtype != torch.bfloat16:
-        raise TypeError(f"v must be torch.bfloat16 (got {v.dtype})")
-    if v.device != q.device:
-        raise ValueError(f"v must be on {q.device} (got {v.device})")
-    if not v.is_contiguous():
-        raise ValueError("v must be contiguous")
+def _mfma_per_issue(inst_mfma: int, inst_issue: int) -> int:
+    ratio = inst_mfma // inst_issue
+    if ratio > 12:
+        return 4
+    if ratio > 6:
+        return 2
+    return 1
+
+
+QK_MAJOR_MFMA_PER_ISSUE = _mfma_per_issue(QK_MAJOR_MFMAS_PER_SLICE, SCHED_INST_ALU_LIGHT)
+QK_MINOR_MFMA_PER_ISSUE = _mfma_per_issue(QK_MINOR_MFMAS_PER_SLICE, SCHED_INST_ALU_LIGHT)
+GEMM_O_MFMA_PER_ISSUE = _mfma_per_issue(
+    GEMM_O_MFMAS,
+    SCHED_INST_ALU_MEDIUM + SCHED_INST_TRANS_HEAVY,
+)
 
 
 def _validate_packed_flash_attn_inputs(
@@ -99,6 +129,11 @@ def _validate_packed_flash_attn_inputs(
         raise ValueError(f"k and v must have the same number of KV heads (got {k.shape[1]}, {v.shape[1]})")
     if q.shape[1] == 0 or k.shape[1] == 0:
         raise ValueError("q_heads and kv_heads must be nonzero")
+    if q.shape[1] != Q_HEADS or k.shape[1] != KV_HEADS:
+        raise ValueError(
+            f"BF16 flash attention currently requires q_heads={Q_HEADS}, kv_heads={KV_HEADS} "
+            f"(got q_heads={q.shape[1]}, kv_heads={k.shape[1]})"
+        )
     if q.shape[1] % k.shape[1] != 0:
         raise ValueError(f"q_heads must be divisible by kv_heads (got {q.shape[1]} and {k.shape[1]})")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
@@ -139,1675 +174,1739 @@ def _validate_packed_flash_attn_inputs(
 
 
 @avelang.jit
-def _tiled_layout_clear_qk_tiles(
-    q_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    k_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    query_row: al.u32,
-    tid_u32: al.u32,
-):
-    zero_bf16 = al.convert(0.0, al.bf16)
-    for dim in al.range(HEAD_DIM):
-        if query_row < BLOCK_ROWS:
-            q_tile[query_row, dim] = zero_bf16
-        if tid_u32 < BLOCK_COLS:
-            k_tile[tid_u32, dim] = zero_bf16
+def _hot_loop_scheduler_qk_major():
+    for _ in al.range(SCHED_INST_ALU_LIGHT):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, QK_MAJOR_MFMA_PER_ISSUE, 0)
+    al.amdgpu.sched_barrier(0)
 
 
 @avelang.jit
-def _tiled_layout_clear_k_tile(
-    k_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    tid_u32: al.u32,
-):
-    zero_bf16 = al.convert(0.0, al.bf16)
-    if tid_u32 < BLOCK_COLS:
-        for dim in al.range(HEAD_DIM):
-            k_tile[tid_u32, dim] = zero_bf16
+def _hot_loop_scheduler_qk_minor():
+    for _ in al.range(SCHED_INST_ALU_LIGHT):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, QK_MINOR_MFMA_PER_ISSUE, 0)
+    al.amdgpu.sched_barrier(0)
 
 
 @avelang.jit
-def _tiled_layout_fetch_global_q(
-    ret: al.Tensor((HEAD_DIM,), al.bf16),
-    q_rsrc: al.Tensor((1, 4), al.i32),
-    query_row: al.u32,
-):
-    zero_i32 = al.convert(0, al.i32)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    for dim_vec in al.range(HEAD_DIM // VEC_SIZE):
-        q_base = query_row * head_dim_u32
-        q_offset = al.convert(
-            (q_base + al.convert(dim_vec * VEC_SIZE, al.u32)) * bf16_bytes_u32,
-            al.i32,
-        )
-        q_data = al.amdgpu.raw_buffer_load_x4(q_rsrc[0], zero_i32, q_offset, 0)
-        q_frag = al.view(q_data, al.Tensor((2, 4, 1), al.bf16))
-        for subfrag in al.range(2):
-            for elem in al.range(4):
-                ret[dim_vec * VEC_SIZE + subfrag * 4 + elem] = q_frag[subfrag, elem, 0]
+def _hot_loop_scheduler_gemm_o():
+    for _ in al.range(SCHED_INST_ALU_MEDIUM):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, GEMM_O_MFMA_PER_ISSUE, 0)
+    for _ in al.range(SCHED_INST_TRANS_HEAVY):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_TRANS, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, GEMM_O_MFMA_PER_ISSUE, 0)
+    al.amdgpu.sched_barrier(0)
 
 
 @avelang.jit
-def _tiled_layout_fetch_global_k(
-    ret: al.Tensor((HEAD_DIM,), al.bf16),
-    k_rsrc: al.Tensor((1, 4), al.i32),
-    key_row: al.u32,
-):
-    zero_i32 = al.convert(0, al.i32)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    for dim_vec in al.range(HEAD_DIM // VEC_SIZE):
-        k_base = key_row * head_dim_u32
-        k_offset = al.convert(
-            (k_base + al.convert(dim_vec * VEC_SIZE, al.u32)) * bf16_bytes_u32,
-            al.i32,
-        )
-        k_data = al.amdgpu.raw_buffer_load_x4(k_rsrc[0], zero_i32, k_offset, 0)
-        k_frag = al.view(k_data, al.Tensor((2, 4, 1), al.bf16))
-        for subfrag in al.range(2):
-            for elem in al.range(4):
-                ret[dim_vec * VEC_SIZE + subfrag * 4 + elem] = k_frag[subfrag, elem, 0]
-
-
-@avelang.jit
-def _tiled_layout_store_shm_q(
-    q_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    loaded_q: al.Tensor((HEAD_DIM,), al.bf16),
-    query_row: al.u32,
-):
-    for dim in al.range(HEAD_DIM):
-        q_tile[query_row, dim] = loaded_q[dim]
-
-
-@avelang.jit
-def _tiled_layout_store_shm_k(
-    k_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    loaded_k: al.Tensor((HEAD_DIM,), al.bf16),
-    key_row: al.u32,
-):
-    for dim in al.range(HEAD_DIM):
-        k_tile[key_row, dim] = loaded_k[dim]
-
-
-@avelang.jit
-def _tiled_layout_store_debug_rows(
-    debug_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    tid_u32: al.u32,
-):
-    idx = tid_u32
-    vecs_per_row = HEAD_DIM // VEC_SIZE
-    for _ in al.range(SHM_Q_VECS // THREADS):
-        row = idx // vecs_per_row
-        col = idx % vecs_per_row
-        for elem in al.range(VEC_SIZE):
-            debug_tile[row, col * VEC_SIZE + elem] = tile[row, col * VEC_SIZE + elem]
-        idx += THREADS
-
-
-@avelang.jit
-def _tiled_layout_store_debug_cols(
-    debug_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    tid_u32: al.u32,
-):
-    idx = tid_u32
-    vecs_per_row = HEAD_DIM // VEC_SIZE
-    for _ in al.range(SHM_K_VECS // THREADS):
-        row = idx // vecs_per_row
-        col = idx % vecs_per_row
-        for elem in al.range(VEC_SIZE):
-            debug_tile[row, col * VEC_SIZE + elem] = tile[row, col * VEC_SIZE + elem]
-        idx += THREADS
-
-
-@avelang.jit
-def _tiled_layout_fetch_reg_q(
-    ret: al.Tensor((4,), al.bf16),
-    q_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    query_row: al.u32,
-    pack_col: al.u32,
-):
-    for elem in al.range(4):
-        ret[elem] = q_tile[query_row, pack_col + elem]
-
-
-@avelang.jit
-def _tiled_layout_fetch_reg_k(
-    ret: al.Tensor((4,), al.bf16),
-    k_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    k_row: al.u32,
-    pack_col: al.u32,
-):
-    for elem in al.range(4):
-        ret[elem] = k_tile[k_row, pack_col + elem]
-
-
-@avelang.jit
-def _gemm_qk(
-    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
-    q_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    k_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    query_row: al.u32,
-    key_row_local: al.u32,
+def _load_q_reg_words_lds_strided(
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    q_words: al.Tensor((SHM_Q_STAGE_WORDS,), al.u32),
+    q_rsrc: al.Tensor((4,), al.u32),
+    query_row_local: al.u32,
+    global_query_row: al.u32,
+    row_stride_words: al.u32,
+    wid: al.u32,
+    lane_col: al.u32,
     lane_half: al.u32,
 ):
-    zero_f32 = al.convert(0.0, al.f32)
-    q_frag0 = al.make_local((4,), al.bf16)
-    q_frag1 = al.make_local((4,), al.bf16)
-    k_frag0 = al.make_local((4,), al.bf16)
-    k_frag1 = al.make_local((4,), al.bf16)
-
-    for k_batch in al.range(K_BATCHES):
-        for t in al.range(16):
-            score_acc[k_batch, t] = zero_f32
-
-    for k_batch in al.range(K_BATCHES):
-        for q_batch in al.range(Q_BATCHES):
-            q_batch_base = al.convert(q_batch * SCORE_TILE_COLS, al.u32)
-            k_batch_base = al.convert(k_batch * WARP_ROWS, al.u32)
-            for mfma_k in al.range(2):
-                pack_col = q_batch_base + al.convert(mfma_k * VEC_SIZE, al.u32) + lane_half * 4
-                k_row = k_batch_base + key_row_local
-                if mfma_k == 0:
-                    _tiled_layout_fetch_reg_q(q_frag0, q_tile, query_row, pack_col)
-                    _tiled_layout_fetch_reg_k(k_frag0, k_tile, k_row, pack_col)
-                else:
-                    _tiled_layout_fetch_reg_q(q_frag1, q_tile, query_row, pack_col)
-                    _tiled_layout_fetch_reg_k(k_frag1, k_tile, k_row, pack_col)
-            score_acc[k_batch] = al.amdgpu.mfma_f32_32x32x8_bf16(k_frag0, q_frag0, score_acc[k_batch])
-            score_acc[k_batch] = al.amdgpu.mfma_f32_32x32x8_bf16(k_frag1, q_frag1, score_acc[k_batch])
-
-
-@avelang.jit
-def _flash_attn_debug_qk_tile_kernel(
-    q_ptr: al.Pointer(al.bf16),
-    k_ptr: al.Pointer(al.bf16),
-    q_debug_ptr: al.Pointer(al.bf16),
-    k_debug_ptr: al.Pointer(al.bf16),
-    out_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-):
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-
-    q_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    q_debug_layout = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    k_debug_layout = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    out_layout = al.make_layout((BLOCK_ROWS, BLOCK_COLS), (BLOCK_COLS, 1))
-
-    q = al.make_tensor(q_ptr, al.bf16, q_layout)
-    k = al.make_tensor(k_ptr, al.bf16, q_layout)
-    q_debug = al.make_tensor(q_debug_ptr, al.bf16, q_debug_layout)
-    k_debug = al.make_tensor(k_debug_ptr, al.bf16, k_debug_layout)
-    out = al.make_tensor(out_ptr, al.f32, out_layout)
-
+    words_per_row = HEAD_DIM // 2
+    q_stage_rows = Q_STAGE_ROWS
+    warps_per_stage = NUM_WARPS // K_SLICES
     tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    perm_high = (lane_col >> al.convert(2, al.u32)) & al.convert(0x7, al.u32)
-    perm_rot = ((perm_high & al.convert(0x1, al.u32)) << al.convert(2, al.u32)) | (
-        perm_high >> al.convert(1, al.u32)
+    q_base = global_query_row - query_row_local
+    q_stage_id = wid // warps_per_stage
+    stage_wid = wid % warps_per_stage
+    stage_query_row = stage_wid * WARP_ROWS + lane_col
+    q_word_tile = al.view(
+        q_words,
+        al.u32,
+        al.make_layout(
+            (Q_STAGE_ROWS // WARP_ROWS, Q_BATCHES, WARP_ROWS, 2, 4),
+            (QK_TILE_ROW_STRIDE_WORDS, QK_TILE_DWORDS, QK_ROW_STRIDE_WORDS, 4, 1),
+        ),
     )
-    key_row_local = (lane_col & al.convert(0x3, al.u32)) | (perm_rot << al.convert(2, al.u32))
 
-    shm_words = al.make_shared((SHM_Q_WORDS + SHM_K_WORDS,), al.u32)
-    q_words = al.subview(shm_words, (0,), (SHM_Q_WORDS,), (1,))
-    k_words = al.subview(shm_words, (SHM_Q_WORDS,), (SHM_K_WORDS,), (1,))
-    layout_q = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    layout_k = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    q_tile = al.view(q_words, al.bf16, layout_q)
-    k_tile = al.view(k_words, al.bf16, layout_k)
-    loaded_q = al.make_local((HEAD_DIM,), al.bf16)
-    loaded_k = al.make_local((HEAD_DIM,), al.bf16)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    q_rsrc = al.amdgpu.make_rsrc(q, total_bytes)
-    k_rsrc = al.amdgpu.make_rsrc(k, total_bytes)
-    q_rsrc_buf = al.make_local((1, 4), al.i32)
-    k_rsrc_buf = al.make_local((1, 4), al.i32)
-    q_rsrc_buf[0] = q_rsrc
-    k_rsrc_buf[0] = k_rsrc
-
-    _tiled_layout_clear_qk_tiles(q_tile, k_tile, query_row, tid_u32)
-
-    if lane_col < warp_rows_u32:
-        _tiled_layout_fetch_global_q(loaded_q, q_rsrc_buf, query_row)
-        _tiled_layout_store_shm_q(q_tile, loaded_q, query_row)
-
-    if tid_u32 < block_cols_u32:
-        _tiled_layout_fetch_global_k(loaded_k, k_rsrc_buf, tid_u32)
-        _tiled_layout_store_shm_k(k_tile, loaded_k, tid_u32)
-
-    al.syncthreads()
-
-    _tiled_layout_store_debug_rows(q_debug, q_tile, tid_u32)
-    _tiled_layout_store_debug_cols(k_debug, k_tile, tid_u32)
-
-    al.syncthreads()
-
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    _gemm_qk(score_acc, q_tile, k_tile, query_row, key_row_local, lane_half)
-
-    if query_row < BLOCK_ROWS:
-        for k_batch in al.range(K_BATCHES):
-            col_base = al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * HALF_WARP_ROWS
-            for t in al.range(16):
-                out[query_row, col_base + t] = score_acc[k_batch, t]
+    for q_stage in al.range(K_SLICES):
+        stage_base = q_stage * q_stage_rows
+        for word_batch in al.range(Q_STAGE_DATA_WORDS // THREADS):
+            row = tid // words_per_row
+            dest_col_word = tid % words_per_row
+            tile_col = dest_col_word // QK_TILE_DWORDS
+            dword_in_tile = dest_col_word - tile_col * QK_TILE_DWORDS
+            col_word = (
+                tile_col * QK_TILE_DWORDS
+                + (dword_in_tile & 0x1)
+                + ((dword_in_tile >> 1) & 0x1)
+                * (QK_TILE_DWORDS // 2)
+                + (dword_in_tile >> 2) * 2
+            )
+            global_vword = row * row_stride_words + col_word
+            global_sword = (
+                q_base + stage_base + word_batch * (THREADS // (HEAD_DIM // 2))
+            ) * row_stride_words
+            global_voffset = global_vword * U32_BYTES
+            global_soffset = global_sword * U32_BYTES
+            lds_row = wid + (word_batch * NUM_WARPS)
+            lds_word = lds_row * QK_ROW_STRIDE_WORDS
+            lds_offset = lds_word * U32_BYTES
+            al.amdgpu.raw_buffer_load_x1_lds(
+                q_rsrc,
+                q_words,
+                U32_BYTES,
+                global_voffset,
+                global_soffset,
+                lds_offset,
+                0,
+            )
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        if q_stage == q_stage_id:
+            for q_batch in al.range(Q_BATCHES):
+                packed = q_word_tile[stage_wid, q_batch, lane_col, lane_half]
+                q_regs[q_batch, 0, 0] = packed[0]
+                q_regs[q_batch, 0, 1] = packed[1]
+                q_regs[q_batch, 1, 0] = packed[2]
+                q_regs[q_batch, 1, 1] = packed[3]
+        al.syncthreads()
 
 
 @avelang.jit
-def _flash_attn_debug_apply_causal_mask_kernel(
-    scores_ptr: al.Pointer(al.f32),
-    out_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
+def _fetch_k_reg_words_page(
+    k_regs: al.Tensor((K_BATCHES, Q_BATCHES, 2, 2), al.u32),
+    k_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    k_batch: al.u32,
+):
+    k_word_layout = al.make_layout(
+        (K_BATCHES, Q_BATCHES, WARP_ROWS, 2, 4),
+        (K_PAGE_WORDS, QK_TILE_DWORDS, QK_ROW_STRIDE_WORDS, 4, 1),
+    )
+    k_word_tile = al.view(k_words, al.u32, k_word_layout)
+    for q_batch in al.range(Q_BATCHES):
+        packed = k_word_tile[k_batch, q_batch, key_row_local, lane_half]
+        k_regs[k_batch, q_batch, 0, 0] = packed[0]
+        k_regs[k_batch, q_batch, 0, 1] = packed[1]
+        k_regs[k_batch, q_batch, 1, 0] = packed[2]
+        k_regs[k_batch, q_batch, 1, 1] = packed[3]
+
+
+@avelang.jit
+def _fetch_k_reg_words_page_small(
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    k_batch: al.u32,
+):
+    k_word_layout = al.make_layout(
+        (K_BATCHES, Q_BATCHES, WARP_ROWS, 2, 4),
+        (K_PAGE_WORDS, QK_TILE_DWORDS, QK_ROW_STRIDE_WORDS, 4, 1),
+    )
+    k_word_tile = al.view(k_words, al.u32, k_word_layout)
+    for q_batch in al.range(Q_BATCHES):
+        packed = k_word_tile[k_batch, q_batch, key_row_local, lane_half]
+        k_regs[q_batch, 0, 0] = packed[0]
+        k_regs[q_batch, 0, 1] = packed[1]
+        k_regs[q_batch, 1, 0] = packed[2]
+        k_regs[q_batch, 1, 1] = packed[3]
+
+
+@avelang.jit
+def _gemm_qk_word_regs_batch0_small(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
 ):
     zero_f32 = al.convert(0.0, al.f32)
-    neg_inf = al.convert(NEG_INF, al.f32)
+    for t in al.range(16):
+        score_acc[0, t] = zero_f32
 
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    half_warp_rows_u32 = al.convert(HALF_WARP_ROWS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[0])
+    _hot_loop_scheduler_qk_major()
 
-    layout = al.make_layout((BLOCK_ROWS, BLOCK_COLS), (BLOCK_COLS, 1))
-    scores = al.make_tensor(scores_ptr, al.f32, layout)
-    out = al.make_tensor(out_ptr, al.f32, layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    for k_batch in al.range(K_BATCHES):
-        col_block_base = al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * half_warp_rows_u32
-        for t in al.range(16):
-            masked_score = zero_f32
-            global_col = col_block_base + t
-            if query_row < seq_len:
-                masked_score = neg_inf
-                if global_col < seq_len:
-                    if query_row >= global_col:
-                        masked_score = scores[query_row, global_col]
-            out[query_row, global_col] = masked_score
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE, QK_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[0])
+    _hot_loop_scheduler_qk_minor()
 
 
 @avelang.jit
-def _compute_row_max(score_acc: al.Tensor((K_BATCHES, 16), al.f32)) -> al.f32:
+def _gemm_qk_word_regs_batch1_small(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+):
+    zero_f32 = al.convert(0.0, al.f32)
+    for t in al.range(16):
+        score_acc[1, t] = zero_f32
+
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[1])
+    _hot_loop_scheduler_qk_major()
+
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE, QK_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[1])
+    _hot_loop_scheduler_qk_minor()
+
+
+@avelang.jit
+def _gemm_qk_word_regs_batch_major(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((K_BATCHES, Q_BATCHES, 2, 2), al.u32),
+    k_batch: al.u32,
+):
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[k_batch, q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[k_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(
+            k_frag,
+            q_frag,
+            score_acc[k_batch],
+        )
+
+
+@avelang.jit
+def _gemm_qk_word_regs_batch_minor(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((K_BATCHES, Q_BATCHES, 2, 2), al.u32),
+    k_batch: al.u32,
+):
+    for mfma_idx in al.range(QK_MAJOR_MFMAS_PER_SLICE, QK_MFMAS_PER_SLICE):
+        q_batch = mfma_idx // 2
+        mfma_k = mfma_idx - q_batch * 2
+        q_frag = al.view(q_regs[q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        k_frag = al.view(k_regs[k_batch, q_batch, mfma_k], al.Tensor((4,), al.bf16))
+        score_acc[k_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(
+            k_frag,
+            q_frag,
+            score_acc[k_batch],
+        )
+
+
+@avelang.jit
+def _gemm_qk_word_regs_batch(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((K_BATCHES, Q_BATCHES, 2, 2), al.u32),
+    k_batch: al.u32,
+):
+    zero_f32 = al.convert(0.0, al.f32)
+    for t in al.range(16):
+        score_acc[k_batch, t] = zero_f32
+
+    _gemm_qk_word_regs_batch_major(score_acc, q_regs, k_regs, k_batch)
+    _hot_loop_scheduler_qk_major()
+    _gemm_qk_word_regs_batch_minor(score_acc, q_regs, k_regs, k_batch)
+    _hot_loop_scheduler_qk_minor()
+
+
+@avelang.jit
+def _softmax_xor_permute_f32(value: al.f32, wtid: al.u32) -> al.f32:
+    index = (wtid ^ 32) * 4
+    bits = al.amdgpu.ds_permute_b32(index, al.bitcast(value, al.u32))
+    return al.bitcast(bits, al.f32)
+
+
+@avelang.jit
+def _compute_row_max_batch(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    k_batch: al.u32,
+) -> al.f32:
     neg_inf = al.convert(NEG_INF, al.f32)
     local_max = neg_inf
-    for k_batch in al.range(K_BATCHES):
-        for t in al.range(16):
-            if score_acc[k_batch, t] > local_max:
-                local_max = score_acc[k_batch, t]
+    for t in al.range(16):
+        score = score_acc[k_batch, t]
+        local_max = al.fmax(local_max, score)
     partner_max = al.shuffle_xor(local_max, 32, 64)
-    block_max = local_max
-    if partner_max > block_max:
-        block_max = partner_max
-    return block_max
+    return al.fmax(local_max, partner_max)
 
 
 @avelang.jit
-def _compute_ptilde(
+def _compute_ptilde_and_row_sum_batch(
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    k_batch: al.u32,
     row_max: al.f32,
     scale_log2: al.f32,
- ) -> al.f32:
-    zero_f32 = al.convert(0.0, al.f32)
-    local_sum = zero_f32
+) -> al.f32:
     row_max_scaled = row_max * scale_log2
-    for k_batch in al.range(K_BATCHES):
-        for t in al.range(16):
-            score_acc[k_batch, t] = al.exp2(score_acc[k_batch, t] * scale_log2 - row_max_scaled)
-            local_sum = local_sum + score_acc[k_batch, t]
+    local_sum = al.convert(0.0, al.f32)
+    for t in al.range(16):
+        p = al.exp2(al.fma(score_acc[k_batch, t], scale_log2, -row_max_scaled))
+        score_acc[k_batch, t] = p
+        local_sum = local_sum + p
     return local_sum
 
 
 @avelang.jit
-def _compute_row_sum(local_sum: al.f32) -> al.f32:
-    return local_sum + al.shuffle_xor(local_sum, 32, 64)
-
-
-@avelang.jit
-def _multiply_alpha_o(alpha: al.f32, out_acc: al.Tensor((HEAD_DIM,), al.f32)):
-    for d in al.range(HEAD_DIM):
-        out_acc[d] = out_acc[d] * alpha
-
-
-@avelang.jit
-def _apply_causal_mask(
+def _compute_row_max_batch0(
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
-    global_query_row: al.u32,
-    key_base: al.u32,
-    lane_half: al.u32,
-    seq_len: al.u32,
-):
-    neg_inf = al.convert(NEG_INF, al.f32)
-    half_warp_rows_u32 = al.convert(HALF_WARP_ROWS, al.u32)
-    for k_batch in al.range(K_BATCHES):
-        col_block_base = key_base + al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * half_warp_rows_u32
-        for t in al.range(16):
-            global_col = col_block_base + t
-            if global_query_row >= seq_len or global_col >= seq_len or global_query_row < global_col:
-                score_acc[k_batch, t] = neg_inf
-
-
-@avelang.jit
-def _compute_local_row_max(score_acc: al.Tensor((K_BATCHES, 16), al.f32)) -> al.f32:
+    wtid: al.u32,
+) -> al.f32:
     neg_inf = al.convert(NEG_INF, al.f32)
     local_max = neg_inf
-    for k_batch in al.range(K_BATCHES):
-        for t in al.range(16):
-            if score_acc[k_batch, t] > local_max:
-                local_max = score_acc[k_batch, t]
-    return local_max
+    for t in al.range(16):
+        score = score_acc[0, t]
+        local_max = al.fmax(local_max, score)
+    partner_max = _softmax_xor_permute_f32(local_max, wtid)
+    return al.fmax(local_max, partner_max)
 
 
 @avelang.jit
-def _gemm_o(
-    out_acc: al.Tensor((HEAD_DIM,), al.f32),
+def _compute_row_max_batch1(
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
-    v_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
+    wtid: al.u32,
+) -> al.f32:
+    neg_inf = al.convert(NEG_INF, al.f32)
+    local_max = neg_inf
+    for t in al.range(16):
+        score = score_acc[1, t]
+        local_max = al.fmax(local_max, score)
+    partner_max = _softmax_xor_permute_f32(local_max, wtid)
+    return al.fmax(local_max, partner_max)
+
+
+@avelang.jit
+def _compute_ptilde_and_row_sum_batch0(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    row_max: al.f32,
+    scale_log2: al.f32,
+) -> al.f32:
+    row_max_scaled = row_max * scale_log2
+    local_sum = al.convert(0.0, al.f32)
+    for t in al.range(16):
+        p = al.exp2(al.fma(score_acc[0, t], scale_log2, -row_max_scaled))
+        score_acc[0, t] = p
+        local_sum = local_sum + p
+    return local_sum
+
+
+@avelang.jit
+def _compute_ptilde_and_row_sum_batch1(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    row_max: al.f32,
+    scale_log2: al.f32,
+) -> al.f32:
+    row_max_scaled = row_max * scale_log2
+    local_sum = al.convert(0.0, al.f32)
+    for t in al.range(16):
+        p = al.exp2(al.fma(score_acc[1, t], scale_log2, -row_max_scaled))
+        score_acc[1, t] = p
+        local_sum = local_sum + p
+    return local_sum
+
+
+@avelang.jit
+def _multiply_alpha_o_mfma(alpha: al.f32, out_acc: al.Tensor((O_BATCHES, 16), al.f32)):
+    zero_f32 = al.convert(0.0, al.f32)
+    for o_batch in al.range(O_BATCHES):
+        for t in al.range(16):
+            out_acc[o_batch, t] = al.fma(out_acc[o_batch, t], alpha, zero_f32)
+
+
+@avelang.jit
+def _apply_lower_causal_mask_batch0_at_key_base(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    global_query_row: al.u32,
+    actual_key_base: al.u32,
     lane_half: al.u32,
-    key_base: al.u32,
-    seq_len: al.u32,
 ):
-    half_warp_rows_u32 = al.convert(HALF_WARP_ROWS, al.u32)
-    for k_batch in al.range(K_BATCHES):
-        local_col_base = al.convert(k_batch * WARP_ROWS, al.u32)
-        for t in al.range(16):
-            p0 = score_acc[k_batch, t]
-            # Both halves of the wave must execute the shuffle so lane_half==0
-            # can legally read the partner half.
-            p1 = al.shuffle_xor(score_acc[k_batch, t], 32, 64)
-            row0 = local_col_base + t
-            row1 = local_col_base + half_warp_rows_u32 + t
-            if lane_half == 0:
-                if key_base + row0 < seq_len:
-                    for d in al.range(HEAD_DIM):
-                        out_acc[d] = out_acc[d] + p0 * al.convert(v_tile[row0, d], al.f32)
-                if key_base + row1 < seq_len:
-                    for d in al.range(HEAD_DIM):
-                        out_acc[d] = out_acc[d] + p1 * al.convert(v_tile[row1, d], al.f32)
+    neg_inf = al.convert(NEG_INF, al.f32)
+    col_block_base = actual_key_base + lane_half * 4
+    rel = global_query_row - col_block_base
+    score_acc[0, 0] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 0], 0)
+    score_acc[0, 1] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 1], 1)
+    score_acc[0, 2] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 2], 2)
+    score_acc[0, 3] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 3], 3)
+    score_acc[0, 4] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 4], 8)
+    score_acc[0, 5] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 5], 9)
+    score_acc[0, 6] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 6], 10)
+    score_acc[0, 7] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 7], 11)
+    score_acc[0, 8] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 8], 16)
+    score_acc[0, 9] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 9], 17)
+    score_acc[0, 10] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 10], 18)
+    score_acc[0, 11] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 11], 19)
+    score_acc[0, 12] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 12], 24)
+    score_acc[0, 13] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 13], 25)
+    score_acc[0, 14] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 14], 26)
+    score_acc[0, 15] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[0, 15], 27)
 
 
 @avelang.jit
-def _gemm_o_mfma(
-    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+def _apply_lower_causal_mask_batch1_at_key_base(
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
-    v_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    out_row_local: al.u32,
+    global_query_row: al.u32,
+    actual_key_base: al.u32,
     lane_half: al.u32,
+):
+    neg_inf = al.convert(NEG_INF, al.f32)
+    col_block_base = actual_key_base + lane_half * 4
+    rel = global_query_row - col_block_base
+    score_acc[1, 0] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 0], 0)
+    score_acc[1, 1] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 1], 1)
+    score_acc[1, 2] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 2], 2)
+    score_acc[1, 3] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 3], 3)
+    score_acc[1, 4] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 4], 8)
+    score_acc[1, 5] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 5], 9)
+    score_acc[1, 6] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 6], 10)
+    score_acc[1, 7] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 7], 11)
+    score_acc[1, 8] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 8], 16)
+    score_acc[1, 9] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 9], 17)
+    score_acc[1, 10] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 10], 18)
+    score_acc[1, 11] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 11], 19)
+    score_acc[1, 12] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 12], 24)
+    score_acc[1, 13] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 13], 25)
+    score_acc[1, 14] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 14], 26)
+    score_acc[1, 15] = al.amdgpu.mask_lower_bound_f32(rel, neg_inf, score_acc[1, 15], 27)
+
+
+@avelang.jit
+def _fetch_v_global_slice_packed_strided(
+    g_v: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    wid: al.u32,
+    wtid: al.u32,
+    key_base: al.u32,
+    row_stride_words: al.u32,
+    v_slice: al.u32,
+):
+    col_u32 = wtid % V_COLS_U32
+    rowpair_group = (
+        wid * V_ROWPAIR_GROUPS_PER_WARP
+        + wtid // V_COLS_U32
+    )
+    row_group = v_slice * K_SLICE_ROWS + rowpair_group * 4
+    row0 = row_group
+    row1 = row_group + 1
+    row2 = row_group + 2
+    row3 = row_group + 3
+    offset0 = ((key_base + row0) * row_stride_words + col_u32) * U32_BYTES
+    offset1 = ((key_base + row1) * row_stride_words + col_u32) * U32_BYTES
+    offset2 = ((key_base + row2) * row_stride_words + col_u32) * U32_BYTES
+    offset3 = ((key_base + row3) * row_stride_words + col_u32) * U32_BYTES
+    g_v[0] = al.bitcast(al.amdgpu.raw_buffer_load_x1(v_rsrc, offset0, 0, 0), al.u32)
+    g_v[1] = al.bitcast(al.amdgpu.raw_buffer_load_x1(v_rsrc, offset1, 0, 0), al.u32)
+    g_v[2] = al.bitcast(al.amdgpu.raw_buffer_load_x1(v_rsrc, offset2, 0, 0), al.u32)
+    g_v[3] = al.bitcast(al.amdgpu.raw_buffer_load_x1(v_rsrc, offset3, 0, 0), al.u32)
+
+
+@avelang.jit
+def _store_v_global_slice_packed(
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    g_v: al.Tensor((4,), al.u32),
+    wid: al.u32,
+    wtid: al.u32,
+    v_slice: al.u32,
+):
+    work_u2 = al.view(
+        work_words,
+        al.u32,
+        al.make_layout(
+            (SHM_WORK_WORDS // 2, 2),
+            (2, 1),
+        ),
+    )
+    col_u32 = wtid % V_COLS_U32
+    rowpair_group = wid * V_ROWPAIR_GROUPS_PER_WARP + wtid // V_COLS_U32
+    even0 = al.amdgpu.perm(g_v[1], g_v[0], 0x05040100)
+    even1 = al.amdgpu.perm(g_v[3], g_v[2], 0x05040100)
+    odd0 = al.amdgpu.perm(g_v[1], g_v[0], 0x07060302)
+    odd1 = al.amdgpu.perm(g_v[3], g_v[2], 0x07060302)
+    shm_idx = rowpair_group * V_LOGICAL_ROW_STRIDE_U32 + col_u32
+    addr_adjust = al.convert(wid == 0, al.u32)
+    even_base = SHM_V_OFFSET_WORDS // 2 + addr_adjust
+    odd_base = SHM_V_OFFSET_WORDS // 2 + V_HALF_U2 + addr_adjust
+    local_idx = shm_idx - addr_adjust
+    even_idx = even_base + local_idx
+    odd_idx = odd_base + local_idx
+    work_u2[even_idx, 0] = even0
+    work_u2[even_idx, 1] = even1
+    work_u2[odd_idx, 0] = odd0
+    work_u2[odd_idx, 1] = odd1
+
+
+@avelang.jit
+def _fetch_v_reg_words_batch_compact(
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    out_row_local: al.u32,
+    wtid: al.u32,
+    k_batch: al.u32,
+):
+    v_pair = al.view(
+        v_words,
+        al.u32,
+        al.make_layout(
+            (2, O_BATCHES, WARP_ROWS // 2, 2, 2, 2, 2),
+            (
+                (SCORE_TILE_COLS // 4) * V_LOGICAL_ROW_STRIDE_U32 * 2,
+                (WARP_ROWS // 2) * 2,
+                2,
+                V_LOGICAL_ROW_STRIDE_U32 * 2,
+                V_HALF_U2 * 2,
+                (SCORE_TILE_COLS // 4 // 2) * V_LOGICAL_ROW_STRIDE_U32 * 2,
+                1,
+            ),
+        ),
+    )
+    lane_half = wtid // WARP_ROWS
+    lane_pair = (wtid % WARP_ROWS) // 2
+    lane_parity = wtid & 1
+
+    for o_batch in al.range(O_BATCHES):
+        for v_chunk in al.range(2):
+            packed = v_pair[v_chunk, o_batch, lane_pair, lane_half, lane_parity]
+            v_regs[o_batch, v_chunk * 2, 0] = packed[0, 0]
+            v_regs[o_batch, v_chunk * 2, 1] = packed[0, 1]
+            v_regs[o_batch, v_chunk * 2 + 1, 0] = packed[1, 0]
+            v_regs[o_batch, v_chunk * 2 + 1, 1] = packed[1, 1]
+
+
+@avelang.jit
+def _pack_gemm_o_score_mfma_batch(
+    packed_score: al.Tensor((16,), al.f32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    k_batch: al.u32,
+    lane_half: al.u32,
+):
+    for elem in al.range(4):
+        lo0 = score_acc[k_batch, elem]
+        lo1 = score_acc[k_batch, 4 + elem]
+        hi0 = score_acc[k_batch, 8 + elem]
+        hi1 = score_acc[k_batch, 12 + elem]
+        partner_lo0 = al.shuffle_xor(lo0, 32, 64)
+        partner_lo1 = al.shuffle_xor(lo1, 32, 64)
+        partner_hi0 = al.shuffle_xor(hi0, 32, 64)
+        partner_hi1 = al.shuffle_xor(hi1, 32, 64)
+        if lane_half == 0:
+            packed_score[elem] = lo0
+            packed_score[4 + elem] = hi0
+            packed_score[8 + elem] = partner_lo0
+            packed_score[12 + elem] = partner_hi0
+        else:
+            packed_score[elem] = partner_lo1
+            packed_score[4 + elem] = partner_hi1
+            packed_score[8 + elem] = lo1
+            packed_score[12 + elem] = hi1
+
+
+@avelang.jit
+def _gemm_o_mfma_v_word_regs_batch_compact(
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    packed_score: al.Tensor((16,), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
 ):
     score_frag = al.make_local((4,), al.bf16)
-    v_frag = al.make_local((4,), al.bf16)
 
     for o_batch in al.range(O_BATCHES):
-        out_acc[o_batch] = al.full((16,), 0.0, al.f32)
-        out_col = al.convert(o_batch * WARP_ROWS, al.u32) + out_row_local
-        for k_batch in al.range(K_BATCHES):
-            for k_slice in al.range(4):
-                row_base = (
-                    al.convert(k_batch * WARP_ROWS, al.u32)
-                    + al.convert(k_slice * VEC_SIZE, al.u32)
-                    + lane_half * 4
-                )
-                for elem in al.range(4):
-                    score_frag[elem] = al.convert(score_acc[k_batch, k_slice * 4 + elem], al.bf16)
-                    v_frag[elem] = v_tile[row_base + elem, out_col]
-                out_acc[o_batch] = al.amdgpu.mfma_f32_32x32x8_bf16(v_frag, score_frag, out_acc[o_batch])
+        for k_slice in al.range(4):
+            v_frag = al.view(v_regs[o_batch, k_slice], al.Tensor((4,), al.bf16))
+            for elem in al.range(4):
+                score_frag[elem] = al.convert(packed_score[k_slice * 4 + elem], al.bf16)
+            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[o_batch])
+    _hot_loop_scheduler_gemm_o()
 
 
 @avelang.jit
-def _pack_gemm_o_score_mfma(
-    packed_score: al.Tensor((K_BATCHES, 16), al.f32),
-    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
-    lane_half: al.u32,
-):
-    for k_batch in al.range(K_BATCHES):
-        for elem in al.range(4):
-            lo0 = score_acc[k_batch, elem]
-            lo1 = score_acc[k_batch, 4 + elem]
-            hi0 = score_acc[k_batch, 8 + elem]
-            hi1 = score_acc[k_batch, 12 + elem]
-            partner_lo0 = al.shuffle_xor(lo0, 32, 64)
-            partner_lo1 = al.shuffle_xor(lo1, 32, 64)
-            partner_hi0 = al.shuffle_xor(hi0, 32, 64)
-            partner_hi1 = al.shuffle_xor(hi1, 32, 64)
-            if lane_half == 0:
-                packed_score[k_batch, elem] = lo0
-                packed_score[k_batch, 4 + elem] = hi0
-                packed_score[k_batch, 8 + elem] = partner_lo0
-                packed_score[k_batch, 12 + elem] = partner_hi0
-            else:
-                packed_score[k_batch, elem] = partner_lo1
-                packed_score[k_batch, 4 + elem] = partner_hi1
-                packed_score[k_batch, 8 + elem] = lo1
-                packed_score[k_batch, 12 + elem] = hi1
-
-
-@avelang.jit
-def _store_gemm_o_mfma(
-    out_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
+def _gemm_o_mfma_v_word_regs_batch0_direct(
     out_acc: al.Tensor((O_BATCHES, 16), al.f32),
-    query_row: al.u32,
-    lane_half: al.u32,
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
 ):
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    half_warp_rows_u32 = al.convert(HALF_WARP_ROWS, al.u32)
-    out_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    out = al.make_tensor(out_ptr, al.f32, out_layout)
-    dim_block = lane_half * half_warp_rows_u32
+    score_frag = al.make_local((4,), al.bf16)
+
     for o_batch in al.range(O_BATCHES):
-        dim_base = al.convert(o_batch * WARP_ROWS, al.u32) + dim_block
-        for t in al.range(16):
-            out[query_row, dim_base + t] = out_acc[o_batch, t]
+        for k_slice in al.range(4):
+            v_frag = al.view(v_regs[o_batch, k_slice], al.Tensor((4,), al.bf16))
+            for elem in al.range(4):
+                score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[o_batch])
+    _hot_loop_scheduler_gemm_o()
 
 
 @avelang.jit
-def _normalize_softmax_lse(
-    out_acc: al.Tensor((HEAD_DIM,), al.f32),
-    out_ptr: al.Pointer(al.bf16),
-    seq_len: al.u32,
+def _gemm_o_mfma_v_word_regs_batch1_direct(
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+):
+    score_frag = al.make_local((4,), al.bf16)
+
+    for o_batch in al.range(O_BATCHES):
+        for k_slice in al.range(4):
+            v_frag = al.view(v_regs[o_batch, k_slice], al.Tensor((4,), al.bf16))
+            for elem in al.range(4):
+                score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_frag, out_acc[o_batch])
+    _hot_loop_scheduler_gemm_o()
+
+
+@avelang.jit
+def _flash_attn_update_o_batch(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    k_batch: al.u32,
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch(score_acc, k_batch)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch(score_acc, k_batch, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    _pack_gemm_o_score_mfma_batch(score_acc_mfma, score_acc, k_batch, lane_half)
+    _gemm_o_mfma_v_word_regs_batch_compact(out_acc, score_acc_mfma, v_regs)
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_update_o_batch0(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch0(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch0(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_update_o_batch1(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch1(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch1(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_prepare_o_batch0(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch0(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch0(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_prepare_o_batch1(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch1(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch1(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_prepare_o_batch(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    score_acc_mfma: al.Tensor((16,), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    k_batch: al.u32,
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch(score_acc, k_batch)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch(score_acc, k_batch, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    _pack_gemm_o_score_mfma_batch(score_acc_mfma, score_acc, k_batch, lane_half)
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_compute_qk_page(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    tid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
     global_query_row: al.u32,
+    seq_len: al.u32,
+    actual_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    page: al.u32,
+):
+    _load_k_page_strided(
+        k_stage_words,
+        k_rsrc,
+        tid,
+        actual_key_base,
+        kv_row_stride_words,
+        page,
+    )
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    al.syncthreads()
+    _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
+    if page == 0:
+        _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
+    else:
+        _gemm_qk_word_regs_batch1_small(score_acc, q_regs, k_regs)
+    if actual_key_base >= first_causal_key_base:
+        if page == 0:
+            _apply_lower_causal_mask_batch0_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+        else:
+            _apply_lower_causal_mask_batch1_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+
+
+@avelang.jit
+def _flash_attn_compute_qk_page_loaded(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    actual_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    page: al.u32,
+):
+    _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
+    if page == 0:
+        _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
+    else:
+        _gemm_qk_word_regs_batch1_small(score_acc, q_regs, k_regs)
+    if actual_key_base >= first_causal_key_base:
+        if page == 0:
+            _apply_lower_causal_mask_batch0_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+        else:
+            _apply_lower_causal_mask_batch1_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg0(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        k_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    mi, l = _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    al.amdgpu.eager_materialize_i32(pair_idx)
+    al.syncthreads()
+    if next_even_slice <= max_k_slice:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            k_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.eager_materialize_i32(next_even_slice)
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        mi, l = _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+        al.amdgpu.eager_materialize_i32(odd_slice)
+        al.syncthreads()
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg1(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        k_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    mi, l = _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    al.amdgpu.eager_materialize_i32(pair_idx)
+    al.syncthreads()
+    if next_even_slice <= max_k_slice:
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            k_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.eager_materialize_i32(next_even_slice)
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        mi, l = _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+        al.amdgpu.eager_materialize_i32(odd_slice)
+        al.syncthreads()
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_packed_drain_epilogue(
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    max_k_slice: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    epilogue_uses_s1 = (max_k_slice & 1) != 0
+    if epilogue_uses_s1:
+        mi, l = _flash_attn_prepare_o_batch1(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    else:
+        mi, l = _flash_attn_prepare_o_batch0(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    if epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+    if not epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+        _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
+    return mi, l
+
+
+@avelang.jit
+def _store_gemm_o_mfma_normalized_packed_lds(
+    out_rsrc: al.Tensor((4,), al.u32),
+    o_words: al.Tensor((SHM_O_WORDS,), al.u32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    lane_col: al.u32,
     lane_half: al.u32,
     l: al.f32,
 ):
-    one_f32 = al.convert(1.0, al.f32)
-    if lane_half == 0:
-        head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-        out_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-        out = al.make_tensor(out_ptr, al.bf16, out_layout)
-        inv_l = one_f32 / l
-        for d in al.range(HEAD_DIM):
-            out[global_query_row, d] = al.convert(out_acc[d] * inv_l, al.bf16)
+    vecs_per_row = HEAD_DIM // VEC_SIZE
+    o_u2 = al.view(
+        o_words,
+        al.u32,
+        al.make_layout(
+            (NUM_WARPS, O_BATCHES * 4, WARP_ROWS, 2, 2),
+            (WARP_ROWS * (HEAD_DIM // 4) * 2, 4, (HEAD_DIM // 4) * 2, 2, 1),
+        ),
+    )
+    o_u4 = al.view(
+        o_words,
+        al.u32,
+        al.make_layout(
+            (SHM_O_VECS // THREADS, THREADS, 4),
+            (THREADS * 4, 4, 1),
+        ),
+    )
+    l_total = l + _softmax_xor_permute_f32(l, wtid)
+    inv_l = al.amdgpu.rcp(l_total)
 
-
-@avelang.jit
-def _flash_attn_debug_softmax_kernel(
-    scores_ptr: al.Pointer(al.f32),
-    out_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    one_f32 = al.convert(1.0, al.f32)
-    scale_log2 = al.convert(SCALE_LOG2, al.f32)
-
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    half_warp_rows_u32 = al.convert(HALF_WARP_ROWS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
-
-    layout = al.make_layout((BLOCK_ROWS, BLOCK_COLS), (BLOCK_COLS, 1))
-    scores = al.make_tensor(scores_ptr, al.f32, layout)
-    out = al.make_tensor(out_ptr, al.f32, layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-
-    valid_q = query_row < seq_len
-    for k_batch in al.range(K_BATCHES):
-        col_block_base = al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * half_warp_rows_u32
-        for t in al.range(16):
-            score_acc[k_batch, t] = zero_f32
-            if valid_q:
-                score_acc[k_batch, t] = scores[query_row, col_block_base + t]
-    block_max = zero_f32
-    row_sum = one_f32
-    if valid_q:
-        block_max = _compute_row_max(score_acc)
-        local_sum = _compute_ptilde(score_acc, block_max, scale_log2)
-        row_sum = _compute_row_sum(local_sum)
-    inv_row_sum = zero_f32
-    if valid_q:
-        inv_row_sum = one_f32 / row_sum
-
-    if query_row < block_rows_u32:
-        for k_batch in al.range(K_BATCHES):
-            col_base = al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * half_warp_rows_u32
-            for t in al.range(16):
-                if valid_q:
-                    out[query_row, col_base + t] = score_acc[k_batch, t] * inv_row_sum
-                else:
-                    out[query_row, col_base + t] = zero_f32
-
-
-@avelang.jit
-def _flash_attn_debug_gemm_o_kernel(
-    probs_ptr: al.Pointer(al.f32),
-    v_ptr: al.Pointer(al.bf16),
-    out_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    key_base = al.convert(0, al.u32)
-
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-    two_u32 = al.convert(2, al.u32)
-    one_u32 = al.convert(1, al.u32)
-    three_u32 = al.convert(0x3, al.u32)
-    seven_u32 = al.convert(0x7, al.u32)
-    one_mask_u32 = al.convert(0x1, al.u32)
-
-    probs_layout = al.make_layout((BLOCK_ROWS, BLOCK_COLS), (BLOCK_COLS, 1))
-    out_layout = al.make_layout((BLOCK_ROWS, head_dim_u32), (head_dim_u32, 1))
-    v_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    probs = al.make_tensor(probs_ptr, al.f32, probs_layout)
-    out = al.make_tensor(out_ptr, al.f32, out_layout)
-    v = al.make_tensor(v_ptr, al.bf16, v_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    perm_high = (lane_col >> two_u32) & seven_u32
-    perm_rot = ((perm_high & one_mask_u32) << two_u32) | (perm_high >> one_u32)
-    out_row_local = (lane_col & three_u32) | (perm_rot << two_u32)
-
-    shm_words = al.make_shared((SHM_K_WORDS,), al.u32)
-    layout_kv = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    kv_tile = al.view(shm_words, al.bf16, layout_kv)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    v_rsrc = al.amdgpu.make_rsrc(v, total_bytes)
-    v_rsrc_buf = al.make_local((1, 4), al.i32)
-    v_rsrc_buf[0] = v_rsrc
-
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, v_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
-
-    score_acc_rowmajor = al.make_local((K_BATCHES, 16), al.f32)
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    out_acc = al.make_local((O_BATCHES, 16), al.f32)
     for o_batch in al.range(O_BATCHES):
-        out_acc[o_batch] = al.full((16,), 0.0, al.f32)
+        for t_group in al.range(4):
+            f0 = out_acc[o_batch, t_group * 4] * inv_l
+            f1 = out_acc[o_batch, t_group * 4 + 1] * inv_l
+            f2 = out_acc[o_batch, t_group * 4 + 2] * inv_l
+            f3 = out_acc[o_batch, t_group * 4 + 3] * inv_l
+            packed0 = al.amdgpu.perm(al.bitcast(f1, al.u32), al.bitcast(f0, al.u32), 0x07060302)
+            packed1 = al.amdgpu.perm(al.bitcast(f3, al.u32), al.bitcast(f2, al.u32), 0x07060302)
+            element_idx = o_batch * 4 + t_group
+            packed = al.full((2,), 0, al.u32)
+            packed[0] = packed0
+            packed[1] = packed1
+            o_u2[wid, element_idx, lane_col, lane_half] = packed
+    al.syncthreads()
 
-    for k_batch in al.range(K_BATCHES):
-        col_block_base = al.convert(k_batch * WARP_ROWS, al.u32) + lane_half * al.convert(
-            HALF_WARP_ROWS, al.u32
-        )
-        for t in al.range(16):
-            score_acc_rowmajor[k_batch, t] = zero_f32
-            if query_row < seq_len:
-                score_acc_rowmajor[k_batch, t] = probs[query_row, col_block_base + t]
-
-    if query_row < seq_len:
-        _pack_gemm_o_score_mfma(score_acc, score_acc_rowmajor, lane_half)
-        _gemm_o_mfma(out_acc, score_acc, kv_tile, out_row_local, lane_half)
-        _store_gemm_o_mfma(out_ptr, seq_len, out_acc, query_row, lane_half)
+    for store_batch in al.range(SHM_O_VECS // THREADS):
+        vec_idx = tid + store_batch * THREADS
+        row = vec_idx // vecs_per_row
+        col_vec = vec_idx - row * vecs_per_row
+        vec = o_u4[store_batch, tid]
+        elem_offset = row * Q_HEADS * HEAD_DIM + col_vec * VEC_SIZE
+        byte_offset = elem_offset * BF16_BYTES
+        al.amdgpu.raw_buffer_store_x4(vec, out_rsrc, byte_offset, 0, 0)
+    al.syncthreads()
 
 
 @avelang.jit
-def _flash_attn_debug_store_o_kernel(
-    pre_ptr: al.Pointer(al.f32),
+def _actual_k_slice_from_ordinal(
+    max_k_slice: al.u32,
+    slice_ordinal: al.u32,
+    reverse_pass: al.u32,
+) -> al.u32:
+    return slice_ordinal + reverse_pass * (max_k_slice - slice_ordinal - slice_ordinal)
+
+
+@avelang.jit
+def _flash_attn_packed_process_tile(
     out_ptr: al.Pointer(al.bf16),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    one_f32 = al.convert(1.0, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-
-    pre_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    pre = al.make_tensor(pre_ptr, al.f32, pre_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    out_acc = al.make_local((HEAD_DIM,), al.f32)
-    for d in al.range(HEAD_DIM):
-        out_acc[d] = zero_f32
-        if query_row < seq_len and lane_half == 0:
-            out_acc[d] = pre[query_row, d]
-
-    if query_row < seq_len:
-        _normalize_softmax_lse(out_acc, out_ptr, seq_len, query_row, lane_half, one_f32)
-
-
-@avelang.jit
-def _flash_attn_debug_normalize_o_kernel(
-    pre_ptr: al.Pointer(al.f32),
-    l_ptr: al.Pointer(al.f32),
-    out_ptr: al.Pointer(al.bf16),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    one_f32 = al.convert(1.0, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-
-    pre_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    l_layout = al.make_layout((seq_len,), (1,))
-    pre = al.make_tensor(pre_ptr, al.f32, pre_layout)
-    l_in = al.make_tensor(l_ptr, al.f32, l_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    out_acc = al.make_local((HEAD_DIM,), al.f32)
-    l = one_f32
-    for d in al.range(HEAD_DIM):
-        out_acc[d] = zero_f32
-        if query_row < seq_len and lane_half == 0:
-            out_acc[d] = pre[query_row, d]
-    if query_row < seq_len and lane_half == 0:
-        l = l_in[query_row]
-
-    if query_row < seq_len:
-        _normalize_softmax_lse(out_acc, out_ptr, seq_len, query_row, lane_half, l)
-
-
-@avelang.jit
-def _flash_attn_debug_single_tile_kernel(
-    q_ptr: al.Pointer(al.bf16),
-    k_ptr: al.Pointer(al.bf16),
-    v_ptr: al.Pointer(al.bf16),
-    pre_out_ptr: al.Pointer(al.f32),
-    l_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    scale_log2 = al.convert(SCALE_LOG2, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-    two_u32 = al.convert(2, al.u32)
-    one_u32 = al.convert(1, al.u32)
-    three_u32 = al.convert(0x3, al.u32)
-    seven_u32 = al.convert(0x7, al.u32)
-    one_mask_u32 = al.convert(0x1, al.u32)
-    key_base = al.convert(0, al.u32)
-
-    l_layout = al.make_layout((seq_len,), (1,))
-    l_out = al.make_tensor(l_ptr, al.f32, l_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    perm_high = (lane_col >> two_u32) & seven_u32
-    perm_rot = ((perm_high & one_mask_u32) << two_u32) | (perm_high >> one_u32)
-    key_row_local = (lane_col & three_u32) | (perm_rot << two_u32)
-
-    shm_words = al.make_shared((SHM_Q_WORDS + SHM_K_WORDS,), al.u32)
-    q_words = al.subview(shm_words, (0,), (SHM_Q_WORDS,), (1,))
-    kv_words = al.subview(shm_words, (SHM_Q_WORDS,), (SHM_K_WORDS,), (1,))
-    layout_q = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    layout_kv = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    global_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    q_tile = al.view(q_words, al.bf16, layout_q)
-    kv_tile = al.view(kv_words, al.bf16, layout_kv)
-    q = al.make_tensor(q_ptr, al.bf16, global_layout)
-    k = al.make_tensor(k_ptr, al.bf16, global_layout)
-    v = al.make_tensor(v_ptr, al.bf16, global_layout)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    q_rsrc = al.amdgpu.make_rsrc(q, total_bytes)
-    k_rsrc = al.amdgpu.make_rsrc(k, total_bytes)
-    v_rsrc = al.amdgpu.make_rsrc(v, total_bytes)
-    q_rsrc_buf = al.make_local((1, 4), al.i32)
-    k_rsrc_buf = al.make_local((1, 4), al.i32)
-    v_rsrc_buf = al.make_local((1, 4), al.i32)
-    q_rsrc_buf[0] = q_rsrc
-    k_rsrc_buf[0] = k_rsrc
-    v_rsrc_buf[0] = v_rsrc
-
-    _tiled_layout_clear_qk_tiles(q_tile, kv_tile, query_row, tid_u32)
-    _load_q_tile(q_tile, q_rsrc_buf, query_row, query_row, lane_col)
-    al.syncthreads()
-
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, k_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
-
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    score_acc_mfma = al.make_local((K_BATCHES, 16), al.f32)
-    out_acc = al.make_local((O_BATCHES, 16), al.f32)
-    for o_batch in al.range(O_BATCHES):
-        out_acc[o_batch] = al.full((16,), 0.0, al.f32)
-
-    _gemm_qk(score_acc, q_tile, kv_tile, query_row, key_row_local, lane_half)
-    _apply_causal_mask(score_acc, query_row, key_base, lane_half, seq_len)
-
-    l = zero_f32
-    block_max = _compute_row_max(score_acc)
-    mi_new = block_max
-    if block_max <= al.convert(NEG_INF, al.f32):
-        mi_new = zero_f32
-    local_sum = _compute_ptilde(score_acc, mi_new, scale_log2)
-    l = _compute_row_sum(local_sum)
-
-    al.syncthreads()
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, v_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
-
-    _pack_gemm_o_score_mfma(score_acc_mfma, score_acc, lane_half)
-    _gemm_o_mfma(out_acc, score_acc_mfma, kv_tile, key_row_local, lane_half)
-
-    if lane_half == 0 and query_row < seq_len:
-        l_out[query_row] = l
-    if query_row < seq_len:
-        _store_gemm_o_mfma(pre_out_ptr, seq_len, out_acc, query_row, lane_half)
-
-
-@avelang.jit
-def _flash_attn_debug_softmax_stats_kernel(
-    q_ptr: al.Pointer(al.bf16),
-    k_ptr: al.Pointer(al.bf16),
-    localmax_ptr: al.Pointer(al.f32),
-    blockmax_ptr: al.Pointer(al.f32),
-    l_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-):
-    zero_f32 = al.convert(0.0, al.f32)
-    scale_log2 = al.convert(SCALE_LOG2, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    two_u32 = al.convert(2, al.u32)
-    one_u32 = al.convert(1, al.u32)
-    three_u32 = al.convert(0x3, al.u32)
-    seven_u32 = al.convert(0x7, al.u32)
-    one_mask_u32 = al.convert(0x1, al.u32)
-    key_base = al.convert(0, al.u32)
-
-    localmax_layout = al.make_layout((BLOCK_ROWS, 2), (2, 1))
-    scalar_layout = al.make_layout((BLOCK_ROWS,), (1,))
-    localmax_out = al.make_tensor(localmax_ptr, al.f32, localmax_layout)
-    blockmax_out = al.make_tensor(blockmax_ptr, al.f32, scalar_layout)
-    l_out = al.make_tensor(l_ptr, al.f32, scalar_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-
-    perm_high = (lane_col >> two_u32) & seven_u32
-    perm_rot = ((perm_high & one_mask_u32) << two_u32) | (perm_high >> one_u32)
-    key_row_local = (lane_col & three_u32) | (perm_rot << two_u32)
-
-    shm_words = al.make_shared((SHM_Q_WORDS + SHM_K_WORDS,), al.u32)
-    q_words = al.subview(shm_words, (0,), (SHM_Q_WORDS,), (1,))
-    kv_words = al.subview(shm_words, (SHM_Q_WORDS,), (SHM_K_WORDS,), (1,))
-    layout_q = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    layout_kv = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    global_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    q_tile = al.view(q_words, al.bf16, layout_q)
-    kv_tile = al.view(kv_words, al.bf16, layout_kv)
-    q = al.make_tensor(q_ptr, al.bf16, global_layout)
-    k = al.make_tensor(k_ptr, al.bf16, global_layout)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    q_rsrc = al.amdgpu.make_rsrc(q, total_bytes)
-    k_rsrc = al.amdgpu.make_rsrc(k, total_bytes)
-    q_rsrc_buf = al.make_local((1, 4), al.i32)
-    k_rsrc_buf = al.make_local((1, 4), al.i32)
-    q_rsrc_buf[0] = q_rsrc
-    k_rsrc_buf[0] = k_rsrc
-
-    _tiled_layout_clear_qk_tiles(q_tile, kv_tile, query_row, tid_u32)
-    _load_q_tile(q_tile, q_rsrc_buf, query_row, query_row, lane_col)
-    al.syncthreads()
-
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, k_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
-
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    _gemm_qk(score_acc, q_tile, kv_tile, query_row, key_row_local, lane_half)
-    _apply_causal_mask(score_acc, query_row, key_base, lane_half, seq_len)
-
-    local_max = _compute_local_row_max(score_acc)
-    partner_max = al.shuffle_xor(local_max, 32, 64)
-    block_max = local_max
-    if partner_max > block_max:
-        block_max = partner_max
-    mi_new = block_max
-    if block_max <= al.convert(NEG_INF, al.f32):
-        mi_new = zero_f32
-    local_sum = _compute_ptilde(score_acc, mi_new, scale_log2)
-    l = _compute_row_sum(local_sum)
-
-    if query_row < al.convert(BLOCK_ROWS, al.u32):
-        localmax_out[query_row, lane_half] = local_max
-        if lane_half == 0:
-            blockmax_out[query_row] = block_max
-            l_out[query_row] = l
-
-
-@avelang.jit
-def _flash_attn_tile_offdiag_step_kernel(
-    q_ptr: al.Pointer(al.bf16),
-    k_ptr: al.Pointer(al.bf16),
-    v_ptr: al.Pointer(al.bf16),
-    pre_ptr: al.Pointer(al.f32),
-    mi_ptr: al.Pointer(al.f32),
-    l_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
+    total_tokens: al.u32,
+    seq_begin: al.u32,
+    q_head_idx: al.u32,
     q_tile_idx: al.u32,
-    key_tile_idx: al.u32,
+    seq_len: al.u32,
+    kv_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    q_rsrc: al.Tensor((4,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_row_stride_words: al.u32,
+    kv_row_stride_words: al.u32,
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    lane_col: al.u32,
+    lane_half: al.u32,
+    query_row: al.u32,
+    key_row_local: al.u32,
+    scale_log2: al.f32,
+    reverse_pass: al.u32,
 ):
     zero_f32 = al.convert(0.0, al.f32)
-    scale_log2 = al.convert(SCALE_LOG2, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
-    two_u32 = al.convert(2, al.u32)
-    one_u32 = al.convert(1, al.u32)
-    three_u32 = al.convert(0x3, al.u32)
-    seven_u32 = al.convert(0x7, al.u32)
-    one_mask_u32 = al.convert(0x1, al.u32)
-
-    q_base = q_tile_idx * block_rows_u32
-    key_base = key_tile_idx * block_cols_u32
-    pre_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    scalar_layout = al.make_layout((seq_len,), (1,))
-    pre_state = al.make_tensor(pre_ptr, al.f32, pre_layout)
-    mi_state = al.make_tensor(mi_ptr, al.f32, scalar_layout)
-    l_state = al.make_tensor(l_ptr, al.f32, scalar_layout)
-
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    global_query_row = q_base + query_row
-
+    q_base = q_tile_idx * BLOCK_ROWS
     if q_base >= seq_len:
         return
 
-    perm_high = (lane_col >> two_u32) & seven_u32
-    perm_rot = ((perm_high & one_mask_u32) << two_u32) | (perm_high >> one_u32)
-    key_row_local = (lane_col & three_u32) | (perm_rot << two_u32)
+    global_query_row = q_base + query_row
 
-    shm_words = al.make_shared((SHM_Q_WORDS + SHM_K_WORDS,), al.u32)
-    q_words = al.subview(shm_words, (0,), (SHM_Q_WORDS,), (1,))
-    kv_words = al.subview(shm_words, (SHM_Q_WORDS,), (SHM_K_WORDS,), (1,))
-    layout_q = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    layout_kv = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    global_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    q_tile = al.view(q_words, al.bf16, layout_q)
-    kv_tile = al.view(kv_words, al.bf16, layout_kv)
-    q = al.make_tensor(q_ptr, al.bf16, global_layout)
-    k = al.make_tensor(k_ptr, al.bf16, global_layout)
-    v = al.make_tensor(v_ptr, al.bf16, global_layout)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    q_rsrc = al.amdgpu.make_rsrc(q, total_bytes)
-    k_rsrc = al.amdgpu.make_rsrc(k, total_bytes)
-    v_rsrc = al.amdgpu.make_rsrc(v, total_bytes)
-    q_rsrc_buf = al.make_local((1, 4), al.i32)
-    k_rsrc_buf = al.make_local((1, 4), al.i32)
-    v_rsrc_buf = al.make_local((1, 4), al.i32)
-    q_rsrc_buf[0] = q_rsrc
-    k_rsrc_buf[0] = k_rsrc
-    v_rsrc_buf[0] = v_rsrc
+    k_stage_words = al.subview(kv_words, (0,), (SHM_V_OFFSET_WORDS,), (1,))
+    q_stage_words = al.subview(kv_words, (SHM_V_OFFSET_WORDS,), (SHM_Q_STAGE_WORDS,), (1,))
+    v_words = al.subview(kv_words, (SHM_V_OFFSET_WORDS,), (SHM_V_WORDS,), (1,))
 
-    _tiled_layout_clear_qk_tiles(q_tile, kv_tile, query_row, tid_u32)
-    _load_q_tile(q_tile, q_rsrc_buf, query_row, global_query_row, lane_col)
-    al.syncthreads()
-
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, k_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
-
+    q_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
+    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
+    v_regs = al.make_local((O_BATCHES, 4, 2), al.u32)
+    g_v0 = al.make_local((4,), al.u32)
+    g_v1 = al.make_local((4,), al.u32)
     score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    out_acc = al.make_local((HEAD_DIM,), al.f32)
+    out_acc = al.make_local((O_BATCHES, 16), al.f32)
+    softmax_state = al.make_local((2,), al.f32)
     mi = zero_f32
     l = zero_f32
-    for d in al.range(HEAD_DIM):
-        out_acc[d] = zero_f32
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    for o_batch in al.range(O_BATCHES):
+        out_acc[o_batch] = al.full((16,), 0.0, al.f32)
 
-    if global_query_row < seq_len:
-        mi = mi_state[global_query_row]
-        l = l_state[global_query_row]
-        if lane_half == 0:
-            for d in al.range(HEAD_DIM):
-                out_acc[d] = pre_state[global_query_row, d]
+    _load_q_reg_words_lds_strided(
+        q_regs,
+        q_stage_words,
+        q_rsrc,
+        query_row,
+        global_query_row,
+        q_row_stride_words,
+        wid,
+        lane_col,
+        lane_half,
+    )
+    seq_last_row = seq_len - 1
+    tile_last_row = q_base + BLOCK_ROWS - 1
+    last_query_row = tile_last_row
+    if seq_last_row < tile_last_row:
+        last_query_row = seq_last_row
+    max_k_slice = last_query_row // K_SLICE_ROWS
+    pair_count = (max_k_slice + 1) // 2
+    first_slice = _actual_k_slice_from_ordinal(max_k_slice, 0, reverse_pass)
+    second_slice = _actual_k_slice_from_ordinal(max_k_slice, 1, reverse_pass)
+    first_key_base = first_slice * K_SLICE_ROWS
+    second_key_base = second_slice * K_SLICE_ROWS
+    first_causal_key_base = q_base
 
-    _gemm_qk(score_acc, q_tile, kv_tile, query_row, key_row_local, lane_half)
-
-    if global_query_row < seq_len:
-        block_max = _compute_row_max(score_acc)
-        mi_new = block_max
-        if mi > block_max:
-            mi_new = mi
-        local_sum = _compute_ptilde(score_acc, mi_new, scale_log2)
-        row_sum = _compute_row_sum(local_sum)
-        scaling = al.exp2((mi - mi_new) * scale_log2)
-        l = scaling * l + row_sum
-        if lane_half == 0:
-            _multiply_alpha_o(scaling, out_acc)
-        mi = mi_new
-
-    if lane_half == 0 and global_query_row < seq_len:
-        mi_state[global_query_row] = mi
-        l_state[global_query_row] = l
-
+    _flash_attn_compute_qk_page(
+        k_stage_words,
+        k_rsrc,
+        q_regs,
+        k_regs,
+        score_acc,
+        tid,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        first_key_base,
+        first_causal_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    _fetch_v_global_slice_packed_strided(
+        g_v0,
+        v_rsrc,
+        wid,
+        wtid,
+        first_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    _load_k_page_strided(
+        k_stage_words,
+        k_rsrc,
+        tid,
+        second_key_base,
+        kv_row_stride_words,
+        1,
+    )
+    _load_k_page_strided(
+        k_stage_words,
+        k_rsrc,
+        tid,
+        first_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.amdgpu.s_waitcnt(0, 7, 15)
     al.syncthreads()
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, v_rsrc_buf, tid_u32, key_base)
-    al.syncthreads()
+    if wid < (NUM_WARPS // 2):
+        _fetch_v_global_slice_packed_strided(
+            g_v1,
+            v_rsrc,
+            wid,
+            wtid,
+            second_key_base,
+            kv_row_stride_words,
+            0,
+        )
 
-    if global_query_row < seq_len:
-        _gemm_o(out_acc, score_acc, kv_tile, lane_half, key_base, seq_len)
+    for pair_idx in al.range(pair_count):
+        odd_slice_pre = pair_idx * 2 + 1
+        actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
+        actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
+        if pair_idx != 0:
+            if odd_slice_pre <= max_k_slice:
+                _load_k_page_strided(
+                    k_stage_words,
+                    k_rsrc,
+                    tid,
+                    actual_odd_key_base,
+                    kv_row_stride_words,
+                    1,
+                )
+                al.amdgpu.s_waitcnt(0, 7, 15)
+                al.syncthreads()
+        next_even_slice_pre = pair_idx * 2 + 2
+        actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
+        actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
+        if next_even_slice_pre <= max_k_slice:
+            _load_k_page_strided(
+                k_stage_words,
+                k_rsrc,
+                tid,
+                actual_next_even_key_base,
+                kv_row_stride_words,
+                0,
+            )
+        if wid < (NUM_WARPS // 2):
+            mi, l = _flash_attn_packed_pair_step_wg0(
+                k_stage_words,
+                kv_words,
+                v_words,
+                k_rsrc,
+                v_rsrc,
+                q_regs,
+                k_regs,
+                v_regs,
+                g_v0,
+                g_v1,
+                score_acc,
+                out_acc,
+                softmax_state,
+                tid,
+                wid,
+                wtid,
+                key_row_local,
+                lane_half,
+                global_query_row,
+                seq_len,
+                pair_idx,
+                max_k_slice,
+                actual_odd_key_base,
+                actual_next_even_key_base,
+                first_causal_key_base,
+                kv_row_stride_words,
+                scale_log2,
+            )
+        else:
+            mi, l = _flash_attn_packed_pair_step_wg1(
+                k_stage_words,
+                kv_words,
+                v_words,
+                k_rsrc,
+                v_rsrc,
+                q_regs,
+                k_regs,
+                v_regs,
+                g_v0,
+                g_v1,
+                score_acc,
+                out_acc,
+                softmax_state,
+                tid,
+                wid,
+                wtid,
+                key_row_local,
+                lane_half,
+                global_query_row,
+                seq_len,
+                pair_idx,
+                max_k_slice,
+                actual_odd_key_base,
+                actual_next_even_key_base,
+                first_causal_key_base,
+                kv_row_stride_words,
+                scale_log2,
+            )
 
-    if lane_half == 0 and global_query_row < seq_len:
-        for d in al.range(HEAD_DIM):
-            pre_state[global_query_row, d] = out_acc[d]
+    mi, l = _flash_attn_packed_drain_epilogue(
+        kv_words,
+        v_words,
+        score_acc,
+        out_acc,
+        v_regs,
+        g_v0,
+        g_v1,
+        softmax_state,
+        wid,
+        wtid,
+        key_row_local,
+        lane_half,
+        max_k_slice,
+        scale_log2,
+    )
+
+    out_elems = total_tokens * Q_HEADS * HEAD_DIM
+    out_flat = al.make_tensor(out_ptr, al.bf16, al.make_layout((out_elems,), (1,)))
+    remaining_o_rows = seq_len - q_base
+    store_o_rows = al.min(remaining_o_rows, al.convert(BLOCK_ROWS, al.u32))
+    out_span_elems = (store_o_rows - 1) * Q_HEADS * HEAD_DIM + HEAD_DIM
+    out_base_elems = ((seq_begin + q_base) * Q_HEADS + q_head_idx) * HEAD_DIM
+    out_view = al.subview(out_flat, (out_base_elems,), (out_span_elems,), (1,))
+    out_rsrc = al.amdgpu.make_rsrc(out_view, out_span_elems * BF16_BYTES)
+
+    o_words = al.subview(kv_words, (0,), (SHM_O_WORDS,), (1,))
+    _store_gemm_o_mfma_normalized_packed_lds(
+        out_rsrc,
+        o_words,
+        out_acc,
+        tid,
+        wid,
+        wtid,
+        lane_col,
+        lane_half,
+        softmax_state[1],
+    )
 
 
 @avelang.jit
-def _flash_attn_tile_diag_step_kernel(
+def _flash_attn_packed_kernel(
     q_ptr: al.Pointer(al.bf16),
     k_ptr: al.Pointer(al.bf16),
     v_ptr: al.Pointer(al.bf16),
-    pre_ptr: al.Pointer(al.f32),
-    mi_ptr: al.Pointer(al.f32),
-    l_ptr: al.Pointer(al.f32),
-    seq_len: al.u32,
-    q_tile_idx: al.u32,
+    seq_ptr: al.Pointer(al.i32),
+    out_ptr: al.Pointer(al.bf16),
+    total_tokens: al.u32,
+    num_seqs: al.u32,
 ):
-    zero_f32 = al.convert(0.0, al.f32)
     scale_log2 = al.convert(SCALE_LOG2, al.f32)
-    head_dim_u32 = al.convert(HEAD_DIM, al.u32)
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
-    two_u32 = al.convert(2, al.u32)
-    one_u32 = al.convert(1, al.u32)
-    three_u32 = al.convert(0x3, al.u32)
-    seven_u32 = al.convert(0x7, al.u32)
-    one_mask_u32 = al.convert(0x1, al.u32)
 
-    q_base = q_tile_idx * block_rows_u32
-    pre_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    scalar_layout = al.make_layout((seq_len,), (1,))
-    pre_state = al.make_tensor(pre_ptr, al.f32, pre_layout)
-    mi_state = al.make_tensor(mi_ptr, al.f32, scalar_layout)
-    l_state = al.make_tensor(l_ptr, al.f32, scalar_layout)
+    physical_q_tile_idx = al.block_id(0)
+    physical_q_head_idx = al.block_id(1)
+    seq_id = al.block_id(2)
+    # al.assume(q_head_idx < Q_HEADS)
+    # al.assume(seq_id < num_seqs)
 
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    global_query_row = q_base + query_row
-
-    if q_base >= seq_len:
+    seq_layout = al.make_layout((num_seqs + 1,), (1,))
+    seq_start = al.make_tensor(seq_ptr, al.i32, seq_layout)
+    seq_begin = al.convert(seq_start[seq_id], al.u32)
+    seq_end = al.convert(seq_start[seq_id + 1], al.u32)
+    seq_begin = al.amdgpu.readfirstlane(seq_begin)
+    seq_len = al.amdgpu.readfirstlane(seq_end - seq_begin)
+    num_q_tiles = al.amdgpu.readfirstlane(
+        (seq_len + BLOCK_ROWS - 1) // BLOCK_ROWS
+    )
+    physical_tiles = al.amdgpu.readfirstlane((num_q_tiles + 1) // 2)
+    if physical_q_tile_idx >= physical_tiles:
         return
-
-    perm_high = (lane_col >> two_u32) & seven_u32
-    perm_rot = ((perm_high & one_mask_u32) << two_u32) | (perm_high >> one_u32)
-    key_row_local = (lane_col & three_u32) | (perm_rot << two_u32)
-
-    shm_words = al.make_shared((SHM_Q_WORDS + SHM_K_WORDS,), al.u32)
-    q_words = al.subview(shm_words, (0,), (SHM_Q_WORDS,), (1,))
-    kv_words = al.subview(shm_words, (SHM_Q_WORDS,), (SHM_K_WORDS,), (1,))
-    layout_q = al.make_layout((BLOCK_ROWS, HEAD_DIM), (HEAD_DIM, 1))
-    layout_kv = al.make_layout((BLOCK_COLS, HEAD_DIM), (HEAD_DIM, 1))
-    global_layout = al.make_layout((seq_len, head_dim_u32), (head_dim_u32, 1))
-    q_tile = al.view(q_words, al.bf16, layout_q)
-    kv_tile = al.view(kv_words, al.bf16, layout_kv)
-    q = al.make_tensor(q_ptr, al.bf16, global_layout)
-    k = al.make_tensor(k_ptr, al.bf16, global_layout)
-    v = al.make_tensor(v_ptr, al.bf16, global_layout)
-    bf16_bytes_u32 = al.convert(BF16_BYTES, al.u32)
-    total_bytes = seq_len * head_dim_u32 * bf16_bytes_u32
-    q_rsrc = al.amdgpu.make_rsrc(q, total_bytes)
-    k_rsrc = al.amdgpu.make_rsrc(k, total_bytes)
-    v_rsrc = al.amdgpu.make_rsrc(v, total_bytes)
-    q_rsrc_buf = al.make_local((1, 4), al.i32)
-    k_rsrc_buf = al.make_local((1, 4), al.i32)
-    v_rsrc_buf = al.make_local((1, 4), al.i32)
-    q_rsrc_buf[0] = q_rsrc
-    k_rsrc_buf[0] = k_rsrc
-    v_rsrc_buf[0] = v_rsrc
-
-    _tiled_layout_clear_qk_tiles(q_tile, kv_tile, query_row, tid_u32)
-    _load_q_tile(q_tile, q_rsrc_buf, query_row, global_query_row, lane_col)
-    al.syncthreads()
-
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, k_rsrc_buf, tid_u32, q_base)
-    al.syncthreads()
-
-    score_acc = al.make_local((K_BATCHES, 16), al.f32)
-    out_acc = al.make_local((HEAD_DIM,), al.f32)
-    for d in al.range(HEAD_DIM):
-        out_acc[d] = zero_f32
-
-    _gemm_qk(score_acc, q_tile, kv_tile, query_row, key_row_local, lane_half)
-    _apply_causal_mask(score_acc, global_query_row, q_base, lane_half, seq_len)
-
-    block_max = _compute_row_max(score_acc)
-    mi = block_max
-    if block_max <= al.convert(NEG_INF, al.f32):
-        mi = zero_f32
-    local_sum = _compute_ptilde(score_acc, mi, scale_log2)
-    l = _compute_row_sum(local_sum)
-
-    if lane_half == 0 and global_query_row < seq_len:
-        mi_state[global_query_row] = mi
-        l_state[global_query_row] = l
-
-    al.syncthreads()
-    _tiled_layout_clear_k_tile(kv_tile, tid_u32)
-    _load_kv_tile(kv_tile, v_rsrc_buf, tid_u32, q_base)
-    al.syncthreads()
-
-    _gemm_o(out_acc, score_acc, kv_tile, lane_half, q_base, seq_len)
-
-    if lane_half == 0 and global_query_row < seq_len:
-        for d in al.range(HEAD_DIM):
-            pre_state[global_query_row, d] = out_acc[d]
-
-
-@avelang.jit
-def _flash_attn_debug_index_kernel(
-    row_out_ptr: al.Pointer(al.u32),
-    global_row_out_ptr: al.Pointer(al.u32),
-    valid_out_ptr: al.Pointer(al.u32),
-    seq_len: al.u32,
-    idx_q: al.u32,
-):
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
-    row_layout = al.make_layout((BLOCK_ROWS,), (1,))
-    row_out = al.make_tensor(row_out_ptr, al.u32, row_layout)
-    global_row_out = al.make_tensor(global_row_out_ptr, al.u32, row_layout)
-    valid_out = al.make_tensor(valid_out_ptr, al.u32, row_layout)
+    # al.assume(physical_q_tile_idx < physical_tiles)
 
     tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    global_query_row = idx_q * block_rows_u32 + query_row
-    valid_q = global_query_row < seq_len
+    # al.assume(tid < THREADS)
+    wid = al.amdgpu.readfirstlane(tid // WARP_SIZE)
+    # al.assume(wid < NUM_WARPS)
+    wtid = tid % WARP_SIZE
+    lane_col = wtid % WARP_ROWS
+    lane_half = wtid // WARP_ROWS
+    query_row = wid * WARP_ROWS + lane_col
 
-    if lane_half == 0 and query_row < block_rows_u32:
-        row_out[query_row] = query_row
-        global_row_out[query_row] = global_query_row
-        if valid_q:
-            valid_out[query_row] = al.convert(1, al.u32)
-        else:
-            valid_out[query_row] = al.convert(0, al.u32)
+    if wid < (NUM_WARPS // 2):
+        al.amdgpu.s_setprio(0)
+    else:
+        al.amdgpu.s_setprio(1)
 
+    key_row_local = lane_col
 
-@avelang.jit
-def _flash_attn_debug_valid_loop_kernel(
-    out_ptr: al.Pointer(al.u32),
-    seq_len: al.u32,
-):
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    layout = al.make_layout((BLOCK_ROWS,), (1,))
-    out = al.make_tensor(out_ptr, al.u32, layout)
+    kv_words = al.make_shared((SHM_WORK_WORDS,), al.u32, 16)
 
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    valid_q = query_row < seq_len
-    one_u32 = al.convert(1, al.u32)
-    zero_u32 = al.convert(0, al.u32)
+    q_elems = total_tokens * Q_HEADS * HEAD_DIM
+    kv_elems = total_tokens * KV_HEADS * HEAD_DIM
+    q_flat = al.make_tensor(q_ptr, al.bf16, al.make_layout((q_elems,), (1,)))
+    k_flat = al.make_tensor(k_ptr, al.bf16, al.make_layout((kv_elems,), (1,)))
+    v_flat = al.make_tensor(v_ptr, al.bf16, al.make_layout((kv_elems,), (1,)))
 
-    if lane_half == 0 and query_row < al.convert(BLOCK_ROWS, al.u32):
-        out[query_row] = zero_u32
+    q_head_idx = physical_q_head_idx
+    head_idx_q = physical_q_tile_idx
+    merged_head_tile = (physical_q_head_idx & 7) * physical_tiles + physical_q_tile_idx
+    q_head_idx = (physical_q_head_idx // 8) * 8 + (merged_head_tile & 7)
+    head_idx_q = merged_head_tile >> 3
 
-    for _ in al.range(one_u32):
-        if lane_half == 0 and query_row < al.convert(BLOCK_ROWS, al.u32):
-            if valid_q:
-                out[query_row] = one_u32
+    kv_head_idx = q_head_idx // (Q_HEADS // KV_HEADS)
+    q_row_stride_elems = Q_HEADS * HEAD_DIM
+    kv_row_stride_elems = KV_HEADS * HEAD_DIM
+    q_span_elems = (seq_len - 1) * q_row_stride_elems + HEAD_DIM
+    kv_span_elems = (seq_len - 1) * kv_row_stride_elems + HEAD_DIM
+    q_base_elems = (seq_begin * Q_HEADS + q_head_idx) * HEAD_DIM
+    kv_base_elems = (seq_begin * KV_HEADS + kv_head_idx) * HEAD_DIM
+    q_view = al.subview(q_flat, (q_base_elems,), (q_span_elems,), (1,))
+    k_view = al.subview(k_flat, (kv_base_elems,), (kv_span_elems,), (1,))
+    v_view = al.subview(v_flat, (kv_base_elems,), (kv_span_elems,), (1,))
+    q_rsrc = al.amdgpu.make_rsrc(q_view, q_span_elems * BF16_BYTES)
+    k_rsrc = al.amdgpu.make_rsrc(k_view, kv_span_elems * BF16_BYTES)
+    v_rsrc = al.amdgpu.make_rsrc(v_view, kv_span_elems * BF16_BYTES)
 
+    q_row_stride_words = q_row_stride_elems // 2
+    kv_row_stride_words = kv_row_stride_elems // 2
 
-@avelang.jit
-def _flash_attn_debug_dynamic_range_kernel(
-    out_ptr: al.Pointer(al.u32),
-    count: al.u32,
-):
-    warp_size_u32 = al.convert(WARP_SIZE, al.u32)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    block_rows_u32 = al.convert(BLOCK_ROWS, al.u32)
-    layout = al.make_layout((BLOCK_ROWS,), (1,))
-    out = al.make_tensor(out_ptr, al.u32, layout)
+    mirrored_idx_q = num_q_tiles - 1 - head_idx_q
+    num_passes = 1
+    if mirrored_idx_q != head_idx_q:
+        num_passes = 2
 
-    tid = al.thread_id(0)
-    tid_u32 = al.convert(tid, al.u32)
-    wid = tid_u32 // warp_size_u32
-    wtid = tid_u32 % warp_size_u32
-    lane_col = wtid % warp_rows_u32
-    lane_half = wtid // warp_rows_u32
-    query_row = wid * warp_rows_u32 + lane_col
-    zero_u32 = al.convert(0, al.u32)
-    one_u32 = al.convert(1, al.u32)
-
-    if lane_half == 0 and query_row < block_rows_u32:
-        out[query_row] = zero_u32
-
-    for _ in al.range(count):
-        if lane_half == 0 and query_row < block_rows_u32:
-            out[query_row] = one_u32
-
-
-@avelang.jit
-def _load_q_tile(
-    q_tile: al.Tensor((BLOCK_ROWS, HEAD_DIM), al.bf16),
-    q_rsrc: al.Tensor((1, 4), al.i32),
-    query_row_local: al.u32,
-    global_query_row: al.u32,
-    lane_col: al.u32,
-):
-    loaded_q = al.make_local((HEAD_DIM,), al.bf16)
-    warp_rows_u32 = al.convert(WARP_ROWS, al.u32)
-    if lane_col < warp_rows_u32:
-        _tiled_layout_fetch_global_q(loaded_q, q_rsrc, global_query_row)
-        _tiled_layout_store_shm_q(q_tile, loaded_q, query_row_local)
+    tile_idx = head_idx_q
+    reverse_pass = 0
+    for _ in al.range(num_passes):
+        _flash_attn_packed_process_tile(
+            out_ptr,
+            total_tokens,
+            seq_begin,
+            q_head_idx,
+            tile_idx,
+            seq_len,
+            kv_words,
+            q_rsrc,
+            k_rsrc,
+            v_rsrc,
+            q_row_stride_words,
+            kv_row_stride_words,
+            tid,
+            wid,
+            wtid,
+            lane_col,
+            lane_half,
+            query_row,
+            key_row_local,
+            scale_log2,
+            reverse_pass,
+        )
+        tile_idx = num_q_tiles - 1 - tile_idx
+        reverse_pass = 1 - reverse_pass
 
 
 @avelang.jit
-def _load_kv_tile(
-    kv_tile: al.Tensor((BLOCK_COLS, HEAD_DIM), al.bf16),
-    kv_rsrc: al.Tensor((1, 4), al.i32),
-    tid_u32: al.u32,
-    key_base: al.u32,
+def _load_k_page_strided(
+    k_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    tid: al.u32,
+    actual_key_base: al.u32,
+    row_stride_words: al.u32,
+    page: al.u32,
 ):
-    loaded_kv = al.make_local((HEAD_DIM,), al.bf16)
-    block_cols_u32 = al.convert(BLOCK_COLS, al.u32)
-    if tid_u32 < block_cols_u32:
-        global_row = key_base + tid_u32
-        _tiled_layout_fetch_global_k(loaded_kv, kv_rsrc, global_row)
-        _tiled_layout_store_shm_k(kv_tile, loaded_kv, tid_u32)
-
-
-def _run_flash_attn_tiles(
-    q_head: torch.Tensor,
-    k_head: torch.Tensor,
-    v_head: torch.Tensor,
-    pre: torch.Tensor,
-    mi: torch.Tensor,
-    l: torch.Tensor,
-    seq_len: int,
-) -> None:
-    row_tiles = math.ceil(seq_len / BLOCK_ROWS)
-    for q_tile_idx in range(row_tiles):
-        for key_tile_idx in range(q_tile_idx, -1, -1):
-            if key_tile_idx == q_tile_idx:
-                _flash_attn_tile_diag_step_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-                    q_head,
-                    k_head,
-                    v_head,
-                    pre,
-                    mi,
-                    l,
-                    seq_len,
-                    q_tile_idx,
-                )
-            else:
-                _flash_attn_tile_offdiag_step_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-                    q_head,
-                    k_head,
-                    v_head,
-                    pre,
-                    mi,
-                    l,
-                    seq_len,
-                    q_tile_idx,
-                    key_tile_idx,
-                )
-
-
-def flash_attn_debug_qk_tile(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-    print_loads: bool = False,
-) -> torch.Tensor:
-    _validate_qk_shape(q, k)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    q_debug, k_debug, out = _flash_attn_debug_qk_tile_outputs(q, k, batch_idx, head_idx)
-    _flash_attn_debug_qk_tile_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        q_debug,
-        k_debug,
-        out,
-        seq_len,
-    )
-    if print_loads:
-        print("loaded_q_row0", q_debug[0, :8].float().cpu().tolist())
-        print("loaded_q_row1", q_debug[1, :8].float().cpu().tolist())
-        print("loaded_k_row0", k_debug[0, :8].float().cpu().tolist())
-        print("loaded_k_row1", k_debug[1, :8].float().cpu().tolist())
-    return out
-
-
-def _flash_attn_debug_qk_tile_outputs(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int,
-    head_idx: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q_head = q[batch_idx, head_idx].contiguous()
-    k_head = k[batch_idx, head_idx].contiguous()
-    q_debug = torch.zeros((BLOCK_ROWS, HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-    k_debug = torch.zeros((BLOCK_COLS, HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-    out = torch.zeros((BLOCK_ROWS, BLOCK_COLS), dtype=torch.float32, device=q.device)
-    return q_debug, k_debug, out
-
-
-def flash_attn_debug_qk_loads(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _validate_qk_shape(q, k)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    q_debug, k_debug, out = _flash_attn_debug_qk_tile_outputs(q, k, batch_idx, head_idx)
-    _flash_attn_debug_qk_tile_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        q_debug,
-        k_debug,
-        out,
-        seq_len,
-    )
-    return q_debug, k_debug
-
-
-def flash_attn_debug_qk_tile_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    _validate_qk_shape(q, k)
-
-    q_tile = torch.zeros((BLOCK_ROWS, HEAD_DIM), dtype=torch.float32, device=q.device)
-    k_tile = torch.zeros((BLOCK_COLS, HEAD_DIM), dtype=torch.float32, device=q.device)
-
-    valid_rows = min(q.shape[2], BLOCK_ROWS)
-    valid_cols = min(k.shape[2], BLOCK_COLS)
-    q_tile[:valid_rows] = q[batch_idx, head_idx, :valid_rows].to(torch.float32)
-    k_tile[:valid_cols] = k[batch_idx, head_idx, :valid_cols].to(torch.float32)
-    return q_tile @ k_tile.transpose(0, 1)
-
-
-def flash_attn_debug_softmax_tile(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    masked_scores = flash_attn_debug_apply_causal_mask_tile(q, k, batch_idx, head_idx)
-
-    out = torch.zeros((BLOCK_ROWS, BLOCK_COLS), dtype=torch.float32, device=q.device)
-    _flash_attn_debug_softmax_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        masked_scores,
-        out,
-        q.shape[2],
-    )
-    return out
-
-
-def flash_attn_debug_apply_causal_mask_tile(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    _validate_qk_shape(q, k)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    q_debug, k_debug, scores = _flash_attn_debug_qk_tile_outputs(q, k, batch_idx, head_idx)
-    _flash_attn_debug_qk_tile_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        q_debug,
-        k_debug,
-        scores,
-        seq_len,
-    )
-
-    out = torch.empty_like(scores)
-    _flash_attn_debug_apply_causal_mask_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        scores,
-        out,
-        seq_len,
-    )
-    return out
-
-
-def flash_attn_debug_softmax_tile_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    scores = flash_attn_debug_qk_tile_reference(q, k, batch_idx, head_idx)
-    valid_len = q.shape[2]
-    scores = scores.clone()
-    scale = 1.0 / math.sqrt(HEAD_DIM)
-    for row in range(BLOCK_ROWS):
-        if row >= valid_len:
-            scores[row].zero_()
-            continue
-        scores[row, valid_len:].fill_(NEG_INF)
-        scores[row, row + 1 : valid_len].fill_(NEG_INF)
-    probs = torch.zeros_like(scores)
-    probs[:valid_len, :valid_len] = torch.softmax(scores[:valid_len, :valid_len] * scale, dim=-1)
-    return probs
-
-
-def flash_attn_debug_gemm_o_tile(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    flash_attn_validate_shape(q, k, v)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    probs = flash_attn_debug_softmax_tile(q, k, batch_idx, head_idx)
-    out = torch.zeros((BLOCK_ROWS, HEAD_DIM), dtype=torch.float32, device=q.device)
-    _flash_attn_debug_gemm_o_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        probs,
-        v[batch_idx, head_idx].contiguous(),
-        out,
-        seq_len,
-    )
-    return out
-
-
-def flash_attn_debug_gemm_o_tile_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    flash_attn_validate_shape(q, k, v)
-    probs = flash_attn_debug_softmax_tile_reference(q, k, batch_idx, head_idx)
-    v_tile = torch.zeros((BLOCK_COLS, HEAD_DIM), dtype=torch.float32, device=q.device)
-    valid_cols = min(v.shape[2], BLOCK_COLS)
-    v_tile[:valid_cols] = v[batch_idx, head_idx, :valid_cols].to(torch.float32)
-    return probs @ v_tile
-
-
-def flash_attn_debug_store_o(
-    pre: torch.Tensor,
-) -> torch.Tensor:
-    if pre.ndim != 2 or pre.shape[1] != HEAD_DIM:
-        raise ValueError(f"pre must have shape [seq, {HEAD_DIM}] (got {tuple(pre.shape)})")
-    if pre.dtype != torch.float32:
-        raise TypeError(f"pre must be torch.float32 (got {pre.dtype})")
-    if pre.device.type != "cuda":
-        raise ValueError(f"pre must be CUDA (got {pre.device})")
-    if not pre.is_contiguous():
-        raise ValueError("pre must be contiguous")
-
-    out = torch.zeros((pre.shape[0], HEAD_DIM), dtype=torch.bfloat16, device=pre.device)
-    _flash_attn_debug_store_o_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        pre,
-        out,
-        pre.shape[0],
-    )
-    return out
-
-
-def flash_attn_debug_normalize_o(
-    pre: torch.Tensor,
-    l: torch.Tensor,
-) -> torch.Tensor:
-    if pre.ndim != 2 or pre.shape[1] != HEAD_DIM:
-        raise ValueError(f"pre must have shape [seq, {HEAD_DIM}] (got {tuple(pre.shape)})")
-    if l.ndim != 1 or l.shape[0] != pre.shape[0]:
-        raise ValueError(f"l must have shape [{pre.shape[0]}] (got {tuple(l.shape)})")
-    if pre.dtype != torch.float32 or l.dtype != torch.float32:
-        raise TypeError(f"pre and l must be torch.float32 (got pre={pre.dtype}, l={l.dtype})")
-    if pre.device != l.device or pre.device.type != "cuda":
-        raise ValueError(f"pre and l must be CUDA on same device (got pre={pre.device}, l={l.device})")
-    if not pre.is_contiguous() or not l.is_contiguous():
-        raise ValueError("pre and l must be contiguous")
-
-    out = torch.zeros((pre.shape[0], HEAD_DIM), dtype=torch.bfloat16, device=pre.device)
-    _flash_attn_debug_normalize_o_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        pre,
-        l,
-        out,
-        pre.shape[0],
-    )
-    return out
-
-
-def flash_attn_debug_single_tile(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    flash_attn_validate_shape(q, k, v)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    pre_out = torch.zeros((seq_len, HEAD_DIM), dtype=torch.float32, device=q.device)
-    l = torch.zeros((seq_len,), dtype=torch.float32, device=q.device)
-    _flash_attn_debug_single_tile_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        v[batch_idx, head_idx].contiguous(),
-        pre_out,
-        l,
-        seq_len,
-    )
-    return pre_out, l
-
-
-def flash_attn_debug_softmax_stats(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    _validate_qk_shape(q, k)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    localmax = torch.zeros((BLOCK_ROWS, 2), dtype=torch.float32, device=q.device)
-    blockmax = torch.zeros((BLOCK_ROWS,), dtype=torch.float32, device=q.device)
-    l = torch.zeros((BLOCK_ROWS,), dtype=torch.float32, device=q.device)
-    _flash_attn_debug_softmax_stats_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        localmax,
-        blockmax,
-        l,
-        seq_len,
-    )
-    return localmax, blockmax, l
-
-
-def flash_attn_debug_full_kernel_state(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    flash_attn_validate_shape(q, k, v)
-
-    batch_size, num_heads, seq_len, _ = q.shape
-    if not (0 <= batch_idx < batch_size):
-        raise ValueError(f"batch_idx must be in [0, {batch_size}) (got {batch_idx})")
-    if not (0 <= head_idx < num_heads):
-        raise ValueError(f"head_idx must be in [0, {num_heads}) (got {head_idx})")
-
-    pre_out = torch.zeros((seq_len, HEAD_DIM), dtype=torch.float32, device=q.device)
-    mi = torch.zeros((seq_len,), dtype=torch.float32, device=q.device)
-    l = torch.zeros((seq_len,), dtype=torch.float32, device=q.device)
-    _run_flash_attn_tiles(
-        q[batch_idx, head_idx].contiguous(),
-        k[batch_idx, head_idx].contiguous(),
-        v[batch_idx, head_idx].contiguous(),
-        pre_out,
-        mi,
-        l,
-        seq_len,
-    )
-    return pre_out, l
-
-
-def flash_attn_debug_index_state(
-    seq_len: int,
-    idx_q: int = 0,
-    device: torch.device | str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    row = torch.zeros((BLOCK_ROWS,), dtype=torch.uint32, device=device)
-    global_row = torch.zeros((BLOCK_ROWS,), dtype=torch.uint32, device=device)
-    valid = torch.zeros((BLOCK_ROWS,), dtype=torch.uint32, device=device)
-    _flash_attn_debug_index_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        row,
-        global_row,
-        valid,
-        seq_len,
-        idx_q,
-    )
-    return row, global_row, valid
-
-
-def flash_attn_debug_valid_loop_state(
-    seq_len: int,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    out = torch.zeros((BLOCK_ROWS,), dtype=torch.uint32, device=device)
-    _flash_attn_debug_valid_loop_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        out,
-        seq_len,
-    )
-    return out
-
-
-def flash_attn_debug_dynamic_range_state(
-    count: int,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    out = torch.zeros((BLOCK_ROWS,), dtype=torch.uint32, device=device)
-    _flash_attn_debug_dynamic_range_kernel[lambda: ((1, 1, 1), (THREADS, 1, 1))](
-        out,
-        count,
-    )
-    return out
-
-
-def flash_attn_debug_apply_causal_mask_tile_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_idx: int = 0,
-    head_idx: int = 0,
-) -> torch.Tensor:
-    scores = flash_attn_debug_qk_tile_reference(q, k, batch_idx, head_idx)
-    valid_len = q.shape[2]
-    masked = scores.clone()
-    for row in range(BLOCK_ROWS):
-        if row >= valid_len:
-            masked[row].zero_()
-            continue
-        masked[row, valid_len:].fill_(NEG_INF)
-        masked[row, row + 1 : valid_len].fill_(NEG_INF)
-    return masked
+    words_per_row = HEAD_DIM // 2
+    page_word_base = page * K_PAGE_WORDS
+    wid = al.amdgpu.readfirstlane(tid // WARP_SIZE)
+    for word_batch in al.range(K_SLICE_DATA_WORDS // THREADS):
+        row = tid // words_per_row
+        dest_col_word = tid % words_per_row
+        tile_col = dest_col_word // QK_TILE_DWORDS
+        dword_in_tile = dest_col_word - tile_col * QK_TILE_DWORDS
+        col_word = (
+            tile_col * QK_TILE_DWORDS
+            + (dword_in_tile & 0x1)
+            + ((dword_in_tile >> 1) & 0x1)
+            * (QK_TILE_DWORDS // 2)
+            + (dword_in_tile >> 2) * 2
+        )
+        global_vword = row * row_stride_words + col_word
+        global_sword = (
+            actual_key_base + word_batch * (THREADS // (HEAD_DIM // 2))
+        ) * row_stride_words
+        lds_row = wid + (word_batch * NUM_WARPS)
+        lds_word = page_word_base + lds_row * QK_ROW_STRIDE_WORDS
+        global_voffset = global_vword * U32_BYTES
+        global_soffset = global_sword * U32_BYTES
+        lds_offset = lds_word * U32_BYTES
+        al.amdgpu.raw_buffer_load_x1_lds(
+            k_rsrc,
+            k_words,
+            U32_BYTES,
+            global_voffset,
+            global_soffset,
+            lds_offset,
+            0,
+        )
 
 
 def flash_attn(
@@ -1830,47 +1929,30 @@ def flash_attn(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
+    total_tokens = q.shape[0]
+    seq_lens = [seq_ptr_cpu[idx + 1] - seq_ptr_cpu[idx] for idx in range(len(seq_ptr_cpu) - 1)]
+    max_seq_len = max(seq_lens, default=0)
+    if total_tokens == 0 or max_seq_len == 0:
+        return out
+
     q_heads = q.shape[1]
     kv_heads = k.shape[1]
-    gqa_ratio = q_heads // kv_heads
-    for seq_idx in range(len(seq_ptr_cpu) - 1):
-        seq_begin = seq_ptr_cpu[seq_idx]
-        seq_end = seq_ptr_cpu[seq_idx + 1]
-        seq_len = seq_end - seq_begin
-        if seq_len == 0:
-            continue
-        for q_head_idx in range(q_heads):
-            kv_head_idx = q_head_idx // gqa_ratio
-            q_head = q[seq_begin:seq_end, q_head_idx].contiguous()
-            k_head = k[seq_begin:seq_end, kv_head_idx].contiguous()
-            v_head = v[seq_begin:seq_end, kv_head_idx].contiguous()
-            pre = torch.zeros((seq_len, HEAD_DIM), dtype=torch.float32, device=q.device)
-            mi = torch.zeros((seq_len,), dtype=torch.float32, device=q.device)
-            l = torch.zeros((seq_len,), dtype=torch.float32, device=q.device)
-            _run_flash_attn_tiles(q_head, k_head, v_head, pre, mi, l, seq_len)
-            out[seq_begin:seq_end, q_head_idx].copy_(
-                flash_attn_debug_normalize_o(pre.contiguous(), l.contiguous())
-            )
+    seq_ptr_device = seq_ptr.to(device=q.device, dtype=torch.int32)
+    row_tiles = math.ceil(max_seq_len / BLOCK_ROWS)
+    physical_tiles = math.ceil(row_tiles / 2)
+    _flash_attn_packed_kernel[lambda: ((physical_tiles, q_heads, len(seq_ptr_cpu) - 1), (THREADS, 1, 1))](
+        q,
+        k,
+        v,
+        seq_ptr_device,
+        out,
+        total_tokens,
+        len(seq_ptr_cpu) - 1,
+        num_warps=NUM_WARPS,
+    )
     return out
 
 
 __all__ = [
-    "flash_attn",
-    "flash_attn_debug_apply_causal_mask_tile",
-    "flash_attn_debug_apply_causal_mask_tile_reference",
-    "flash_attn_debug_gemm_o_tile",
-    "flash_attn_debug_gemm_o_tile_reference",
-    "flash_attn_debug_full_kernel_state",
-    "flash_attn_debug_index_state",
-    "flash_attn_debug_normalize_o",
-    "flash_attn_debug_single_tile",
-    "flash_attn_debug_store_o",
-    "flash_attn_debug_dynamic_range_state",
-    "flash_attn_debug_valid_loop_state",
-    "flash_attn_debug_qk_loads",
-    "flash_attn_debug_qk_tile",
-    "flash_attn_debug_qk_tile_reference",
-    "flash_attn_debug_softmax_stats",
-    "flash_attn_debug_softmax_tile",
-    "flash_attn_debug_softmax_tile_reference",
+    "flash_attn"
 ]

@@ -17,14 +17,14 @@ class TestFlashAttention(unittest.TestCase):
         torch.manual_seed(0)
         self.rtol = 5e-2
         self.atol = 5e-2
+        self.batch_size = 16
 
-    def test_flash_attention(self):
-        seq_lens = [32, 64]
+    def _run_flash_attention_case(self, seq_lens):
         total_tokens = sum(seq_lens)
-        q_heads = 4
-        kv_heads = 2
+        q_heads = 8
+        kv_heads = 1
         gqa_ratio = q_heads // kv_heads
-        head_dim = 64
+        head_dim = 128
 
         q = torch.randn((total_tokens, q_heads, head_dim), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((total_tokens, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda")
@@ -49,6 +49,12 @@ class TestFlashAttention(unittest.TestCase):
             msg=f"Flash attention results do not match.\nExpected:\n{expected}\nActual:\n{actual}\n"
             f"Max absolute difference: {torch.max(torch.abs(actual - expected))}",
         )
+
+    def test_flash_attention(self):
+        self._run_flash_attention_case([32, 64] * self.batch_size)
+
+    def test_flash_attention_multi_tile(self):
+        self._run_flash_attention_case([1024, 2048] * self.batch_size)
 
 
 if __name__ == "__main__":

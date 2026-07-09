@@ -288,9 +288,12 @@ def _dump_final_assembly(
     target_triple: str,
     target_chipset: str,
     opt_level: int,
+    num_warps: int,
     symbol_name: str | None = None,
 ) -> str:
-    binary = generator.compile_to_binary_bytes(target_triple, target_chipset, opt_level)
+    binary = generator.compile_to_binary_bytes(
+        target_triple, target_chipset, opt_level, num_warps
+    )
     return _render_final_binary(binary, target_triple, symbol_name)
 
 
@@ -342,6 +345,12 @@ def main() -> int:
         type=int,
         default=2,
         help="Optimization level (0-3)",
+    )
+    parser.add_argument(
+        "--num-warps",
+        type=int,
+        default=-1,
+        help="AMDGPU wave/warp count compiler option (default: -1, compiler default)",
     )
     parser.add_argument(
         "--constexprs-json",
@@ -415,6 +424,7 @@ def main() -> int:
         args.target_triple,
         args.target_chipset,
         args.opt_level,
+        args.num_warps,
         function_name,
     )
 
