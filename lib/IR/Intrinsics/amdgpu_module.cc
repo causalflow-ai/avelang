@@ -6,6 +6,7 @@
 #include "IR/generator_context.h"
 #include "IR/mlir_generator_impl.h"
 #include "IR/named_module.h"
+#include "IR/type_system.h"
 #include "Utils/assert.h"
 #include "Utils/embedded_filesystem_view.h"
 #include "intrinsic_support.h"
@@ -121,6 +122,12 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateGlobalAtomicAddFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtPkFp8F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtPkBf8F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     mlir::Value
@@ -166,6 +173,10 @@ class AMDGPUIntrinsic : public NamedModule {
     bool CheckGlobalAtomicAddFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckCvtPkF8F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args,
+        llvm::StringRef intrinsic_name) const;
 };
 
 AMDGPUIntrinsic::AMDGPUIntrinsic() : NamedModule("amdgpu") {}
@@ -346,6 +357,32 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckGlobalAtomicAddFunction(call_expr, gen_ctx,
                                                 resolved_args);
+        });
+
+    AddFunction(
+        "cvt_pk_fp8_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtPkFp8F32Function(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtPkF8F32Function(call_expr, gen_ctx, resolved_args,
+                                            "cvt_pk_fp8_f32");
+        });
+
+    AddFunction(
+        "cvt_pk_bf8_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtPkBf8F32Function(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtPkF8F32Function(call_expr, gen_ctx, resolved_args,
+                                            "cvt_pk_bf8_f32");
         });
 }
 
@@ -735,6 +772,39 @@ mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
+}
+
+namespace {
+template <typename CvtOp>
+mlir::Value CreateCvtPkF8F32(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto wordSel = ConstantFolder::FoldIntValue(resolved_args[3]);
+    SS_ASSERT(wordSel && (*wordSel == 0 || *wordSel == 1));
+
+    auto wordSelAttr =
+        mlir::IntegerAttr::get(builder.getI1Type(), *wordSel);
+    auto op = CvtOp::create(builder, location, builder.getI32Type(),
+                            resolved_args[0], resolved_args[1],
+                            resolved_args[2], wordSelAttr);
+    SetTypeInfo(op.getResult(), TypeInfo{true});
+    return op.getResult();
+}
+} // namespace
+
+mlir::Value AMDGPUIntrinsic::CreateCvtPkFp8F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateCvtPkF8F32<mlir::ROCDL::CvtPkFp8F32Op>(
+        call_expr, ctx, resolved_args);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateCvtPkBf8F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateCvtPkF8F32<mlir::ROCDL::CvtPkBf8F32Op>(
+        call_expr, ctx, resolved_args);
 }
 
 mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferLoadFunction(
@@ -1156,6 +1226,50 @@ bool AMDGPUIntrinsic::CheckSchedGroupBarrierFunction(
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "Failed to generate operands for sched_group_barrier()";
+        return false;
+    }
+
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckCvtPkF8F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    llvm::StringRef intrinsic_name) const {
+    if (call_expr->GetArgs().size() != 4 || resolved_args.size() != 4 ||
+        !resolved_args[0] || !resolved_args[1] || !resolved_args[2] ||
+        !resolved_args[3]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name << "() requires exactly 4 arguments: src_a, "
+            << "src_b, old, opsel";
+        return false;
+    }
+
+    if (!resolved_args[0].getType().isF32() ||
+        !resolved_args[1].getType().isF32()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name << "() expects scalar f32 src_a and src_b "
+            << "arguments";
+        return false;
+    }
+
+    auto oldType =
+        mlir::dyn_cast<mlir::IntegerType>(resolved_args[2].getType());
+    if (!oldType || oldType.getWidth() != 32) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name << "() expects old to be a 32-bit integer";
+        return false;
+    }
+
+    auto wordSel = ConstantFolder::FoldIntValue(resolved_args[3]);
+    if (!wordSel || (*wordSel != 0 && *wordSel != 1)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name
+            << "() requires opsel to be a compile-time integer 0 or 1";
         return false;
     }
 

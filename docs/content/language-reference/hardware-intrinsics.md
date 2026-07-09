@@ -106,6 +106,17 @@ r = al.amdgpu.rcp(x)
 out = al.amdgpu.perm(lhs, rhs, sel)
 ```
 
+`al.amdgpu.cvt_pk_fp8_f32(src_a, src_b, old, opsel)` and
+`al.amdgpu.cvt_pk_bf8_f32(src_a, src_b, old, opsel)` convert two scalar `f32`
+values into a packed FP8 or BF8 pair and return the resulting `u32` word.
+`opsel` is a compile-time `0` or `1`: it selects the low or high 16-bit word
+to replace, preserving the other word from `old`.
+
+```python
+packed = al.amdgpu.cvt_pk_fp8_f32(x, y, 0, 0)
+packed = al.amdgpu.cvt_pk_bf8_f32(x, y, packed, 1)
+```
+
 `al.amdgpu.s_waitcnt(vmcnt, expcnt, lgkmcnt)` emits an explicit wait-count instruction. The arguments must be compile-time integers in the hardware ranges `vmcnt=[0,63]`, `expcnt=[0,7]`, and `lgkmcnt=[0,15]`.
 
 ```python
