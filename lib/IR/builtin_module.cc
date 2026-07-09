@@ -203,6 +203,41 @@ CreateUnaryFloatMathFunction(ast::Call *call_expr, GeneratorContext *ctx,
         .getResult();
 }
 
+static mlir::Value
+CreateTernaryFloatMathFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                               llvm::ArrayRef<mlir::Value> resolved_args,
+                               llvm::StringRef functionName) {
+    if (call_expr->GetArgs().size() != 3 || resolved_args.size() != 3 ||
+        !resolved_args[0] || !resolved_args[1] || !resolved_args[2]) {
+        std::string message =
+            ("avelang." + functionName + "() expects exactly 3 arguments").str();
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << message;
+        return nullptr;
+    }
+
+    auto valueType = resolved_args[0].getType();
+    if (!mlir::isa<mlir::FloatType>(valueType) ||
+        resolved_args[1].getType() != valueType ||
+        resolved_args[2].getType() != valueType) {
+        std::string message =
+            ("avelang." + functionName +
+             "() expects three same-typed floating-point arguments")
+                .str();
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << message;
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    return mlir::math::FmaOp::create(builder, GetCallLocation(ctx, call_expr),
+                                    resolved_args[0], resolved_args[1],
+                                    resolved_args[2])
+        .getResult();
+}
+
 // Helper function for GPU functions that require dimension argument processing
 template <typename OpType>
 static mlir::Value
@@ -520,6 +555,13 @@ void AveLangModule::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
             return CreateExp2Function(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "fma",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateFmaFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -949,6 +991,12 @@ mlir::Value AveLangModule::CreateExp2Function(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateUnaryFloatMathFunction<mlir::math::Exp2Op>(
         call_expr, ctx, resolved_args, "exp2");
+}
+
+mlir::Value AveLangModule::CreateFmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateTernaryFloatMathFunction(call_expr, ctx, resolved_args, "fma");
 }
 
 mlir::Value AveLangModule::CreateTanhFunction(

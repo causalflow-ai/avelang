@@ -38,6 +38,9 @@ class AveLangModule : public NamedModule {
     CreateExp2Function(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
+    CreateFmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                      llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
     CreateTanhFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value

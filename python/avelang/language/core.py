@@ -143,6 +143,11 @@ def exp2(x):
     pass
 
 
+def fma(a, b, c):
+    """Compute a * b + c as a fused multiply-add."""
+    pass
+
+
 def exp(x):
     """Compute e**x for scalar GPU values."""
     pass
