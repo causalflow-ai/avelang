@@ -69,6 +69,10 @@ def mask_lower_bound_f32(rel, neg_inf, value, threshold):
     pass
 
 
+def mask_upper_bound_f32(remaining, neg_inf, value, threshold):
+    pass
+
+
 def raw_buffer_store_x1(vdata, rsrc, vindex, soffset, aux):
     pass
 

@@ -96,6 +96,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateMaskLowerBoundF32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateMaskUpperBoundF32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateRawBufferStoreX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -356,6 +359,19 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
             return CreateMaskLowerBoundF32Function(call_expr, gen_ctx,
+                                                   resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMaskBoundF32Function(call_expr, gen_ctx,
+                                             resolved_args);
+        });
+
+    AddFunction(
+        "mask_upper_bound_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMaskUpperBoundF32Function(call_expr, gen_ctx,
                                                    resolved_args);
         },
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -644,6 +660,35 @@ mlir::Value AMDGPUIntrinsic::CreateMaskLowerBoundF32Function(
         mlir::ValueRange{rel, value, negInf}, asmString, "=v,v,v,v,~{vcc}",
         true, false,
         mlir::LLVM::tailcallkind::TailCallKind::None, nullptr, nullptr);
+    return asmOp.getResult(0);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateMaskUpperBoundF32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+
+    auto threshold = ConstantFolder::FoldIntValue(resolved_args[3]);
+    if (!threshold) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mask_upper_bound_f32 requires a compile-time threshold";
+        return nullptr;
+    }
+
+    auto value = resolved_args[2];
+    auto remaining = ConvertToI32(builder, location, resolved_args[0]);
+    auto negInf = resolved_args[1];
+    auto asmString =
+        "v_cmp_lt_i32_e64 vcc, " + std::to_string(*threshold) +
+        ", $1\n\tv_cndmask_b32_e64 $0, $3, $2, vcc";
+    auto asmOp = mlir::LLVM::InlineAsmOp::create(
+        builder, location, builder.getF32Type(),
+        mlir::ValueRange{remaining, value, negInf}, asmString,
+        "=v,v,v,v,~{vcc}",
+        true, false, mlir::LLVM::tailcallkind::TailCallKind::None, nullptr,
+        nullptr);
     return asmOp.getResult(0);
 }
 
