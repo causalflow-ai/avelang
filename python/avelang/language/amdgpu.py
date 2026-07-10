@@ -51,6 +51,10 @@ def s_waitcnt(vmcnt, expcnt, lgkmcnt):
     pass
 
 
+def v_setvskip(mask, skip_id):
+    pass
+
+
 def raw_buffer_load_x1(rsrc, vindex, soffset, aux):
     pass
 

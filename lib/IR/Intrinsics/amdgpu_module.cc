@@ -119,6 +119,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value
     CreateSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateVSetVSkipFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                            llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -171,6 +174,9 @@ class AMDGPUIntrinsic : public NamedModule {
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckVSetVSkipFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -256,6 +262,17 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckSWaitcntFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "v_setvskip",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateVSetVSkipFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckVSetVSkipFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -752,6 +769,26 @@ mlir::Value AMDGPUIntrinsic::CreateSWaitcntFunction(
     auto waitcntAttr =
         mlir::IntegerAttr::get(builder.getI32Type(), waitcntValue);
     mlir::ROCDL::SWaitcntOp::create(builder, location, waitcntAttr);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateVSetVSkipFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto uniformMask = mlir::LLVM::CallIntrinsicOp::create(
+        builder, location, builder.getI32Type(),
+        builder.getStringAttr("llvm.amdgcn.readfirstlane"),
+        mlir::ValueRange{resolved_args[0]});
+    llvm::SmallVector<mlir::Value> operands{uniformMask.getResult(0),
+                                            resolved_args[1]};
+    mlir::LLVM::InlineAsmOp::create(
+        builder, location, mlir::Type(), operands,
+        "s_setvskip $0, $1", "s,s", true, false,
+        mlir::LLVM::tailcallkind::TailCallKind::None, nullptr, nullptr);
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -1260,6 +1297,29 @@ bool AMDGPUIntrinsic::CheckSWaitcntFunction(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckVSetVSkipFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
+        !resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "v_setvskip() requires exactly 2 arguments: mask, skip_id";
+        return false;
+    }
+    for (auto value : resolved_args) {
+        auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+        if (!intType || intType.getWidth() != 32) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "v_setvskip() expects i32 mask and skip_id arguments";
+            return false;
+        }
+    }
     return true;
 }
 
