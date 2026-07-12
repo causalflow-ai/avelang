@@ -681,6 +681,24 @@ def kernel(a: S.Tensor((32,), S.i32)):
     RunMLIRGenerationTestWithJitDeps(kSourceCode, {"helper"});
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRJitFunctionConstexprBranch) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def kernel(out: S.Tensor((2,), S.u32)):
+    def helper(flag: S.constexpr) -> S.u32:
+        if flag:
+            return S.convert(11, S.u32)
+        return S.convert(23, S.u32)
+    out[0] = helper(True)
+    out[1] = helper(False)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
 TEST_F(MLIRGeneratorTest, SpecializeJitFunctionByAddressSpace) {
     static const std::string kSourceCode = R"""""(
 import avelang
