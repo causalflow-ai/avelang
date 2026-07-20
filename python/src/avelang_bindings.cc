@@ -2,15 +2,18 @@
 #include "AST/ast_context.h"
 #include "AST/ast_nodes_stmt.h"
 #include "Basic/diagnostic.h"
+#include "Dialect/AveLang/IR/AveLangOps.h"
 #include "Driver/driver.h"
 #include "Frontend/avelang_parser.h"
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
+#include "IR/type_system.h"
 #include "Target/GPU/gpu_backend.h"
 #include "Target/GPU/lower_to_llvm.h"
 
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Casting.h>
@@ -19,8 +22,11 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <memory>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Diagnostics.h>
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <set>
@@ -29,6 +35,7 @@
 namespace py = pybind11;
 using namespace llvm;
 using namespace causalflow::avelang;
+namespace cf = causalflow::avelang::dialect;
 
 static ir::MLIRGenerator::FunctionType
 parseFunctionType(const std::string &function_type) {
@@ -92,6 +99,116 @@ DescribeRemainingTranslationBlockers(mlir::Operation *operation) {
         message += "  " + blocker + "\n";
     }
     return message;
+}
+
+static std::optional<int64_t> GetConstantIntValue(mlir::Value value) {
+    if (!value) {
+        return std::nullopt;
+    }
+    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr =
+                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    return std::nullopt;
+}
+
+static bool ExtractConstantTupleValues(mlir::Value tupleValue,
+                                       llvm::SmallVectorImpl<int64_t> &values) {
+    if (auto tupleOp = tupleValue.getDefiningOp<cf::MakeIntTupleOp>()) {
+        for (auto elem : tupleOp.getElements()) {
+            auto value = GetConstantIntValue(elem);
+            if (!value) {
+                return false;
+            }
+            values.push_back(*value);
+        }
+        return true;
+    }
+    return false;
+}
+
+static std::optional<uint64_t> GetTMAElementSize(mlir::Type type) {
+    if (type.isInteger()) {
+        return type.getIntOrFloatBitWidth() / 8;
+    }
+    if (type.isF16() || type.isBF16()) {
+        return 2;
+    }
+    if (type.isF32()) {
+        return 4;
+    }
+    if (type.isF64()) {
+        return 8;
+    }
+    return std::nullopt;
+}
+
+static std::optional<std::string> GetTMADataType(mlir::Type type,
+                                                 ir::TypeInfo typeInfo) {
+    if (type.isInteger()) {
+        unsigned width = type.getIntOrFloatBitWidth();
+        bool isUnsigned = typeInfo.is_unsigned_integer.value_or(false);
+        if (isUnsigned && width == 8) {
+            return "CU_TENSOR_MAP_DATA_TYPE_UINT8";
+        }
+        if (isUnsigned && width == 16) {
+            return "CU_TENSOR_MAP_DATA_TYPE_UINT16";
+        }
+        if (isUnsigned && width == 32) {
+            return "CU_TENSOR_MAP_DATA_TYPE_UINT32";
+        }
+        if (!isUnsigned && width == 32) {
+            return "CU_TENSOR_MAP_DATA_TYPE_INT32";
+        }
+        if (isUnsigned && width == 64) {
+            return "CU_TENSOR_MAP_DATA_TYPE_UINT64";
+        }
+        if (!isUnsigned && width == 64) {
+            return "CU_TENSOR_MAP_DATA_TYPE_INT64";
+        }
+        return std::nullopt;
+    }
+    if (type.isF16()) {
+        return "CU_TENSOR_MAP_DATA_TYPE_FLOAT16";
+    }
+    if (type.isF32()) {
+        return "CU_TENSOR_MAP_DATA_TYPE_FLOAT32";
+    }
+    if (type.isF64()) {
+        return "CU_TENSOR_MAP_DATA_TYPE_FLOAT64";
+    }
+    if (type.isBF16()) {
+        return "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16";
+    }
+    return std::nullopt;
+}
+
+static mlir::MemRefType GetBuiltinMemRefType(mlir::Type type) {
+    if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return builtinType;
+    }
+    if (auto aveType = mlir::dyn_cast<cf::MemRefType>(type)) {
+        mlir::MemRefLayoutAttrInterface layout;
+        auto strides = aveType.getStrides();
+        if (!strides.empty()) {
+            layout = mlir::StridedLayoutAttr::get(type.getContext(),
+                                                  /*offset=*/0, strides);
+        }
+        return mlir::MemRefType::get(aveType.getShape(),
+                                     aveType.getElementType(), layout,
+                                     aveType.getMemorySpace());
+    }
+    return {};
+}
+
+static py::list ToPythonList(llvm::ArrayRef<int64_t> values) {
+    py::list list;
+    for (int64_t value : values) {
+        list.append(value);
+    }
+    return list;
 }
 
 class AveLangCompiler {
@@ -165,6 +282,7 @@ class AveLangMLIRGenerator {
                           const std::string &function_type = "kernel");
     void GenerateFromPythonAST(const py::object &py_ast_node);
     void AddJitDependency(const py::object &py_ast_node);
+    py::list GetTMADescriptorSpecs();
     std::string GetMLIR();
     std::string GetLLVMIR(const std::string &target_triple,
                           const std::string &target_chipset, unsigned opt_level,
@@ -333,6 +451,99 @@ void AveLangMLIRGenerator::AddJitDependency(const py::object &py_ast_node) {
         }
     }
     dependency_contexts_.push_back(std::move(ast_context));
+}
+
+py::list AveLangMLIRGenerator::GetTMADescriptorSpecs() {
+    py::list specs;
+    auto module = generator_.GetModule();
+    if (!module) {
+        return specs;
+    }
+
+    module.walk([&](cf::NVVMTMADescriptorOp op) {
+        mlir::Value tensor = op.getMemref();
+        auto tensorType = GetBuiltinMemRefType(tensor.getType());
+        if (!tensorType || !tensorType.hasStaticShape()) {
+            return;
+        }
+
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(tensor);
+        if (!blockArg) {
+            return;
+        }
+
+        auto funcOp = blockArg.getOwner()
+                          ? mlir::dyn_cast_or_null<mlir::func::FuncOp>(
+                                blockArg.getOwner()->getParentOp())
+                          : mlir::func::FuncOp{};
+        if (!funcOp) {
+            return;
+        }
+        auto gpuFuncAttr =
+            funcOp->getAttrOfType<mlir::IntegerAttr>("ave.gpu_func");
+        if (!gpuFuncAttr ||
+            gpuFuncAttr.getInt() !=
+                static_cast<int>(
+                    ir::MLIRGenerator::FunctionType::kGlobalKernel)) {
+            return;
+        }
+
+        auto argName = funcOp.getArgAttrOfType<mlir::StringAttr>(
+            blockArg.getArgNumber(), "llvm.name");
+        if (!argName) {
+            return;
+        }
+
+        auto layoutOp = op.getLayout().getDefiningOp<cf::MakeLayoutOp>();
+        if (!layoutOp) {
+            return;
+        }
+
+        llvm::SmallVector<int64_t> boxDims;
+        if (!ExtractConstantTupleValues(layoutOp.getDims(), boxDims) ||
+            boxDims.empty()) {
+            return;
+        }
+
+        auto elementSize = GetTMAElementSize(tensorType.getElementType());
+        auto dtype = GetTMADataType(tensorType.getElementType(),
+                                    ir::GetTypeInfo(tensor));
+        if (!elementSize || !dtype) {
+            return;
+        }
+
+        llvm::SmallVector<int64_t> globalDims;
+        for (int64_t dim : llvm::reverse(tensorType.getShape())) {
+            globalDims.push_back(dim);
+        }
+
+        llvm::SmallVector<int64_t> defaultStrides(tensorType.getRank(), 1);
+        for (int64_t i = tensorType.getRank() - 2; i >= 0; --i) {
+            defaultStrides[i] =
+                defaultStrides[i + 1] * tensorType.getDimSize(i + 1);
+        }
+
+        llvm::SmallVector<int64_t> globalStrides;
+        for (int64_t i = tensorType.getRank() - 2; i >= 0; --i) {
+            globalStrides.push_back(defaultStrides[i] * *elementSize);
+        }
+
+        llvm::SmallVector<int64_t> reversedBoxDims;
+        for (int64_t dim : llvm::reverse(boxDims)) {
+            reversedBoxDims.push_back(dim);
+        }
+
+        py::dict spec;
+        spec["arg_name"] = argName.getValue().str();
+        spec["rank"] = tensorType.getRank();
+        spec["global_dims"] = ToPythonList(globalDims);
+        spec["global_strides"] = ToPythonList(globalStrides);
+        spec["box_dims"] = ToPythonList(reversedBoxDims);
+        spec["dtype"] = *dtype;
+        specs.append(std::move(spec));
+    });
+
+    return specs;
 }
 
 std::string AveLangMLIRGenerator::GetMLIR() {
@@ -515,6 +726,8 @@ PYBIND11_MODULE(_avelang_bindings, m) {
              py::arg("py_ast_node"))
         .def("add_jit_dependency", &AveLangMLIRGenerator::AddJitDependency,
              py::arg("py_ast_node"))
+        .def("get_tma_descriptor_specs",
+             &AveLangMLIRGenerator::GetTMADescriptorSpecs)
         .def("get_mlir", &AveLangMLIRGenerator::GetMLIR)
         .def("get_llvm_ir", &AveLangMLIRGenerator::GetLLVMIR,
              py::arg("target_triple"), py::arg("target_chipset"),

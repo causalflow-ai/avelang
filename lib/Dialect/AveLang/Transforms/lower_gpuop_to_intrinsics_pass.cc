@@ -7,6 +7,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
@@ -37,6 +38,38 @@ namespace amdgpu_mfma = causalflow::avelang::amdgpu::mfma;
 
 namespace {
 
+
+static mlir::MemRefType getBuiltinTensorMapMemRefType(mlir::Type type) {
+    if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return builtinType;
+    }
+    if (auto substrateType = mlir::dyn_cast<MemRefType>(type)) {
+        mlir::MemRefLayoutAttrInterface layout;
+        auto strides = substrateType.getStrides();
+        if (!strides.empty()) {
+            layout = mlir::StridedLayoutAttr::get(type.getContext(),
+                                                  /*offset=*/0, strides);
+        }
+        return mlir::MemRefType::get(substrateType.getShape(),
+                                     substrateType.getElementType(), layout,
+                                     substrateType.getMemorySpace());
+    }
+    return {};
+}
+static bool extractTupleValues(mlir::Value tupleValue,
+                               llvm::SmallVectorImpl<mlir::Value> &values) {
+    if (auto tupleOp = tupleValue.getDefiningOp<MakeIntTupleOp>()) {
+        for (auto elem : tupleOp.getElements()) {
+            if (!extractTupleValues(elem, values)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    values.push_back(tupleValue);
+    return true;
+}
 /// Helper to convert a memref to an aligned pointer index with optional bounds
 /// checking. Returns a null Value on failure and emits a diagnostic.
 mlir::Value convertMemrefToPointerIndex(mlir::PatternRewriter &rewriter,
@@ -471,6 +504,57 @@ class NVVMStMatrixLowering : public mlir::OpRewritePattern<NVVMStMatrixOp> {
     }
 };
 
+
+class NVVMTMADescriptorLowering
+    : public mlir::OpRewritePattern<NVVMTMADescriptorOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMADescriptorOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMADescriptorOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto tensor = op.getMemref();
+        auto tensorType = getBuiltinTensorMapMemRefType(tensor.getType());
+        if (!tensorType) {
+            return mlir::failure();
+        }
+
+        auto layoutOp = op.getLayout().getDefiningOp<MakeLayoutOp>();
+        if (!layoutOp) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> boxDimensions;
+        if (!extractTupleValues(layoutOp.getDims(), boxDimensions) ||
+            boxDimensions.empty()) {
+            return mlir::failure();
+        }
+
+        auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+        if (!funcOp) {
+            return mlir::failure();
+        }
+
+        unsigned argIndex = funcOp.getNumArguments();
+        auto descriptorPtrType =
+            mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+        // GPU outlining uses this marker to apply the CUDA TMA argument ABI
+        // once the argument belongs to a kernel.
+        auto attrs = rewriter.getDictionaryAttr(
+            {rewriter.getNamedAttr("ave.nv_tma_desc",
+                                   rewriter.getUnitAttr())});
+        if (mlir::failed(funcOp.insertArgument(
+                argIndex, descriptorPtrType, attrs, op.getLoc()))) {
+            return mlir::failure();
+        }
+
+        auto descriptor = mlir::UnrealizedConversionCastOp::create(
+            rewriter, op.getLoc(), op.getResult().getType(),
+            funcOp.getArgument(argIndex));
+        rewriter.replaceOp(op, descriptor.getResult(0));
+        return mlir::success();
+    }
+};
 class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
   public:
     using mlir::OpRewritePattern<AMDGPUMfmaOp>::OpRewritePattern;
@@ -603,7 +687,7 @@ class LowerAveLangGPUToIntrinsicsPass
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, AMDGPUMfmaLowering,
+                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 
