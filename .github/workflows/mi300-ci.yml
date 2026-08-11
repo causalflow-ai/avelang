@@ -1,0 +1,39 @@
+name: MI300 ROCm CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request_target:
+    types: 
+      - opened
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mi300-rocm-ci
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, linux, x64, mi300, rocm72, dind]
+    timeout-minutes: 120
+    steps:
+      - name: Check out the triggering commit
+        env:
+          REPOSITORY_URL: https://github.com/${{ github.repository }}.git
+          REVISION: ${{ github.sha }}
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/src"
+          git init "$GITHUB_WORKSPACE/src"
+          git -C "$GITHUB_WORKSPACE/src" remote add origin "$REPOSITORY_URL"
+          git -C "$GITHUB_WORKSPACE/src" fetch --depth=1 origin "$REVISION"
+          git -C "$GITHUB_WORKSPACE/src" checkout --detach FETCH_HEAD
+
+      - name: Build and test in isolated ROCm container
+        run: |
+          "$GITHUB_WORKSPACE/src/.github/runner/run-ci-container.sh" "$GITHUB_WORKSPACE/src"

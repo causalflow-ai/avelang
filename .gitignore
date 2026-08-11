@@ -1,5 +1,7 @@
 # Build outputs
 .*
+!.github/
+!.github/**
 build/
 dist/
 *.egg-info/
@@ -24,3 +26,5 @@ __pycache__/
 # Editor and local-tool state
 .cache/
 
+# Local self-hosted runner registration secret
+.github/runner/runner-token
