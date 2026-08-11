@@ -4,6 +4,7 @@
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/MLIRContext.h>
@@ -20,6 +21,7 @@ class GpuOutliningTest : public ::testing::Test {
     void SetUp() override {
         context.getOrLoadDialect<mlir::func::FuncDialect>();
         context.getOrLoadDialect<mlir::gpu::GPUDialect>();
+        context.getOrLoadDialect<mlir::memref::MemRefDialect>();
     }
 
     mlir::MLIRContext context;
@@ -137,6 +139,32 @@ TEST_F(GpuOutliningTest, NoGpuJitFunctions) {
     int gpuModuleCount = 0;
     module->walk([&](mlir::gpu::GPUModuleOp) { gpuModuleCount++; });
     EXPECT_EQ(gpuModuleCount, 0);
+}
+
+TEST_F(GpuOutliningTest, PreservesWorkgroupAllocationAlignment) {
+    const char *mlirCode = R"(
+        module {
+            func.func @gpu_kernel() attributes {ave.gpu_func = 2 : i32} {
+                %buffer = memref.alloca() {alignment = 128 : i64} : memref<32xi8, #gpu.address_space<workgroup>>
+                return
+            }
+        }
+    )";
+
+    auto module = mlir::parseSourceString<mlir::ModuleOp>(mlirCode, &context);
+    ASSERT_TRUE(module);
+
+    mlir::PassManager pm(&context);
+    pm.addPass(createGpuOutliningPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(module.get())));
+
+    mlir::gpu::GPUFuncOp kernel;
+    module->walk([&](mlir::gpu::GPUFuncOp func) { kernel = func; });
+    ASSERT_TRUE(kernel);
+    ASSERT_EQ(kernel.getNumWorkgroupAttributions(), 1u);
+    auto alignment = kernel.getWorkgroupAttributionAttr(0, "llvm.align");
+    ASSERT_TRUE(alignment);
+    EXPECT_EQ(mlir::cast<mlir::IntegerAttr>(alignment).getInt(), 128);
 }
 
 } // namespace causalflow::avelang::target::gpu

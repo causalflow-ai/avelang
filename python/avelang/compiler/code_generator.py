@@ -273,6 +273,7 @@ def compile_to_binary(src, target, opt_level: int = 2, options=None):
 
     kernel_func = _get_function_def(src.fn.parse())
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
+    src.tma_specs = generator.get_tma_descriptor_specs()
 
     num_warps = getattr(options, "num_warps", -1)
     return generator.compile_to_binary_bytes(target.tuple, target.chip, opt_level, num_warps)
