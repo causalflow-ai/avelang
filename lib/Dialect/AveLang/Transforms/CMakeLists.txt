@@ -25,6 +25,7 @@ target_link_libraries(ave-lang-dialect-transforms
     MLIRControlFlowDialect
     MLIRSCFDialect
     MLIRVectorTransforms
+    MLIRNVGPUDialect
     MLIRNVVMDialect
     MLIRROCDLDialect
     MLIRGPUDialect

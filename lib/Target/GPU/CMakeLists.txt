@@ -1,5 +1,6 @@
 add_library(ave-lang-target-gpu
   lower_to_llvm.cc
+  reconcile_nvgpu_index_bitwidth.cc
   gpu_outlining.cc
   gpu_backend.cc
   link_intrinsic_implementation.cc

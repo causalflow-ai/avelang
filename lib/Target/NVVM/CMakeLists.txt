@@ -6,6 +6,7 @@ add_library(ave-lang-target-nvvm
 target_link_libraries(ave-lang-target-nvvm
   PRIVATE
   MLIRArithToLLVM
+  MLIRNVVMToLLVM
   MLIRVectorToLLVMPass
   MLIRAffineToStandard
   MLIRAffineTransforms
@@ -15,8 +16,10 @@ target_link_libraries(ave-lang-target-nvvm
   MLIRGPUTransforms
   MLIRBufferizationTransforms
   MLIRGPUDialect
+  MLIRNVGPUDialect
   MLIRSCFToControlFlow
   MLIRNVVMDialect
+  MLIRNVGPUToNVVM
   MLIRGPUToNVVMTransforms
   MLIRMemRefTransforms
   MLIRUBToLLVM

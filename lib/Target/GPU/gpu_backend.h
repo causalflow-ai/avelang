@@ -3,7 +3,9 @@
 #include <functional>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/JSON.h>
 #include <memory>
+#include <mlir/IR/BuiltinOps.h>
 #include <mlir/Pass/PassManager.h>
 #include <string>
 #include <vector>
@@ -35,6 +37,10 @@ class GPUBackendInterface {
     virtual llvm::Expected<std::string>
     generateAssembly(llvm::Module &module,
                      const GPUCompilationOptions &options) = 0;
+
+    virtual llvm::json::Object getKernelMetadata(mlir::ModuleOp module) const {
+        return {};
+    }
 
     virtual void EnsureInitialized() {}
 };

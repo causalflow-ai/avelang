@@ -179,7 +179,9 @@ PyMODINIT_FUNC PyInit___avelang_launcher(void) {
 """
 
 
-def make_launcher(constants, signature) -> str:
+def make_launcher(constants, signature, tma_specs=None) -> str:
+    tma_specs = tma_specs or []
+
     def ty_to_cpp(ty):
         TYPE_MAP = {
             "i32": "int",
@@ -233,6 +235,18 @@ def make_launcher(constants, signature) -> str:
         else:
             return FORMAT_MAP[ty_to_cpp(ty)]
 
+    def tma_swizzle_to_cpp(swizzle):
+        swizzle_map = {
+            0: "CU_TENSOR_MAP_SWIZZLE_NONE",
+            1: "CU_TENSOR_MAP_SWIZZLE_32B",
+            2: "CU_TENSOR_MAP_SWIZZLE_64B",
+            3: "CU_TENSOR_MAP_SWIZZLE_128B",
+        }
+        swizzle = int(swizzle)
+        if swizzle not in swizzle_map:
+            raise ValueError(f"Unsupported TMA swizzle kind: {swizzle}")
+        return swizzle_map[swizzle]
+
     args_format = "".join([format_of(ty) for ty in signature.values()])
     format = _BASE_ARGS_FORMAT + args_format
 
@@ -268,6 +282,7 @@ def make_launcher(constants, signature) -> str:
     ]
 
     params = [f"&arg{i}" for i, ty in signature.items() if ty != "constexpr"]
+    params.extend(f"&tma_desc{i}" for i in range(len(tma_specs)))
     if params:
         params_decl = f"    void *params[] = {{\n        {', '.join(params)},\n    }};"
         params_arg = "params"
@@ -281,8 +296,42 @@ def make_launcher(constants, signature) -> str:
     internal_args = ", ".join(internal_args_list)
     launch_args = f", {internal_args}" if internal_args else ""
 
+    tma_decl_list = []
+    for i, spec in enumerate(tma_specs):
+        rank = spec["rank"]
+        global_dims = ", ".join(str(v) for v in spec["global_dims"])
+        global_strides = ", ".join(str(v) for v in spec["global_strides"])
+        box_dims = ", ".join(str(v) for v in spec["box_dims"])
+        element_strides = ", ".join("1" for _ in range(rank))
+        strides_arg = f"tma_global_strides{i}" if rank > 1 else "NULL"
+        swizzle = tma_swizzle_to_cpp(spec.get("swizzle_kind", 0))
+        tma_decl_list.append(
+            f"""
+    CUtensorMap tma_desc{i} __attribute__((aligned(128)));
+    cuuint64_t tma_global_dims{i}[{rank}] = {{{global_dims}}};
+    cuuint32_t tma_box_dims{i}[{rank}] = {{{box_dims}}};
+    cuuint32_t tma_element_strides{i}[{rank}] = {{{element_strides}}};
+"""
+        )
+        if rank > 1:
+            tma_decl_list.append(
+                f"    cuuint64_t tma_global_strides{i}[{rank - 1}] = {{{global_strides}}};\n"
+            )
+        tma_decl_list.append(
+            f"""
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &tma_desc{i}, {spec["dtype"]}, {rank},
+        (void *)arg{spec["arg_index"]}, tma_global_dims{i}, {strides_arg},
+        tma_box_dims{i}, tma_element_strides{i},
+        CU_TENSOR_MAP_INTERLEAVE_NONE, {swizzle},
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+"""
+        )
+    tma_decls = "".join(tma_decl_list)
+
     cuda_launch = f"""
 static void CudaLaunch(int grid_x, int grid_y, int grid_z, int block_x, int block_y, int block_z, CUstream stream, CUfunction func{", " + arg_decl if arg_decl else ""}) {{
+{tma_decls}
 {params_decl}
     CUDA_CHECK(cuLaunchKernel(func, grid_x, grid_y, grid_z, block_x, block_y, block_z, 0, stream, {params_arg}, NULL));
 }} 
@@ -321,7 +370,15 @@ class CudaLauncher:
 
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
-        src = make_launcher(constants, signature)
+        tma_specs = []
+        metadata = getattr(src, "kernel_metadata", {})
+        for spec in metadata.get("tma_descriptor_specs", []):
+            spec = dict(spec)
+            arg_name = spec.pop("arg_name", None)
+            if arg_name is not None:
+                spec["arg_index"] = src.fn.arg_names.index(arg_name)
+            tma_specs.append(spec)
+        src = make_launcher(constants, signature, tma_specs)
         mod = compile_module_from_src(
             src,
             "__avelang_launcher",

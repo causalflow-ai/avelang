@@ -9,6 +9,7 @@
 #include "avelang/config.h"
 #include "gpu_backend.h"
 #include "gpu_passes.h"
+#include "reconcile_nvgpu_index_bitwidth.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/LLVMContext.h>
@@ -40,9 +41,9 @@
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h>
 #include <mlir/Dialect/Math/IR/Math.h>
-#include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/UB/IR/UBOps.h>
@@ -60,6 +61,74 @@ class FuncDialect;
 namespace causalflow::avelang::target::gpu {
 
 using namespace mlir;
+
+namespace {
+
+class SetNVVMTMADescriptorABIAttributesPass
+    : public PassWrapper<SetNVVMTMADescriptorABIAttributesPass,
+                         OperationPass<ModuleOp>> {
+  public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+        SetNVVMTMADescriptorABIAttributesPass)
+
+    void runOnOperation() override {
+        Builder builder(&getContext());
+        WalkResult abiResult = getOperation().walk([&](LLVM::LLVMFuncOp func) {
+            auto descriptorIndices = func->getAttrOfType<DenseI32ArrayAttr>(
+                "ave.nv_tma_desc_indices");
+            if (!descriptorIndices) {
+                return WalkResult::advance();
+            }
+
+            if (!func->hasAttr(NVVM::NVVMDialect::getKernelFuncAttrName())) {
+                func.emitError() << "TMA descriptors are only supported on "
+                                    "kernel arguments";
+                return WalkResult::interrupt();
+            }
+
+            auto descriptorBytes = LLVM::LLVMArrayType::get(
+                &getContext(), builder.getI8Type(), 128);
+            for (int32_t argIndex : descriptorIndices.asArrayRef()) {
+                if (argIndex < 0 ||
+                    static_cast<unsigned>(argIndex) >= func.getNumArguments() ||
+                    !isa<LLVM::LLVMPointerType>(
+                        func.getArgument(argIndex).getType())) {
+                    func.emitError()
+                        << "invalid TMA descriptor argument index " << argIndex;
+                    return WalkResult::interrupt();
+                }
+
+                // nvTmaDesc ABI: aligned, by-value, grid-constant CUtensorMap.
+                func.setArgAttr(argIndex, LLVM::LLVMDialect::getByValAttrName(),
+                                TypeAttr::get(descriptorBytes));
+                func.setArgAttr(argIndex,
+                                NVVM::NVVMDialect::getGridConstantAttrName(),
+                                builder.getUnitAttr());
+                func.setArgAttr(argIndex, LLVM::LLVMDialect::getAlignAttrName(),
+                                builder.getI64IntegerAttr(64));
+            }
+            func->removeAttr("ave.nv_tma_desc_indices");
+            return WalkResult::advance();
+        });
+        if (abiResult.wasInterrupted()) {
+            signalPassFailure();
+        }
+    }
+
+    StringRef getArgument() const final {
+        return "set-nvvm-tma-descriptor-abi-attributes";
+    }
+
+    StringRef getDescription() const final {
+        return "Set the NVVM kernel ABI attributes for TMA descriptors";
+    }
+};
+
+static std::unique_ptr<Pass> createSetNVVMTMADescriptorABIAttributesPass() {
+    return std::make_unique<SetNVVMTMADescriptorABIAttributesPass>();
+}
+
+} // namespace
 
 class LowerToLLVM::Impl {
   public:
@@ -218,6 +287,10 @@ class LowerToLLVM::Impl {
         pm.addPass(::mlir::createCSEPass());
 
         pm.addPass(::mlir::createReconcileUnrealizedCastsPass());
+        if (targetTriple.find("nvptx") != std::string::npos) {
+            pm.addPass(createSetNVVMTMADescriptorABIAttributesPass());
+            pm.addPass(createReconcileNVGPUIndexBitwidthPass());
+        }
 
         pm.addPass(::mlir::createCanonicalizerPass());
         pm.addPass(::mlir::createCSEPass());
@@ -237,6 +310,23 @@ class LowerToLLVM::Impl {
             llvm::errs() << "Expected exactly one GPU module after lowering, "
                          << "found " << gpuModules.size() << "\n";
             return nullptr;
+        }
+
+        // NVGPU TMA descriptor lowering materializes this helper as a top-level
+        // llvm.func on the builtin.module, but we translate the nested
+        // gpu.module in isolation. Ensure the declaration exists in the
+        // translated symbol scope.
+        constexpr llvm::StringLiteral kTensorMapEncodeFn =
+            "mgpuTensorMapEncodeTiledMemref";
+        if (auto topLevelFn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+                kTensorMapEncodeFn)) {
+            auto gpuModule = gpuModules[0];
+            if (!gpuModule.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+                    kTensorMapEncodeFn)) {
+                mlir::OpBuilder builder(gpuModule.getContext());
+                builder.setInsertionPointToEnd(gpuModule.getBody());
+                builder.clone(*topLevelFn.getOperation());
+            }
         }
 
         // Translate MLIR to LLVM IR

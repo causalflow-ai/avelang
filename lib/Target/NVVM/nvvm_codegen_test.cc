@@ -37,6 +37,31 @@ module {
   }
 })";
 
+static const std::string kTMADescriptorMLIRCode = R"(
+module {
+  func.func @tma_descriptor_test(%arg0: !ave.memref<!ave.layout<dims = [16, 16], strides = [16, 1]>, f32> {llvm.name = "global_mem"}) attributes {ave.gpu_func = 2 : i32} {
+    %c16 = arith.constant 16 : i32
+    %dims = ave.make_int_tuple %c16, %c16 {is_tuple = true} : i32, i32 -> none
+    %c1 = arith.constant 1 : i32
+    %strides = ave.make_int_tuple %c16, %c1 {is_tuple = true} : i32, i32 -> none
+    %layout = ave.make_layout %dims, %strides : (none, none) -> !ave.layout
+    %swizzle = arith.constant 0 : index
+    %desc = ave.gpu.nvvm_tma_descriptor %arg0, %layout, %swizzle : !ave.memref<!ave.layout<dims = [16, 16], strides = [16, 1]>, f32>, !ave.layout, index -> !nvgpu.tensormap.descriptor<tensor = memref<16x16xf32, strided<[16, 1]>, 3>, swizzle = none, l2promo = none, oob = zero, interleave = none>
+    return
+  }
+})";
+
+static std::string getTMADescriptorMLIRCode(llvm::StringRef elementType) {
+    std::string result = kTMADescriptorMLIRCode;
+    std::string replacement = elementType.str();
+    size_t offset = 0;
+    while ((offset = result.find("f32", offset)) != std::string::npos) {
+        result.replace(offset, 3, replacement);
+        offset += replacement.size();
+    }
+    return result;
+}
+
 class NVVMCodegenTest : public ::testing::Test {
   protected:
     void SetUp() override {
@@ -91,6 +116,61 @@ class NVVMCodegenTest : public ::testing::Test {
     std::unique_ptr<Module> llvmModule;
     std::string ptx_code_;
 };
+
+TEST_F(NVVMCodegenTest, CollectsTMADescriptorKernelMetadata) {
+    ParseMLIRString(kTMADescriptorMLIRCode);
+
+    auto metadata = backend->getKernelMetadata(*module);
+    auto *specs = metadata.getArray("tma_descriptor_specs");
+    ASSERT_NE(specs, nullptr);
+    ASSERT_EQ(specs->size(), 1u);
+
+    auto *spec = (*specs)[0].getAsObject();
+    ASSERT_NE(spec, nullptr);
+    EXPECT_EQ(spec->getString("arg_name"), "global_mem");
+    EXPECT_EQ(spec->getInteger("rank"), 2);
+    EXPECT_EQ(spec->getString("dtype"), "CU_TENSOR_MAP_DATA_TYPE_FLOAT32");
+    EXPECT_EQ(spec->getInteger("swizzle_kind"), 0);
+
+    auto *globalDims = spec->getArray("global_dims");
+    auto *globalStrides = spec->getArray("global_strides");
+    auto *boxDims = spec->getArray("box_dims");
+    ASSERT_NE(globalDims, nullptr);
+    ASSERT_NE(globalStrides, nullptr);
+    ASSERT_NE(boxDims, nullptr);
+    ASSERT_EQ(globalDims->size(), 2u);
+    ASSERT_EQ(globalStrides->size(), 1u);
+    ASSERT_EQ(boxDims->size(), 2u);
+    EXPECT_EQ((*globalDims)[0].getAsInteger(), 16);
+    EXPECT_EQ((*globalDims)[1].getAsInteger(), 16);
+    EXPECT_EQ((*globalStrides)[0].getAsInteger(), 64);
+    EXPECT_EQ((*boxDims)[0].getAsInteger(), 16);
+    EXPECT_EQ((*boxDims)[1].getAsInteger(), 16);
+}
+
+TEST_F(NVVMCodegenTest, CollectsSignedI8AndI16TMADescriptorMetadata) {
+    auto checkMetadata = [&](llvm::StringRef elementType,
+                             llvm::StringRef expectedDataType,
+                             int64_t expectedGlobalStride) {
+        ParseMLIRString(getTMADescriptorMLIRCode(elementType));
+
+        auto metadata = backend->getKernelMetadata(*module);
+        auto *specs = metadata.getArray("tma_descriptor_specs");
+        ASSERT_NE(specs, nullptr);
+        ASSERT_EQ(specs->size(), 1u);
+
+        auto *spec = (*specs)[0].getAsObject();
+        ASSERT_NE(spec, nullptr);
+        EXPECT_EQ(spec->getString("dtype"), expectedDataType);
+        auto *globalStrides = spec->getArray("global_strides");
+        ASSERT_NE(globalStrides, nullptr);
+        ASSERT_EQ(globalStrides->size(), 1u);
+        EXPECT_EQ((*globalStrides)[0].getAsInteger(), expectedGlobalStride);
+    };
+
+    checkMetadata("i8", "CU_TENSOR_MAP_DATA_TYPE_UINT8", 16);
+    checkMetadata("i16", "CU_TENSOR_MAP_DATA_TYPE_UINT16", 32);
+}
 
 TEST_F(NVVMCodegenTest, ExecuteAxpyOnGPU) {
     static const int kN = 64;
