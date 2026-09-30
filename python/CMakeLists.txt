@@ -1,16 +1,7 @@
 # Python bindings for ave-lang
 
-# Find required LLVM/MLIR libraries
-# Use all-targets to get all LLVM target libraries (needed for MLIR)
-llvm_map_components_to_libnames(llvm_libs support core irreader)
-# Get all target libraries via llvm-config to ensure all LLVMInitialize*Target symbols are available
-execute_process(
-    COMMAND ${LLVM_CONFIG_EXECUTABLE} --libs all-targets
-    OUTPUT_VARIABLE LLVM_ALL_TARGETS_LIBS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-# Convert the space-separated list to a CMake list
-separate_arguments(LLVM_ALL_TARGETS_LIBS NATIVE_COMMAND "${LLVM_ALL_TARGETS_LIBS}")
+# Include all targets for the LLVMInitialize*Target symbols in the bindings.
+llvm_map_components_to_libnames(llvm_libs support core irreader ${LLVM_TARGETS_TO_BUILD})
 
 # Get MLIR libraries
 get_property(mlir_libs GLOBAL PROPERTY MLIR_ALL_LIBS)
@@ -42,7 +33,6 @@ target_link_libraries(_avelang_bindings PRIVATE
     ave-lang-ast
     clangFrontend
     ${llvm_libs}
-    ${LLVM_ALL_TARGETS_LIBS}
     ${mlir_libs}
 )
 
