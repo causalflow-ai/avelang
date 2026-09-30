@@ -622,6 +622,9 @@ def _normalize_ty(ty) -> str:
             return "*" + _normalize_ty(ty[:-1])
         if ty.startswith("*"):
             return "*" + _normalize_ty(ty[1:])
+        scalar_ty = getattr(core, ty.rsplit(".", 1)[-1], None)
+        if isinstance(scalar_ty, core.dtype):
+            return _normalize_ty(scalar_ty)
         if ty.startswith("S."):
             return _normalize_ty(ty.removeprefix("S."))
     elif isinstance(ty, core.pointer_type):
