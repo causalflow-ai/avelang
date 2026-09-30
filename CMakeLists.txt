@@ -67,7 +67,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g")
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
-find_package(LLVM CONFIG REQUIRED)
+find_package(LLVM 23.0 CONFIG REQUIRED)
 find_package(MLIR CONFIG REQUIRED)
 find_package(Clang REQUIRED CONFIG)
 
@@ -138,7 +138,7 @@ else()
 endif()
 
 include_directories(include lib)
-include_directories(${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/avelang)
 configure_file(
