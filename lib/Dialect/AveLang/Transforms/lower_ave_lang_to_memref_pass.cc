@@ -307,10 +307,6 @@ std::optional<BaseMemRefInfo> findBaseI8Memref(mlir::Value value,
             return std::nullopt;
         }
 
-        if (memrefType.getElementType().isInteger(8)) {
-            return BaseMemRefInfo{current, makeZero()};
-        }
-
         if (auto viewOp = current.getDefiningOp<mlir::memref::ViewOp>()) {
             auto source = viewOp.getSource();
             auto sourceType =
@@ -390,10 +386,8 @@ std::optional<BaseMemRefInfo> findBaseI8Memref(mlir::Value value,
             continue;
         }
 
-        if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(current)) {
-            if (memrefType.getElementType().isInteger(8)) {
-                return BaseMemRefInfo{blockArg, makeZero()};
-            }
+        if (memrefType.getElementType().isInteger(8)) {
+            return BaseMemRefInfo{current, makeZero()};
         }
 
         return std::nullopt;
@@ -421,7 +415,8 @@ mlir::LogicalResult lowerFunctionArgsToI8(mlir::ModuleOp module) {
             if (!totalBytes) {
                 func.emitError(
                     "cannot lower function argument with dynamic shape or "
-                    "unsupported element size");
+                    "unsupported element size: ")
+                    << memrefType;
                 return mlir::failure();
             }
 

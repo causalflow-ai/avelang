@@ -9,6 +9,7 @@ from avelang.testing import has_rocm
 
 
 BF16_BYTES = 2
+U32_BYTES = 4
 
 
 @avelang.jit
@@ -37,6 +38,20 @@ def kernel_store_x4_row_subview_rsrc(
     row_rsrc = S.amdgpu.make_rsrc(row_view, n * BF16_BYTES)
     zero = S.convert(0, S.u32)
     S.amdgpu.raw_buffer_store_x4(src[0], row_rsrc, zero, zero, 0)
+
+
+@avelang.jit
+def kernel_store_x4_u8_subview_rsrc(
+    src: S.Tensor((1, 4), S.u32),
+    out_ptr: S.Pointer(S.u8),
+    n: S.u32,
+    offset: S.u32,
+):
+    out_memref = S.make_tensor(out_ptr, S.u8, S.make_layout((n,), (1,)))
+    out_view = S.subview(out_memref, (offset,), (4 * U32_BYTES,), (1,))
+    out_rsrc = S.amdgpu.make_rsrc(out_view, 4 * U32_BYTES)
+    zero = S.convert(0, S.u32)
+    S.amdgpu.raw_buffer_store_x4(src[0], out_rsrc, zero, zero, 0)
 
 
 @unittest.skipUnless(
@@ -72,6 +87,19 @@ class TestAMDGPUBufferStoreSubview(unittest.TestCase):
             torch.equal(out_subview[0].cpu(), torch.zeros_like(expected)),
             f"Subview-backed descriptor wrote the wrong row:\n{out_subview.cpu()}",
         )
+
+    def test_u8_subview_rsrc_honors_subview_offset(self):
+        values = torch.arange(1, 17, dtype=torch.uint8, device="cuda")
+        words = values.view(torch.int32).view(1, 4).view(torch.uint32)
+        output = torch.zeros(32, dtype=torch.uint8, device="cuda")
+
+        kernel_store_x4_u8_subview_rsrc[
+            lambda: ((1, 1, 1), (1, 1, 1))
+        ](words, output, output.numel(), 8)
+
+        expected = torch.zeros_like(output)
+        expected[8:24] = values
+        self.assertTrue(torch.equal(output.cpu(), expected.cpu()))
 
 
 if __name__ == "__main__":
