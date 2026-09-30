@@ -423,22 +423,11 @@ class AmdgpuDriver(GPUDriver):
         if not cls.is_active():
             raise RuntimeError("No HIP device available for AmdgpuDriver.")
 
-        arch = "gfx90a"
+        # Query the selected device directly. Product names and a fixed list
+        # of architectures miss newer GPUs such as gfx950 (MI350).
+        import torch
 
-        try:
-            result = subprocess.check_output(["rocm-smi", "--showproductname"], stderr=subprocess.DEVNULL).decode()
-            lowered = result.lower()
-            if "gfx906" in lowered:
-                arch = "gfx906"
-            elif "gfx908" in lowered:
-                arch = "gfx908"
-            elif "gfx90a" in lowered:
-                arch = "gfx90a"
-            if "gfx942" in lowered:
-                arch = "gfx942"
-            elif "gfx1100" in lowered:
-                arch = "gfx1100"
-        except subprocess.CalledProcessError:
-            pass  # Use default arch if detection fails
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = props.gcnArchName.split(":", 1)[0]
 
         return GPUTarget("amdgcn-amd-amdhsa", arch)

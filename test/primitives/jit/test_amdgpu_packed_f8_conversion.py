@@ -14,7 +14,7 @@ SUPPORTED_ARCHES = {"gfx940", "gfx941", "gfx942", "gfx950"}
 def supports_packed_f8_conversion() -> bool:
     if not has_rocm():
         return False
-    props = torch.cuda.get_device_properties(0)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = str(getattr(props, "gcnArchName", "")).split(":", 1)[0]
     return arch in SUPPORTED_ARCHES
 
@@ -38,7 +38,7 @@ def packed_pair(src_a: torch.Tensor, src_b: torch.Tensor, dtype: torch.dtype) ->
 
 @unittest.skipUnless(
     supports_packed_f8_conversion(),
-    "Requires a gfx940/gfx941/gfx942 ROCm GPU.",
+    "Requires a gfx940/gfx941/gfx942/gfx950 ROCm GPU.",
 )
 class TestAMDGPUPackedF8Conversion(unittest.TestCase):
     def test_packed_fp8_and_bf8_conversion(self):
@@ -52,12 +52,21 @@ class TestAMDGPUPackedF8Conversion(unittest.TestCase):
             src_a, src_b, old, fp8_low, bf8_high
         )
 
+        # CDNA4 uses OCP FP8 encodings; CDNA3 uses FNUZ encodings with
+        # different exponent biases, even for ordinary values like 1 and 2.
+        props = torch.cuda.get_device_properties(src_a.device)
+        arch = props.gcnArchName.split(":", 1)[0]
+        if arch == "gfx950":
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fn, torch.float8_e5m2
+        else:
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fnuz, torch.float8_e5m2fnuz
+
         old_bits = old.item() & 0xFFFFFFFF
         expected_fp8_low = (old_bits & 0xFFFF0000) | packed_pair(
-            src_a, src_b, torch.float8_e4m3fnuz
+            src_a, src_b, fp8_dtype
         )
         expected_bf8_high = (old_bits & 0x0000FFFF) | (
-            packed_pair(src_a, src_b, torch.float8_e5m2fnuz) << 16
+            packed_pair(src_a, src_b, bf8_dtype) << 16
         )
 
         self.assertEqual(fp8_low.item() & 0xFFFFFFFF, expected_fp8_low)
