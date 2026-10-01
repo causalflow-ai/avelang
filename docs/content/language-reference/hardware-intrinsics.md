@@ -143,7 +143,9 @@ al.amdgpu.s_waitcnt(0, 7, 15)
 al.amdgpu.sched_group_barrier(2, 4, 1)
 ```
 
-`al.amdgpu.raw_buffer_load_x1_lds(...)` is the lower-level direct-to-LDS raw-buffer load wrapper. It is intended for carefully scheduled pipelines and requires compile-time constant size and offset arguments.
+`al.amdgpu.raw_buffer_load_x1_lds(rsrc, lds_ptr, size, vindex, soffset, offset, aux)` loads one dword (4 bytes) per lane directly into LDS and requires compile-time `size=4`. The corresponding `raw_buffer_load_x4_lds(...)` loads four dwords (16 bytes) per lane and requires compile-time `size=16`. Both require compile-time `aux` in `[0, 31]`; cache-control bits must be supported by the target architecture. `offset` is a byte offset added to the LDS pointer and may be computed at runtime. The LDS base must be uniform within each wave; hardware adds the lane offset for the selected transfer width.
+
+The 16-byte operation requires gfx950. Wait for the loads with `al.amdgpu.s_waitcnt(0, 0, 0)` before reading LDS, and use `al.syncthreads()` when other waves consume the data.
 
 ## NVVM
 

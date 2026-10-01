@@ -14,6 +14,12 @@ from avelang.compiler.code_generator import (
 from avelang.testing import has_rocm
 
 
+def has_arch(*arches):
+    return has_rocm() and (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] in arches
+    )
+
+
 @avelang.jit
 def store_scattered_bytes(dst: S.Tensor((512,), S.u8), aux: S.constexpr):
     lane = S.convert(S.thread_id(0), S.u32)
@@ -67,6 +73,31 @@ def kernel_amdgpu_readfirstlane(out: S.Tensor((128,), S.i32)):
     tid = S.thread_id(0)
     tid_i32 = S.convert(tid, S.i32)
     out[tid] = S.amdgpu.readfirstlane(tid_i32)
+
+
+@avelang.jit
+def copy_to_lds_4(src: S.Tensor((256,), S.u32), out: S.Tensor((256,), S.u32), aux: S.constexpr):
+    tid = S.thread_id(0)
+    wave = S.amdgpu.readfirstlane(S.convert(tid // 64, S.u32))
+    storage = S.make_shared((256,), S.u32)
+    resource = S.amdgpu.make_rsrc(src, 1024)
+    S.amdgpu.raw_buffer_load_x1_lds(resource, storage, 4, S.convert(tid * 4, S.u32), 0, wave * 256, aux)
+    S.amdgpu.s_waitcnt(0, 0, 0)
+    S.syncthreads()
+    out[tid] = storage[(tid + 64) % 256]
+
+
+@avelang.jit
+def copy_to_lds_16(src: S.Tensor((256, 4), S.u32), out: S.Tensor((256, 4), S.u32), aux: S.constexpr):
+    tid = S.thread_id(0)
+    wave = S.amdgpu.readfirstlane(S.convert(tid // 64, S.u32))
+    storage = S.make_shared((1024,), S.u32)
+    resource = S.amdgpu.make_rsrc(src, 4096)
+    S.amdgpu.raw_buffer_load_x4_lds(resource, storage, 16, S.convert(tid * 16, S.u32), 0, wave * 1024, aux)
+    S.amdgpu.s_waitcnt(0, 0, 0)
+    S.syncthreads()
+    values = S.view(storage, S.u32, S.make_layout((256, 4), (4, 1)))
+    out[tid] = values[(tid + 64) % 256]
 
 
 def generate_mlir(jit_fn) -> str:
@@ -133,6 +164,24 @@ class TestAMDGPUBufferOps(unittest.TestCase):
             torch.equal(dst.cpu(), src.cpu()),
             f"Expected: {src.tolist()}, Actual: {dst.tolist()}",
         )
+
+    @unittest.skipUnless(has_arch("gfx942", "gfx950"), "4-byte LDS transfer test requires gfx942 or gfx950")
+    def test_4_byte_lds_copy_and_cross_wave_visibility(self):
+        src = torch.arange(256, device="cuda", dtype=torch.int32)
+        for aux in (0, 16, 17):
+            with self.subTest(aux=aux):
+                out = torch.empty_like(src)
+                copy_to_lds_4[lambda: ((1, 1, 1), (256, 1, 1))](src, out, aux)
+                torch.testing.assert_close(out, src.roll(-64, 0), rtol=0, atol=0)
+
+    @unittest.skipUnless(has_arch("gfx950"), "16-byte LDS transfers require gfx950")
+    def test_16_byte_lds_copy_and_cross_wave_visibility(self):
+        src = torch.arange(1024, device="cuda", dtype=torch.int32).reshape(256, 4)
+        for aux in (0, 16, 17):
+            with self.subTest(aux=aux):
+                out = torch.empty_like(src)
+                copy_to_lds_16[lambda: ((1, 1, 1), (256, 1, 1))](src, out, aux)
+                torch.testing.assert_close(out, src.roll(-64, 0), rtol=0, atol=0)
 
     def test_readfirstlane(self):
         out = torch.full((128,), -1, dtype=torch.int32, device="cuda")

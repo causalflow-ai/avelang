@@ -16,15 +16,6 @@ module {
     return
   }
 
-  func.func private @_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32(%arg0: vector<4xi32>, %arg1: index, %arg2: i32, %arg3: i32) attributes {func.inline = "always"} {
-    %ptr_i64 = arith.index_cast %arg1 : index to i64
-    %llvm_ptr = llvm.inttoptr %ptr_i64 : i64 to !llvm.ptr<3>
-    %c4_i32 = arith.constant 4 : i32
-    %c0_i32 = arith.constant 0 : i32
-    llvm.call_intrinsic "llvm.amdgcn.raw.buffer.load.lds"(%arg0, %llvm_ptr, %c4_i32, %arg2, %arg3, %c0_i32, %c0_i32) : (vector<4xi32>, !llvm.ptr<3>, i32, i32, i32, i32, i32) -> ()
-    return
-  }
-
   func.func private @_avelang_amdgpu_rocdl_mfma_f32_16x16x16_f16(%arg0: vector<2xi32>, %arg1: vector<2xi32>, %arg2: vector<4xf32>) -> vector<4xf32> attributes {func.inline = "always"} {
     %a_f16 = vector.bitcast %arg0 : vector<2xi32> to vector<4xf16>
     %b_f16 = vector.bitcast %arg1 : vector<2xi32> to vector<4xf16>
