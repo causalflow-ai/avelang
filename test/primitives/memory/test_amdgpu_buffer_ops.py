@@ -15,6 +15,14 @@ from avelang.testing import has_rocm
 
 
 @avelang.jit
+def store_scattered_bytes(dst: S.Tensor((512,), S.u8), aux: S.constexpr):
+    lane = S.convert(S.thread_id(0), S.u32)
+    resource = S.amdgpu.make_rsrc(dst, 256)
+    # Byte 1 of each word; lanes >=64 fall outside the descriptor.
+    S.amdgpu.raw_buffer_store_u8(S.convert(lane + 128, S.u8), resource, lane * 4, 1, aux)
+
+
+@avelang.jit
 def kernel_amdgpu_raw_buffer_roundtrip(
     src: S.Tensor((7,), S.i32),
     dst: S.Tensor((7,), S.i32),
@@ -81,6 +89,15 @@ def generate_mlir(jit_fn) -> str:
     "Requires ROCm/HIP with an AMD GPU.",
 )
 class TestAMDGPUBufferOps(unittest.TestCase):
+    def test_byte_store_preserves_neighbors_and_obeys_resource_bounds(self):
+        for aux in (0, 16, 17):
+            with self.subTest(aux=aux):
+                dst = torch.full((512,), 37, dtype=torch.uint8, device="cuda")
+                store_scattered_bytes[lambda: ((1, 1, 1), (128, 1, 1))](dst, aux)
+                expected = torch.full_like(dst, 37)
+                expected[1:256:4] = torch.arange(128, 192, dtype=torch.uint8, device="cuda")
+                torch.testing.assert_close(dst, expected, rtol=0, atol=0)
+
     def test_raw_buffer_roundtrip(self):
         src = torch.arange(7, dtype=torch.int32, device="cuda") * 17 - 9
         dst = torch.full((7,), -1, dtype=torch.int32, device="cuda")
