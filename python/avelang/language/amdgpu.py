@@ -47,6 +47,11 @@ def get_dpp(old, src, dpp_ctrl, row_mask, bank_mask, bound_ctrl):
     pass
 
 
+def ds_swizzle(value, pattern):
+    """Permute i32 lanes using a constant AMD DS swizzle pattern."""
+    pass
+
+
 def rcp(value):
     pass
 

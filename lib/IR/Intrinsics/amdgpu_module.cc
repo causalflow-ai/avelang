@@ -120,6 +120,9 @@ class AMDGPUIntrinsic : public NamedModule {
     CreateGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                          llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
+    CreateDsSwizzleFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
     CreateRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                       llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
@@ -191,6 +194,9 @@ class AMDGPUIntrinsic : public NamedModule {
         llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                              llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckDsSwizzleFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSWaitcntFunction(ast::Call *call_expr, GeneratorContext *ctx,
@@ -280,6 +286,17 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckGetDppFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "ds_swizzle",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateDsSwizzleFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckDsSwizzleFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -821,6 +838,21 @@ mlir::Value AMDGPUIntrinsic::CreateMakeRsrcFunction(
         llvm::SmallVector<mlir::OpFoldResult>{builder.getI64IntegerAttr(3)});
 
     return rsrc;
+}
+
+mlir::Value AMDGPUIntrinsic::CreateDsSwizzleFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto pattern = ConstantFolder::FoldIntValue(resolved_args[1]);
+    SS_ASSERT(pattern && *pattern >= 0 && *pattern <= 65535);
+    auto offset = mlir::arith::ConstantIntOp::create(
+        builder, location, *pattern, 32);
+    auto op = mlir::ROCDL::DsSwizzleOp::create(
+        builder, location, builder.getI32Type(), resolved_args[0], offset);
+    SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
+    return op.getResult();
 }
 
 mlir::Value AMDGPUIntrinsic::CreateRcpFunction(
@@ -1448,6 +1480,29 @@ bool AMDGPUIntrinsic::CheckMakeRsrcFunction(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckDsSwizzleFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
+        !resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "ds_swizzle() requires exactly two arguments: value, pattern";
+        return false;
+    }
+
+    auto pattern = ConstantFolder::FoldIntValue(resolved_args[1]);
+    if (!resolved_args[0].getType().isInteger(32) || !pattern ||
+        *pattern < 0 || *pattern > 65535) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "ds_swizzle() expects a 32-bit integer value and a "
+               "compile-time pattern in [0, 65535]";
+        return false;
+    }
     return true;
 }
 
