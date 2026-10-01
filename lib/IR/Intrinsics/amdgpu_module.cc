@@ -114,6 +114,9 @@ class AMDGPUIntrinsic : public NamedModule {
     CreatePermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
+    CreateBitReverseFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
     CreateGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                          llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
@@ -183,6 +186,9 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckPermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckBitReverseFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                              llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
@@ -252,6 +258,17 @@ void AMDGPUIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckPermFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "bitreverse",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateBitReverseFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckBitReverseFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -910,6 +927,17 @@ mlir::Value AMDGPUIntrinsic::CreatePermFunction(
     return callOp.getResult(0);
 }
 
+mlir::Value AMDGPUIntrinsic::CreateBitReverseFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto op = mlir::LLVM::BitReverseOp::create(builder, location,
+                                              resolved_args[0]);
+    SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
+    return op.getResult();
+}
+
 mlir::Value AMDGPUIntrinsic::CreateGetDppFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -1536,6 +1564,27 @@ bool AMDGPUIntrinsic::CheckPermFunction(
         }
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckBitReverseFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1 ||
+        !resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "bitreverse() requires exactly one argument";
+        return false;
+    }
+
+    auto type = mlir::dyn_cast<mlir::IntegerType>(resolved_args[0].getType());
+    if (!type || type.getWidth() != 32) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "bitreverse() expects a 32-bit integer";
+        return false;
+    }
     return true;
 }
 
