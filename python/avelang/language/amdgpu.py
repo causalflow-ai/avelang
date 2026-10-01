@@ -72,6 +72,12 @@ def raw_buffer_load_x4(rsrc, vindex, soffset, aux):
 
 
 def raw_buffer_load_x1_lds(rsrc, lds_ptr, size, vindex, soffset, offset, aux):
+    """Load one dword (4 bytes) per lane into LDS; size must be 4."""
+    pass
+
+
+def raw_buffer_load_x4_lds(rsrc, lds_ptr, size, vindex, soffset, offset, aux):
+    """Load four dwords (16 bytes) per lane into LDS; size must be 16."""
     pass
 
 
