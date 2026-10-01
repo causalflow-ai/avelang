@@ -107,6 +107,14 @@ def raw_buffer_store_x4(vdata, rsrc, vindex, soffset, aux):
     pass
 
 
+def cvt_pk_f16_f32(src0, src1):
+    pass
+
+
+def cvt_pk_bf16_f32(src0, src1):
+    pass
+
+
 def cvt_pk_fp8_f32(src0, src1, old, word_sel):
     pass
 

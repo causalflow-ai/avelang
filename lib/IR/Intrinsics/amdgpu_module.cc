@@ -149,6 +149,12 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateCvtPkBf8F32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtPkF16F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtPkBf16F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
     CreateSetPrioFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -217,6 +223,10 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckCvtPkF8F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args,
+        llvm::StringRef intrinsic_name) const;
+    bool CheckCvtPk16F32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args,
         llvm::StringRef intrinsic_name) const;
@@ -488,6 +498,32 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckGlobalAtomicAddFunction(call_expr, gen_ctx,
                                                 resolved_args);
+        });
+
+    AddFunction(
+        "cvt_pk_f16_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtPkF16F32Function(
+                call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtPk16F32Function(
+                call_expr, gen_ctx, resolved_args, "cvt_pk_f16_f32");
+        });
+
+    AddFunction(
+        "cvt_pk_bf16_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtPkBf16F32Function(
+                call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtPk16F32Function(
+                call_expr, gen_ctx, resolved_args, "cvt_pk_bf16_f32");
         });
 
     AddFunction(
@@ -1092,6 +1128,27 @@ mlir::Value CreateCvtPkF8F32(ast::Call *call_expr, GeneratorContext *ctx,
     SetTypeInfo(op.getResult(), TypeInfo{true});
     return op.getResult();
 }
+
+template <typename DstType>
+mlir::Value CreateCvtPk16F32(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto elementType = DstType::get(builder.getContext());
+    auto pair = mlir::vector::FromElementsOp::create(
+        builder, location, mlir::VectorType::get({2}, builder.getF32Type()),
+        resolved_args);
+    auto converted = mlir::arith::TruncFOp::create(
+        builder, location, mlir::VectorType::get({2}, elementType), pair);
+    auto words = mlir::vector::BitCastOp::create(
+        builder, location, mlir::VectorType::get({1}, builder.getI32Type()),
+        converted);
+    auto result = mlir::vector::ExtractOp::create(
+        builder, location, words, llvm::ArrayRef<int64_t>{0});
+    SetTypeInfo(result.getResult(), TypeInfo{true});
+    return result;
+}
 } // namespace
 
 mlir::Value AMDGPUIntrinsic::CreateCvtPkFp8F32Function(
@@ -1106,6 +1163,18 @@ mlir::Value AMDGPUIntrinsic::CreateCvtPkBf8F32Function(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateCvtPkF8F32<mlir::ROCDL::CvtPkBf8F32Op>(
         call_expr, ctx, resolved_args);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateCvtPkF16F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateCvtPk16F32<mlir::Float16Type>(call_expr, ctx, resolved_args);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateCvtPkBf16F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateCvtPk16F32<mlir::BFloat16Type>(call_expr, ctx, resolved_args);
 }
 
 mlir::Value AMDGPUIntrinsic::CreateSetPrioFunction(
@@ -1816,6 +1885,27 @@ bool AMDGPUIntrinsic::CheckCvtPkF8F32Function(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckCvtPk16F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    llvm::StringRef intrinsic_name) const {
+    if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
+        !resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name << "() requires exactly 2 arguments: src0, src1";
+        return false;
+    }
+    if (!resolved_args[0].getType().isF32() ||
+        !resolved_args[1].getType().isF32()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << intrinsic_name << "() expects src0 and src1 to be f32 scalars";
+        return false;
+    }
     return true;
 }
 

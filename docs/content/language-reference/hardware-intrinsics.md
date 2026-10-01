@@ -120,6 +120,11 @@ in `[0, 15]`, and `bound_ctrl` is `0` or `1`.
 shifted = al.amdgpu.get_dpp(value, value, 0x101, 0xF, 0xF, 1)
 ```
 
+`al.amdgpu.cvt_pk_f16_f32(src0, src1)` and
+`al.amdgpu.cvt_pk_bf16_f32(src0, src1)` convert two scalar `f32` values
+to FP16 or BF16 using round-to-nearest-even and return a packed `u32`.
+`src0` occupies bits `[15:0]`; `src1` occupies bits `[31:16]`.
+
 `al.amdgpu.cvt_pk_fp8_f32(src_a, src_b, old, opsel)` and
 `al.amdgpu.cvt_pk_bf8_f32(src_a, src_b, old, opsel)` convert two scalar `f32`
 values into a packed FP8 or BF8 pair and return the resulting `u32` word.
