@@ -1041,8 +1041,8 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferLoadFunction(
     auto location = GetCallLocation(ctx, call_expr);
 
     auto rsrc = resolved_args[0];
-    auto vindex = resolved_args[1];
-    auto soffset = resolved_args[2];
+    auto vindex = ConvertToI32(builder, location, resolved_args[1]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[2]);
     auto aux = resolved_args[3];
 
     mlir::Type result_type;
@@ -1071,10 +1071,12 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferStoreFunction(
 
     auto vdata = resolved_args[0];
     auto rsrc = resolved_args[1];
-    auto vindex = resolved_args[2];
-    auto soffset = resolved_args[3];
+    auto vindex = ConvertToI32(builder, location, resolved_args[2]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[3]);
     auto aux = resolved_args[4];
 
+    if (width == 1)
+        vdata = ConvertToI32(builder, location, vdata);
     auto vdata_type = vdata.getType();
 
     if (width > 1) {

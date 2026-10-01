@@ -23,15 +23,16 @@ def kernel_amdgpu_raw_buffer_roundtrip(
     src_rsrc = S.amdgpu.make_rsrc(src, range_bytes)
     dst_rsrc = S.amdgpu.make_rsrc(dst, range_bytes)
 
-    zero = S.convert(0, S.i32)
-    offset_x2 = S.convert(4, S.i32)
-    offset_x4 = S.convert(12, S.i32)
+    # Buffer offsets use the low 32 bits of these wider values.
+    zero = S.convert(0x100000000, S.u64)
+    offset_x2 = S.convert(0x100000004, S.u64)
+    offset_x4 = S.convert(0x10000000C, S.u64)
 
     value_x1 = S.amdgpu.raw_buffer_load_x1(src_rsrc, zero, zero, 0)
     value_x2 = S.amdgpu.raw_buffer_load_x2(src_rsrc, zero, offset_x2, 0)
     value_x4 = S.amdgpu.raw_buffer_load_x4(src_rsrc, zero, offset_x4, 0)
 
-    S.amdgpu.raw_buffer_store_x1(value_x1, dst_rsrc, zero, zero, 0)
+    S.amdgpu.raw_buffer_store_x1(S.convert(value_x1, S.u64), dst_rsrc, zero, zero, 0)
     S.amdgpu.raw_buffer_store_x2(value_x2, dst_rsrc, zero, offset_x2, 0)
     S.amdgpu.raw_buffer_store_x4(value_x4, dst_rsrc, zero, offset_x4, 0)
 
