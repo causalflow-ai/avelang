@@ -155,6 +155,7 @@ class DependenciesFinder(ast.NodeVisitor):
         # functions.  Thus this map is actually
         #  (var_name, id(__globals__)) -> (var_value, __globals__).
         self.used_global_vals: Dict[Tuple[str, int], Tuple[Any, Dict[str, Any]]] = {}
+        self.direct_global_names = set()
 
         self.visiting_arg_default_value = False
         self._locals_stack = []
@@ -274,6 +275,7 @@ class DependenciesFinder(ast.NodeVisitor):
             except Exception:
                 stored_val = val
             self.used_global_vals[(name, id(var_dict))] = (stored_val, var_dict)
+            self.direct_global_names.add(name)
         return
 
     def visit_Name(self, node):
@@ -542,6 +544,7 @@ class JITCallable:
         # key is actually (var name, id(__globals__)), and the map value is
         # (value, __globals__).
         self.used_global_vals: Dict[Tuple[str, int], Tuple[Any, Dict[str, Any]]] = {}
+        self._direct_global_names = set()
 
     def get_capture_scope(self):
         fn = self.fn
@@ -566,6 +569,7 @@ class JITCallable:
             dependencies_finder.visit(self.parse())
             self.hash = dependencies_finder.ret + str(self.starting_line_number)
             self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
+            self._direct_global_names = dependencies_finder.direct_global_names
 
             from ..language.core import constexpr
 
@@ -604,6 +608,7 @@ class JITCallable:
         self._src = new_src
         self.hash = None
         self.used_global_vals = {}
+        self._direct_global_names = set()
 
     src = property(fget=_get_src, fset=_set_src)
 
@@ -734,9 +739,11 @@ class JITFunction(JITCallable, KernelInterface[T]):
         _ = self.cache_key
         constexprs = {}
         skip = set(skip_names or [])
-        for (name, _), (value, _) in self.used_global_vals.items():
-            if name in skip:
+        scope = self.get_capture_scope()
+        for name in sorted(self._direct_global_names):
+            if name in skip or name not in scope:
                 continue
+            value = scope[name]
             if hasattr(value, "value"):
                 value = value.value
             try:

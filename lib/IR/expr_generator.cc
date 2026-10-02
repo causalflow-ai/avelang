@@ -1600,8 +1600,11 @@ mlir::Value ExprGenerator::GenerateJitFunctionCall(
             auto dep_it = impl.jit_function_deps_.find(name);
             if (dep_it != impl.jit_function_deps_.end() &&
                 dep_it->second == func) {
-                sym_guard =
-                    ctx->GetSymbolTableGuard(impl.module_syms_->Clone());
+                auto captures = impl.jit_function_syms_.find(name);
+                auto *symbols = captures == impl.jit_function_syms_.end()
+                                    ? impl.module_syms_.get()
+                                    : captures->second.get();
+                sym_guard = ctx->GetSymbolTableGuard(symbols->Clone());
             }
         }
         mlir::OpBuilder::InsertionGuard guard(parent_->GetBuilder());

@@ -169,7 +169,7 @@ class MLIRGeneratorImpl {
     mlir::ModuleOp Generate(ast::ASTNode *root);
     void RegisterJitDependency(ast::FunctionDef *func);
     void InitializeSymbolTable();
-    void SnapshotModuleSymbolTable();
+    void SnapshotModuleSymbolTable(ast::FunctionDef *func = nullptr);
 
   private:
     friend class ExprGenerator;
@@ -195,6 +195,8 @@ class MLIRGeneratorImpl {
     mlir::ModuleOp module_;
     std::unordered_map<std::string, ast::FunctionDef *> jit_function_deps_;
     std::unordered_map<std::string, mlir::func::FuncOp> jit_function_ops_;
+    std::unordered_map<std::string, std::unique_ptr<SymbolTable>>
+        jit_function_syms_;
     std::unique_ptr<SymbolTable> module_syms_;
     NamedModuleRegistry named_module_registry_;
 

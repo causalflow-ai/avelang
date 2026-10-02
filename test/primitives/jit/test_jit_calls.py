@@ -6,6 +6,9 @@ import avelang
 import avelang.language as S
 
 
+CAPTURED_BLOCK = 128
+
+
 def helper(x):
     return x + 1
 
@@ -75,6 +78,28 @@ class TestJitCalls(unittest.TestCase):
             torch.allclose(actual, expected),
             f"Expected: {expected.tolist()}, Actual: {actual.tolist()}",
         )
+
+    def test_helper_uses_own_capture_scope(self):
+        def make_helper(OFFSET):
+            @avelang.jit
+            def captured_helper(extra: S.constexpr) -> S.i32:
+                return OFFSET + extra + CAPTURED_BLOCK
+
+            return captured_helper
+
+        captured_helper = make_helper(7)
+        _ = captured_helper.cache_key
+        OFFSET = 100
+
+        @avelang.jit
+        def kernel(out: S.Tensor((2,), S.i32)):
+            CAPTURED_BLOCK = 64
+            out[0] = captured_helper(OFFSET)
+            out[1] = OFFSET + CAPTURED_BLOCK
+
+        out = torch.empty(2, dtype=torch.int32, device="cuda")
+        kernel[lambda: ((1, 1, 1), (1, 1, 1))](out)
+        self.assertEqual(out.cpu().tolist(), [235, 164])
 
     def test_nested_function_shadows_global(self):
         @avelang.jit

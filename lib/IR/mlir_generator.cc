@@ -193,10 +193,11 @@ MLIRGenerator::VisitFunctionDefWithType(ast::FunctionDef *func,
         return llvm::Error::success();
 
     CreateModule();
-
+    SymbolTable::FrameGuard constants_scope(ctx_->syms.get());
     if (auto E = InjectConstexprs(constexprs_json))
         return E;
-    impl_->SnapshotModuleSymbolTable();
+    impl_->SnapshotModuleSymbolTable(
+        func_type == FunctionType::kPrivateFunction ? func : nullptr);
 
     if (func_type == FunctionType::kPrivateFunction) {
         if (auto *args = func->GetArguments()) {
@@ -324,11 +325,14 @@ void MLIRGeneratorImpl::InitializeSymbolTable() {
     ctx_->syms->Initialize();
 }
 
-void MLIRGeneratorImpl::SnapshotModuleSymbolTable() {
+void MLIRGeneratorImpl::SnapshotModuleSymbolTable(ast::FunctionDef *func) {
     if (!ctx_ || !ctx_->syms) {
         return;
     }
     module_syms_ = ctx_->syms->Clone();
+    // Lazy specialization must resolve captures in the helper's own scope.
+    if (func)
+        jit_function_syms_[func->GetName()] = module_syms_->Clone();
 }
 
 void MLIRGeneratorImpl::HandleImport(ast::Import *import_stmt) {
