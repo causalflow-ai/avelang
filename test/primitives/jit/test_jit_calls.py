@@ -79,6 +79,27 @@ class TestJitCalls(unittest.TestCase):
             f"Expected: {expected.tolist()}, Actual: {actual.tolist()}",
         )
 
+    def test_tensor_slice_arguments(self):
+        @avelang.jit
+        def set_pair(pair: S.Tensor((2,), S.u32), value: S.u32) -> S.Tensor((2,), S.u32):
+            pair[0] = value
+            pair[1] = value + 1
+            return pair
+
+        @avelang.jit
+        def kernel(out: S.Tensor((4, 2), S.u32), row: S.u32):
+            local = S.make_local((2, 2), S.u32)
+            shared = S.make_shared((2, 2), S.u32)
+            set_pair(local[row], 21)
+            set_pair(shared[row], 31)
+            out[0] = local[row]
+            out[2] = shared[row]
+            out[3] = set_pair(set_pair(out[row], 11), 41)
+
+        out = torch.empty((4, 2), dtype=torch.int32, device="cuda")
+        kernel[lambda: ((1, 1, 1), (1, 1, 1))](out, 1)
+        self.assertEqual(out.cpu().tolist(), [[21, 22], [11, 12], [31, 32], [41, 42]])
+
     def test_helper_uses_own_capture_scope(self):
         def make_helper(OFFSET):
             @avelang.jit

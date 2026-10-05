@@ -128,23 +128,36 @@ ResolveCallerArgs(ExprGenerator *gen, ast::Call *call, ast::FunctionDef *callee,
             continue;
         }
 
-        result.runtime_exprs.push_back(argExpr);
-        result.runtime_values.push_back(value);
-
-        auto resolvedType =
-            value ? value.getType() : ctx->syms->ResolveType(annotation);
-        result.runtime_types.push_back(resolvedType);
-
         auto memrefType = value
                               ? mlir::dyn_cast<cf::MemRefType>(value.getType())
                               : cf::MemRefType();
+        auto targetType = memrefType ? mlir::Type()
+                                    : ctx->syms->ResolveType(annotation);
+        if (targetType && mlir::isa<cf::MemRefType>(targetType)) {
+            if (llvm::isa<ast::Subscript>(argExpr)) {
+                if (auto memref = gen->GetParent()->ResolveMemrefValue(argExpr)) {
+                    value = memref;
+                }
+            }
+            value = gen->CastTensorVector(
+                value, targetType, argExpr->GetSourceRange().getBegin());
+            memrefType = value
+                             ? mlir::dyn_cast<cf::MemRefType>(value.getType())
+                             : cf::MemRefType();
+        }
+
+        result.runtime_exprs.push_back(argExpr);
+        result.runtime_values.push_back(value);
+
+        auto resolvedType = value ? value.getType() : targetType;
+        result.runtime_types.push_back(resolvedType);
+
         if (memrefType) {
             result.address_spaces.emplace(calleeArg->GetArgName(),
                                           memrefType.getMemorySpace());
             continue;
         }
 
-        auto targetType = ctx->syms->ResolveType(annotation);
         if (targetType && mlir::isa<cf::MemRefType>(targetType)) {
             result.address_spaces.emplace(calleeArg->GetArgName(),
                                           GetPrivateAddressSpace(builder));
@@ -1492,13 +1505,13 @@ mlir::Value ExprGenerator::GenerateFuncCallWithArgs(
         }
         auto *arg_expr = arg_exprs[i];
         auto expected_type = input_types[i];
-        mlir::Value arg_value;
+        auto arg_value = resolved_args[i];
 
-        if (mlir::isa<cf::MemRefType>(expected_type)) {
-            arg_value = parent_->ResolveMemrefValue(arg_expr);
-        }
-        if (!arg_value) {
-            arg_value = resolved_args[i];
+        if (mlir::isa<cf::MemRefType>(expected_type) &&
+            (!arg_value || !mlir::isa<cf::MemRefType>(arg_value.getType()))) {
+            if (auto memref = parent_->ResolveMemrefValue(arg_expr)) {
+                arg_value = memref;
+            }
         }
         if (!arg_value) {
             Report(this, basic::DiagnosticCode::kUnimplemented,
