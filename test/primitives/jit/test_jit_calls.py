@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import unittest
 
 import torch
@@ -75,6 +76,21 @@ class TestJitCalls(unittest.TestCase):
             torch.allclose(actual, expected),
             f"Expected: {expected.tolist()}, Actual: {actual.tolist()}",
         )
+
+    def test_factory_tensor_annotations(self):
+        def make_identity(size):
+            @avelang.jit
+            def identity(values: S.Tensor((size,), S.u32)) -> S.Tensor((size,), S.u32):
+                return values
+
+            return identity
+
+        identities = [make_identity(size) for size in (5, 9)]
+        for size, identity in zip((5, 9), identities):
+            function = identity.parse().body[0]
+            self.assertEqual(ast.literal_eval(function.args.args[0].annotation.args[0]), (size,))
+            self.assertEqual(ast.literal_eval(function.returns.args[0]), (size,))
+        self.assertNotEqual(identities[0].cache_key, identities[1].cache_key)
 
     def test_nested_function_shadows_global(self):
         @avelang.jit
