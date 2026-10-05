@@ -101,6 +101,33 @@ class TestJitCalls(unittest.TestCase):
         kernel[lambda: ((1, 1, 1), (1, 1, 1))](out)
         self.assertEqual(out.cpu().tolist(), [235, 164])
 
+    def test_factory_tensor_annotations(self):
+        def make_identity(size):
+            @avelang.jit
+            def identity(values: S.Tensor((size,), S.u32)) -> S.Tensor((size,), S.u32):
+                return values
+
+            return identity
+
+        identities = [make_identity(size) for size in (5, 9)]
+        self.assertNotEqual(identities[0].cache_key, identities[1].cache_key)
+        for size, identity in zip((5, 9), identities):
+            self.assertNotIn("size", identity.get_capture_scope())
+
+            @avelang.jit
+            def kernel(
+                values: S.Tensor((size,), S.u32),
+                out: S.Tensor((1,), S.u32),
+                index: S.u32,
+            ):
+                result = identity(values)
+                out[0] = result[index]
+
+            values = torch.arange(size, dtype=torch.int32, device="cuda") + 100
+            out = torch.empty(1, dtype=torch.int32, device="cuda")
+            kernel[lambda: ((1, 1, 1), (64, 1, 1))](values, out, size - 1)
+            self.assertEqual(out.item(), 99 + size)
+
     def test_nested_function_shadows_global(self):
         @avelang.jit
         def kernel_shadow(

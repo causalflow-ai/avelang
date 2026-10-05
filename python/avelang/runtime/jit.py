@@ -568,6 +568,7 @@ class JITCallable:
             )
             dependencies_finder.visit(self.parse())
             self.hash = dependencies_finder.ret + str(self.starting_line_number)
+            self.hash += repr(self._tensor_annotation_shapes())
             self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
             self._direct_global_names = dependencies_finder.direct_global_names
 
@@ -582,12 +583,32 @@ class JITCallable:
     def __hash__(self):
         return hash(self.cache_key)
 
+    def _tensor_annotation_shapes(self):
+        from ..language.core import Tensor
+
+        return {name: value.shape for name, value in self.fn.__annotations__.items() if isinstance(value, Tensor)}
+
     def parse(self):
         file_name, begin_line = get_jit_fn_file_line(self)
         padded_source = ("\n" * max(begin_line - 1, 0)) + self._src
         tree = ast.parse(self._src, filename=file_name)
         if begin_line > 1:
             tree = ast.increment_lineno(tree, begin_line - 1)
+        shapes = self._tensor_annotation_shapes()
+        function = tree.body[0]
+        annotations = [
+            (arg.arg, arg.annotation)
+            for arg in function.args.posonlyargs + function.args.args + function.args.kwonlyargs
+        ]
+        annotations.append(("return", function.returns))
+        for name, annotation in annotations:
+            if name in shapes and isinstance(annotation, ast.Call) and annotation.args:
+                shape = shapes[name]
+                if all(type(dim) is int for dim in shape):
+                    annotation.args[0] = ast.copy_location(
+                        ast.Tuple(elts=[ast.Constant(value=dim) for dim in shape], ctx=ast.Load()), annotation.args[0]
+                    )
+        tree = ast.fix_missing_locations(tree)
         tree = _attach_ast_source_metadata(tree, file_name, padded_source)
         assert isinstance(tree, ast.Module)
         assert len(tree.body) == 1
