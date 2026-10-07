@@ -1371,6 +1371,7 @@ mlir::Value AveLangModule::CreateMakeTensorFunction(
 
     auto castOp = cf::AveLangMemRefCastOp::create(builder, location, ptrValue,
                                                   layoutValue, resultType);
+    SetTypeInfo(castOp.getResult(), GetTypeInfo(args[1]));
     return castOp.getResult();
 }
 

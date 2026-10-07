@@ -4,6 +4,7 @@
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
 #include "IR/symbol_table.h"
+#include "IR/type_system.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
@@ -632,6 +633,37 @@ def kernel(out: al.Tensor((3,), al.i32), value: al.i32):
     out[2] = al.convert(boolean_helper(al.convert(value, al.u1)), al.i32)
 )",
                                      {"boolean_helper"});
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRMakeTensorPreservesSignedness) {
+    ast::ASTNode *root = nullptr;
+    TryParse(R"(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def kernel(ptr: al.Pointer(al.u32), out: al.Tensor((2,), al.i32)):
+    layout = al.make_layout((2,), (1,))
+    unsigned = al.make_tensor(ptr, al.u32, layout)
+    signed = al.make_tensor(ptr, al.i32, layout)
+    out[0] = al.convert(unsigned[0] >> 1, al.i32)
+    out[1] = signed[0] >> 1
+)",
+             &root);
+    ASSERT_NE(root, nullptr);
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+    unsigned unsigned_shifts = 0, signed_shifts = 0;
+    module.walk([&](mlir::arith::ShRUIOp) { ++unsigned_shifts; });
+    module.walk([&](mlir::arith::ShRSIOp) { ++signed_shifts; });
+    EXPECT_EQ(unsigned_shifts, 1u);
+    EXPECT_EQ(signed_shifts, 1u);
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRF32Tensor) {
@@ -1682,11 +1714,12 @@ def setprio_test():
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUReadFirstLane) {
     static const std::string kSourceCode = R"""""(
 import avelang
-import avelang.language as S
+import avelang.language as al
 
 @avelang.jit
-def readfirstlane_test(out: S.Tensor((1,), S.u32), value: S.u32):
-    out[0] = S.amdgpu.readfirstlane(value)
+def readfirstlane_test(out: al.Tensor((2,), al.u32), value: al.u32, signed_value: al.i32):
+    out[0] = al.amdgpu.readfirstlane(value) >> 1
+    out[1] = al.convert(al.amdgpu.readfirstlane(signed_value) >> 1, al.u32)
 )""""";
 
     ast::ASTNode *root;
@@ -1708,9 +1741,17 @@ def readfirstlane_test(out: S.Tensor((1,), S.u32), value: S.u32):
         found_readfirstlane = true;
         EXPECT_TRUE(op.getSrc().getType().isInteger(32));
         EXPECT_TRUE(op.getResult().getType().isInteger(32));
+        EXPECT_EQ(ir::GetTypeInfo(op.getResult()).is_unsigned_integer,
+                  ir::GetTypeInfo(op.getSrc()).is_unsigned_integer);
     });
 
     EXPECT_TRUE(found_readfirstlane);
+
+    unsigned unsigned_shifts = 0, signed_shifts = 0;
+    mlir.walk([&](mlir::arith::ShRUIOp) { ++unsigned_shifts; });
+    mlir.walk([&](mlir::arith::ShRSIOp) { ++signed_shifts; });
+    EXPECT_EQ(unsigned_shifts, 1u);
+    EXPECT_EQ(signed_shifts, 1u);
 
     mlir::PassManager pm(mlir.getContext());
     pm.addPass(mlir::createCanonicalizerPass());
