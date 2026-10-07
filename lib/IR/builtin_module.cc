@@ -524,6 +524,8 @@ void AveLangModule::Initialize() {
     AddType("bf16", builder.getBF16Type());
     AddType("f8e4m3fn", Float8E4M3FNType::get(builder.getContext()));
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
+    AddType("f8e5m2", Float8E5M2Type::get(builder.getContext()));
+    AddType("f8e5m2fnuz", Float8E5M2FNUZType::get(builder.getContext()));
 
     // FIXME: Constexpr type (placeholder, currently i32)
     AddType("constexpr", builder.getI32Type());
