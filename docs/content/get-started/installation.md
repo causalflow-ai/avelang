@@ -5,7 +5,7 @@ title: Installation guide
 
 ## Prerequisites
 
-- LLVM, MLIR, and Clang 22. For AMDGPU target we recommend using the [ROCm 7.2.x fork of LLVM](https://github.com/ROCm/llvm-project).
+- LLVM, MLIR, and Clang 23 from the ROCm [therock-10.0 release tag](https://github.com/ROCm/llvm-project/releases/tag/therock-10.0).
 - CMake 3.25 or newer
 - Ninja
 - Python 3.10 or newer
@@ -19,9 +19,9 @@ We recommend building Ave inside a [uv](https://docs.astral.sh/uv) Python virtua
 uv venv .venv
 source .venv/bin/activate
 CMAKE_ARGS='-DAVE_LANG_BACKEND=cuda -DWITH_PYTHON=ON \
-  -DCMAKE_C_COMPILER=/path/to/llvm22/bin/clang \
-  -DCMAKE_CXX_COMPILER=/path/to/llvm22/bin/clang++ \
-  -DCMAKE_PREFIX_PATH=/path/to/llvm22' uv pip install -e .
+  -DCMAKE_C_COMPILER=/path/to/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/path/to/llvm/bin/clang++ \
+  -DCMAKE_PREFIX_PATH=/path/to/llvm' uv pip install -e .
 ```
 
 For ROCm:
@@ -30,9 +30,9 @@ For ROCm:
 uv venv .venv
 source .venv/bin/activate
 CMAKE_ARGS="-DAVE_LANG_BACKEND=rocm -DWITH_PYTHON=ON \
-  -DCMAKE_C_COMPILER=/path/to/llvm22/bin/clang \
-  -DCMAKE_CXX_COMPILER=/path/to/llvm22/bin/clang++ \
-  -DCMAKE_PREFIX_PATH='/path/to/llvm22;/opt/rocm'" uv pip install -e .
+  -DCMAKE_C_COMPILER=/path/to/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/path/to/llvm/bin/clang++ \
+  -DCMAKE_PREFIX_PATH=/path/to/llvm;/opt/rocm" uv pip install -e .
 ```
 
 You should be able to run the python test via `python -m pytest test` once the build and installation are completed.

@@ -107,8 +107,7 @@ class GpuOutliningPass
                     mlir::TypeRange{}, // workgroup attributions
                     mlir::TypeRange{}  // private attributions
                 );
-                gpuFunc->setAttr(mlir::gpu::GPUDialect::getKernelFuncAttrName(),
-                                 builder.getUnitAttr());
+                gpuFunc.setKernel(true);
 
                 // Copy function body
                 mlir::IRMapping mapping;

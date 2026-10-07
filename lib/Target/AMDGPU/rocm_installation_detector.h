@@ -61,9 +61,9 @@ class RocmInstallationDetector {
     std::map<unsigned, std::string> ABIVersionMap;
 
     bool allGenericLibsValid() const {
-        return !OCML.empty() && !OCKL.empty() && WavefrontSize64.isValid() &&
-               FiniteOnly.isValid() && UnsafeMath.isValid() &&
-               DenormalsAreZero.isValid() && CorrectlyRoundedSqrt.isValid();
+        // Newer ROCm releases removed some conditional control libraries.
+        // Require only OCML, OCKL and wavefrontsize64; link others when present.
+        return !OCML.empty() && !OCKL.empty() && WavefrontSize64.isValid();
     }
 
     void scanLibDevicePath(llvm::StringRef Path);

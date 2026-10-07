@@ -96,10 +96,10 @@ class LLVMTargetTest : public ::testing::Test {
         auto module = mlir::parseSourceString<mlir::ModuleOp>(
             mlirCode, compiler.getContext());
         EXPECT_TRUE(module);
-        EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)));
         if (!module) {
             return nullptr;
         }
+        EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)));
 
         if (mlirDump) {
             llvm::raw_string_ostream mlirOs(*mlirDump);
@@ -425,7 +425,7 @@ TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     EXPECT_NE(llvmDump.find("addrspace(3) global [32 x i8] undef"),
               std::string::npos);
     EXPECT_NE(llvmDump.find(
-                  "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
+                  "store <2 x bfloat> <bfloat 1.000000e+00, bfloat 2.000000e+00>, "
                   "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
                   "align 16"),
               std::string::npos);
@@ -678,7 +678,9 @@ module {
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
 
-    EXPECT_NE(llvmDump.find("store <2 x i32>"), std::string::npos) << llvmDump;
+    EXPECT_TRUE(llvmDump.find("store <2 x i32>") != std::string::npos ||
+                llvmDump.find("store <4 x i32>") != std::string::npos)
+        << llvmDump;
 }
 #endif
 
