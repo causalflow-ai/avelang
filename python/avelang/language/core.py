@@ -1,8 +1,8 @@
 class dtype:
     SINT_TYPES = ["i8", "i16", "i32", "i64"]
     UINT_TYPES = ["u1", "u8", "u16", "u32", "u64"]
-    FP_TYPES = ["fp16", "bf16", "fp32", "fp64"]
     STANDARD_FP_TYPES = ["fp16", "bf16", "fp32", "fp64"]
+    FP_TYPES = STANDARD_FP_TYPES + ["f8e4m3fn", "f8e4m3fnuz", "f8e5m2", "f8e5m2fnuz"]
     OTHER_TYPES = ["void"]
 
     def __init__(self, name):
@@ -25,6 +25,10 @@ u32 = dtype("u32")
 u64 = dtype("u64")
 
 # Floating-point types
+f8e4m3fn = dtype("f8e4m3fn")
+f8e4m3fnuz = dtype("f8e4m3fnuz")
+f8e5m2 = dtype("f8e5m2")
+f8e5m2fnuz = dtype("f8e5m2fnuz")
 f16 = dtype("fp16")
 bf16 = dtype("bf16")
 f32 = dtype("fp32")
@@ -83,6 +87,11 @@ class constexpr:
 
 
 # Built-in functions for GPU kernels
+def convert(value, dtype):
+    """Numerically convert a scalar or vector to dtype, preserving its shape."""
+    pass
+
+
 def block_id(dim: int):
     """Get the block ID in the specified dimension."""
     pass

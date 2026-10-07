@@ -9,6 +9,7 @@ add_library(ave-lang-target-amdgpu
 
 target_link_libraries(ave-lang-target-amdgpu
   PRIVATE
+  MLIRArithToAMDGPU
   MLIRArithToLLVM
   MLIRArithDialect
   MLIRVectorToLLVMPass

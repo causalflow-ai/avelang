@@ -524,6 +524,8 @@ void AveLangModule::Initialize() {
     AddType("bf16", builder.getBF16Type());
     AddType("f8e4m3fn", Float8E4M3FNType::get(builder.getContext()));
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
+    AddType("f8e5m2", Float8E5M2Type::get(builder.getContext()));
+    AddType("f8e5m2fnuz", Float8E5M2FNUZType::get(builder.getContext()));
 
     // FIXME: Constexpr type (placeholder, currently i32)
     AddType("constexpr", builder.getI32Type());
@@ -950,8 +952,18 @@ mlir::Value AveLangModule::CreateConvertFunction(
             << "Failed to resolve target type for convert";
         return nullptr;
     }
+    if (!target_type.isIntOrIndexOrFloat()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.convert requires a scalar numeric target dtype";
+        return nullptr;
+    }
 
     auto source_type = value.getType();
+    if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(source_type)) {
+        target_type = mlir::VectorType::get(vector_type.getShape(), target_type,
+                                            vector_type.getScalableDims());
+    }
     auto location = GetCallLocation(ctx, call_expr);
 
     // Explicit type conversion (allows demotion since user explicitly requested
