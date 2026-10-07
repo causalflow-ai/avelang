@@ -95,6 +95,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateRawBufferLoadX1LdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateRawBufferStoreU8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateRawBufferStoreX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -172,6 +175,9 @@ class AMDGPUIntrinsic : public NamedModule {
     bool CheckGenericRawBufferStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
+    bool CheckRawBufferStoreU8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckMakeRsrcFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -355,6 +361,19 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
                                                    resolved_args);
+        });
+
+    AddFunction(
+        "raw_buffer_store_u8",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateRawBufferStoreU8Function(call_expr, gen_ctx,
+                                                  resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckRawBufferStoreU8Function(call_expr, gen_ctx,
+                                                 resolved_args);
         });
 
     AddFunction(
@@ -681,6 +700,23 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
                          ConvertToI32(builder, location, resolved_args[3]),
                          ConvertToI32(builder, location, resolved_args[4])});
 
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateRawBufferStoreU8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto aux = mlir::arith::ConstantIntOp::create(
+        builder, location, *ConstantFolder::FoldIntValue(resolved_args[4]), 32);
+    mlir::LLVM::CallIntrinsicOp::create(
+        builder, location,
+        builder.getStringAttr("llvm.amdgcn.raw.buffer.store"),
+        mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2],
+                         resolved_args[3], aux});
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -1222,6 +1258,43 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckRawBufferStoreU8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 5) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_store_u8 requires exactly 5 arguments: "
+               "value, resource, byte_offset, scalar_offset, aux";
+        return false;
+    }
+    for (auto value : resolved_args) {
+        if (!value)
+            return false;
+    }
+
+    auto resource = mlir::dyn_cast<mlir::VectorType>(resolved_args[1].getType());
+    if (!resolved_args[0].getType().isInteger(8) || !resource ||
+        resource.getRank() != 1 || resource.getNumElements() != 4 ||
+        !resource.getElementType().isInteger(32) ||
+        !resolved_args[2].getType().isInteger(32) ||
+        !resolved_args[3].getType().isInteger(32)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_store_u8 expects i8 value, vector<4xi32> resource "
+               "and i32 offsets";
+        return false;
+    }
+    auto aux = ConstantFolder::FoldIntValue(resolved_args[4]);
+    if (!aux || *aux < 0 || *aux > 31) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_store_u8 aux must be a constant in [0, 31]";
+        return false;
+    }
     return true;
 }
 

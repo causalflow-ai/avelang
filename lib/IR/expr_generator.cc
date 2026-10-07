@@ -1595,9 +1595,12 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
                     }
                     resolved_args[0] = loaded;
                 }
-            } else if (symbol_name.rfind("raw_buffer_store_x", 0) == 0) {
+            } else if (symbol_name.rfind("raw_buffer_store_x", 0) == 0 ||
+                       symbol_name == "raw_buffer_store_u8") {
                 auto widthOpt = ParseIntAfterMarker(symbol_name, "_x");
-                int width = widthOpt.value_or(0);
+                int width = symbol_name == "raw_buffer_store_u8"
+                                ? 1
+                                : widthOpt.value_or(0);
                 if (resolved_args.size() > 0 && resolved_args[0] &&
                     mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
                     mlir::Value loaded;

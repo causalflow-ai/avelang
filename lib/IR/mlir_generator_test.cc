@@ -1527,6 +1527,7 @@ import avelang.language as S
 def raw_buffer_store_test(vdata1: S.i32,
                          vdata2: S.Tensor((2,), S.i32),
                          vdata4: S.Tensor((4,), S.i32),
+                         vdata8: S.u8,
                          rsrc: S.Tensor((4,), S.u32),
                          vindex: S.i32,
                          soffset: S.i32,
@@ -1534,6 +1535,7 @@ def raw_buffer_store_test(vdata1: S.i32,
     S.amdgpu.raw_buffer_store_x1(vdata1, rsrc, vindex, soffset, aux)
     S.amdgpu.raw_buffer_store_x2(vdata2, rsrc, vindex, soffset, aux)
     S.amdgpu.raw_buffer_store_x4(vdata4, rsrc, vindex, soffset, aux)
+    S.amdgpu.raw_buffer_store_u8(vdata8, rsrc, vindex, soffset, 0)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
