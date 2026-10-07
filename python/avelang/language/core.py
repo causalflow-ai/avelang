@@ -138,6 +138,11 @@ def select(pred, true_value, false_value):
     pass
 
 
+def bitreverse(value):
+    """Reverse all 32 bits of an i32 or u32 scalar, preserving its type."""
+    pass
+
+
 def fma(a, b, c):
     """Compute the fused multiply-add a * b + c."""
     pass

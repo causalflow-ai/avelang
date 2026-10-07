@@ -588,6 +588,34 @@ def bitwise_and_test(a: S.Tensor((2, 3), S.i32), b: S.Tensor((2, 3), S.i32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRBitReverseBuiltin) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def bitreverse_builtin(signed_value: al.i32, unsigned_value: al.u32):
+    signed_reversed = al.bitreverse(signed_value)
+    unsigned_reversed = al.bitreverse(unsigned_value)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, BitReverseRejectsFloat) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def invalid_bitreverse(value: al.f32):
+    result = al.bitreverse(value)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode, "avelang.bitreverse() expects a 32-bit integer");
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRCast) {
     static const std::string kSourceCode = R"""""(
 import avelang

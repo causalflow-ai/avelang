@@ -14,6 +14,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/Ptr/IR/PtrAttrs.h>
 #include <mlir/Dialect/Ptr/IR/PtrTypes.h>
@@ -583,6 +584,13 @@ void AveLangModule::Initialize() {
         });
 
     AddFunction(
+        "bitreverse",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateBitReverseFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
         "fma",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
@@ -1023,6 +1031,33 @@ mlir::Value AveLangModule::CreateBitcastFunction(
         SetTypeInfo(bitcast.getResult(), targetTypeInfo);
     }
     return bitcast.getResult();
+}
+
+mlir::Value AveLangModule::CreateBitReverseFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1 ||
+        !resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.bitreverse() requires exactly one argument";
+        return nullptr;
+    }
+
+    auto value = resolved_args[0];
+    auto type = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!type || type.getWidth() != 32) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.bitreverse() expects a 32-bit integer";
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto op = mlir::LLVM::BitReverseOp::create(builder, location, value);
+    SetTypeInfo(op.getResult(), GetTypeInfo(value));
+    return op.getResult();
 }
 
 mlir::Value AveLangModule::CreateFmaFunction(
