@@ -950,8 +950,18 @@ mlir::Value AveLangModule::CreateConvertFunction(
             << "Failed to resolve target type for convert";
         return nullptr;
     }
+    if (!target_type.isIntOrIndexOrFloat()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.convert requires a scalar numeric target dtype";
+        return nullptr;
+    }
 
     auto source_type = value.getType();
+    if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(source_type)) {
+        target_type = mlir::VectorType::get(vector_type.getShape(), target_type,
+                                            vector_type.getScalableDims());
+    }
     auto location = GetCallLocation(ctx, call_expr);
 
     // Explicit type conversion (allows demotion since user explicitly requested
