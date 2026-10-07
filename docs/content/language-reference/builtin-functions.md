@@ -32,6 +32,17 @@ packed = al.view(pair, al.Tensor((1,), al.u32))[0]
 
 The conversion changes the numeric values' representation. The subsequent view reinterprets their bits as a packed word. A tensor memory view must first be indexed to load the values to convert.
 
+On gfx950, four FP8 values can be packed into one `u32`. For `A` of type `al.Tensor((8, 4), al.f32)`:
+
+```python
+values = al.convert(A[row], al.f8e4m3fn)
+packed = al.view(values, al.Tensor((1,), al.u32))[0]
+```
+
+Use `al.f8e5m2` for BF8 on gfx950. On gfx942, use the FNUZ dtypes `al.f8e4m3fnuz` and `al.f8e5m2fnuz`.
+
+Use the [AMDGPU packed conversion intrinsics](../hardware-intrinsics/) to convert two scalar values into the low or high half of an existing word while preserving the other half.
+
 Use `al.bitcast(value, dtype)` when the bit pattern should be reinterpreted without a numeric conversion. This is useful when working with packed values or hardware fragments.
 
 ```python

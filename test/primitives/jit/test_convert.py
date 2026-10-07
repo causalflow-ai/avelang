@@ -41,6 +41,74 @@ def convert_vector_floats(
 
 
 @avelang.jit
+def convert_fp8_ocp(
+    src: al.Tensor((4, 7), al.f32),
+    fp8_out: al.Tensor((4, 7), al.f8e4m3fn),
+    bf8_out: al.Tensor((4, 7), al.f8e5m2),
+    restored_fp8: al.Tensor((4, 7), al.f32),
+    restored_bf8: al.Tensor((4, 7), al.f32),
+    scalar_fp8: al.Tensor((4,), al.f32),
+    scalar_bf8: al.Tensor((4,), al.f32),
+):
+    row = al.thread_id(0)
+    fp8 = al.convert(src[row], al.f8e4m3fn)
+    bf8 = al.convert(src[row], al.f8e5m2)
+    fp8_out[row] = fp8
+    bf8_out[row] = bf8
+    restored_fp8[row] = al.convert(fp8, al.f32)
+    restored_bf8[row] = al.convert(bf8, al.f32)
+    scalar_fp8[row] = al.convert(al.convert(src[row, 0], al.f8e4m3fn), al.f32)
+    scalar_bf8[row] = al.convert(al.convert(src[row, 0], al.f8e5m2), al.f32)
+
+
+@avelang.jit
+def convert_fp8_fnuz(
+    src: al.Tensor((4, 7), al.f32),
+    fp8_out: al.Tensor((4, 7), al.f8e4m3fnuz),
+    bf8_out: al.Tensor((4, 7), al.f8e5m2fnuz),
+    restored_fp8: al.Tensor((4, 7), al.f32),
+    restored_bf8: al.Tensor((4, 7), al.f32),
+    scalar_fp8: al.Tensor((4,), al.f32),
+    scalar_bf8: al.Tensor((4,), al.f32),
+):
+    row = al.thread_id(0)
+    fp8 = al.convert(src[row], al.f8e4m3fnuz)
+    bf8 = al.convert(src[row], al.f8e5m2fnuz)
+    fp8_out[row] = fp8
+    bf8_out[row] = bf8
+    restored_fp8[row] = al.convert(fp8, al.f32)
+    restored_bf8[row] = al.convert(bf8, al.f32)
+    scalar_fp8[row] = al.convert(al.convert(src[row, 0], al.f8e4m3fnuz), al.f32)
+    scalar_bf8[row] = al.convert(al.convert(src[row, 0], al.f8e5m2fnuz), al.f32)
+
+
+@avelang.jit
+def pack_fp8_ocp(
+    src: al.Tensor((4, 4), al.f32),
+    fp8_out: al.Tensor((4,), al.u32),
+    bf8_out: al.Tensor((4,), al.u32),
+):
+    row = al.thread_id(0)
+    fp8 = al.convert(src[row], al.f8e4m3fn)
+    bf8 = al.convert(src[row], al.f8e5m2)
+    fp8_out[row] = al.view(fp8, al.Tensor((1,), al.u32))[0]
+    bf8_out[row] = al.view(bf8, al.Tensor((1,), al.u32))[0]
+
+
+@avelang.jit
+def pack_fp8_fnuz(
+    src: al.Tensor((4, 4), al.f32),
+    fp8_out: al.Tensor((4,), al.u32),
+    bf8_out: al.Tensor((4,), al.u32),
+):
+    row = al.thread_id(0)
+    fp8 = al.convert(src[row], al.f8e4m3fnuz)
+    bf8 = al.convert(src[row], al.f8e5m2fnuz)
+    fp8_out[row] = al.view(fp8, al.Tensor((1,), al.u32))[0]
+    bf8_out[row] = al.view(bf8, al.Tensor((1,), al.u32))[0]
+
+
+@avelang.jit
 def convert_vector_integers(
     signed: al.Tensor((2, 4), al.i16),
     unsigned: al.Tensor((2, 4), al.u16),
@@ -186,6 +254,95 @@ class TestConvert(unittest.TestCase):
         self.assert_float_conversion(restored_brain, brain.float())
         self.assert_float_conversion(half_from_brain, brain.to(torch.float16))
         self.assert_float_conversion(brain_from_half, half.to(torch.bfloat16))
+
+    @unittest.skipUnless(testing.has_rocm(), "Requires AMDGPU backend.")
+    def test_fp8_bf8_conversion(self):
+        if testing.has_gfx950():
+            kernel = convert_fp8_ocp
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fn, torch.float8_e5m2
+        elif testing.has_gfx942():
+            kernel = convert_fp8_fnuz
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fnuz, torch.float8_e5m2fnuz
+        else:
+            self.skipTest("Requires gfx942 or gfx950.")
+
+        src = torch.tensor(
+            [
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                1.0625,
+                1.1875,
+                1.125,
+                1.375,
+                0.1,
+                -0.1,
+                2**-10,
+                2**-9,
+                2**-14,
+                2**-16,
+                2**-17,
+                -(2**-16),
+                448,
+                464,
+                480,
+                240,
+                248,
+                57344,
+                61440,
+                65504,
+                1e30,
+                float("inf"),
+                -float("inf"),
+                float("nan"),
+            ],
+            dtype=torch.float32,
+        ).reshape(4, 7)
+        fp8_out = torch.empty((4, 7), dtype=fp8_dtype, device="cuda")
+        bf8_out = torch.empty((4, 7), dtype=bf8_dtype, device="cuda")
+        restored_fp8 = torch.empty((4, 7), dtype=torch.float32, device="cuda")
+        restored_bf8 = torch.empty_like(restored_fp8)
+        scalar_fp8 = torch.empty(4, dtype=torch.float32, device="cuda")
+        scalar_bf8 = torch.empty_like(scalar_fp8)
+        kernel[lambda: ((1, 1, 1), (4, 1, 1))](
+            src.to("cuda"), fp8_out, bf8_out, restored_fp8, restored_bf8, scalar_fp8, scalar_bf8
+        )
+        for dtype, actual, restored, scalar in (
+            (fp8_dtype, fp8_out, restored_fp8, scalar_fp8),
+            (bf8_dtype, bf8_out, restored_bf8, scalar_bf8),
+        ):
+            expected = src.to(dtype).float()
+            self.assert_float_conversion(actual.cpu().float(), expected)
+            self.assert_float_conversion(restored, expected)
+            self.assert_float_conversion(scalar, expected[:, 0])
+
+    @unittest.skipUnless(testing.has_rocm(), "Requires AMDGPU backend.")
+    def test_fp8_bf8_packing(self):
+        if testing.has_gfx950():
+            kernel = pack_fp8_ocp
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fn, torch.float8_e5m2
+        elif testing.has_gfx942():
+            kernel = pack_fp8_fnuz
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fnuz, torch.float8_e5m2fnuz
+        else:
+            self.skipTest("Requires gfx942 or gfx950.")
+
+        src = torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [-1.0, 0.0, -0.0, 8.0],
+                [0.1, -0.1, 1.0625, 1.1875],
+                [2**-10, 2**-9, 240.0, -240.0],
+            ],
+            dtype=torch.float32,
+        )
+        fp8_out = torch.empty(4, dtype=torch.int32, device="cuda")
+        bf8_out = torch.empty_like(fp8_out)
+        kernel[lambda: ((1, 1, 1), (4, 1, 1))](src.to("cuda"), fp8_out, bf8_out)
+        for actual, dtype in ((fp8_out, fp8_dtype), (bf8_out, bf8_dtype)):
+            expected = src.to(dtype).view(torch.int32).reshape(4)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
     def test_vector_integer_width_and_signedness(self):
         signed = torch.tensor([-32768, -255, -1, 0, 1, 255, 32766, 32767], dtype=torch.int16).reshape(2, 4)
