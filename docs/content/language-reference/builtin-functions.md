@@ -36,6 +36,16 @@ idx = al.min(idx, limit)
 y = al.sqrt(x)
 ```
 
+## Bit Operations
+
+`al.bitreverse(value)` reverses all 32 bits of an `al.i32` or `al.u32` scalar and preserves its type. Bit 0 becomes bit 31, bit 1 becomes bit 30, and so on. The operation is available on both AMD and NVIDIA GPUs.
+
+```python
+reversed_word = al.bitreverse(word)
+```
+
+For example, `0x00000001` becomes `0x80000000`. Other integer widths, floating-point values, and vectors are not supported.
+
 ## Tensor Construction And Memory
 
 `al.make_shared(shape, dtype)` allocates workgroup shared memory. The shape is usually static or derived from `al.constexpr` parameters so the compiler can allocate a fixed shared-memory region.
