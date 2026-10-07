@@ -128,8 +128,9 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
                 return value;
             }
         } else {
-            return mlir::arith::ExtFOp::create(builder, location, target_type,
-                                               value);
+            // Same-width format changes (e.g. f16 <-> bf16) require ConvertFOp.
+            return mlir::arith::ConvertFOp::create(
+                builder, location, target_type, value, nullptr, nullptr);
         }
     }
 
