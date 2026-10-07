@@ -27,6 +27,7 @@
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/STLExtras.h>
+#include <llvm/Support/MathExtras.h>
 #include <llvm/Support/raw_ostream.h>
 
 namespace causalflow::avelang::ir {
@@ -1129,10 +1130,8 @@ mlir::Value ExprGenerator::VisitConstant(ast::Constant *constant) {
 
     // Try to parse as integer first
     if (auto intValue = ParseConstantInteger(value)) {
-        // For integer constants, we'll use a default i32 type unless context
-        // suggests otherwise This can be extended later to infer type from
-        // usage context
-        auto intType = builder.getI32Type();
+        auto intType = llvm::isInt<32>(*intValue) ? builder.getI32Type()
+                                                  : builder.getI64Type();
 
         // Create integer constant using ConstantOp instead of deprecated
         // ConstantIndexOp for portability

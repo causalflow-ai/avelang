@@ -635,6 +635,63 @@ def kernel(out: al.Tensor((3,), al.i32), value: al.i32):
                                      {"boolean_helper"});
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRIntegerLiteralWidthsAndValues) {
+    const std::vector<std::pair<int64_t, unsigned>> cases = {
+        {0, 32},
+        {2147483647LL, 32},
+        {2147483648LL, 64},
+        {2147483649LL, 64},
+        {4294967295LL, 64},
+        {4294967296LL, 64},
+        {9223372036854775807LL, 64},
+    };
+    for (auto [value, width] : cases) {
+        for (const auto *sign : {"", "-"}) {
+            SCOPED_TRACE(std::string(sign) + std::to_string(value));
+            ast::ASTNode *root = nullptr;
+            TryParse("import avelang\nimport avelang.language as al\n"
+                     "@avelang.jit\ndef kernel(out: al.Tensor((1,), al.i64)):\n"
+                     "    out[0] = " +
+                         std::string(sign) + std::to_string(value) + "\n",
+                     &root);
+            ASSERT_NE(root, nullptr);
+            auto ir_context = ir::IRContext::Create();
+            ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+            auto module = generator.Generate(root);
+            ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+                << diagHandler_.GetErrorMessages();
+            ASSERT_TRUE(module);
+            ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+
+            bool found_literal = false;
+            module.walk([&](mlir::arith::ConstantOp op) {
+                auto attr = mlir::dyn_cast<mlir::IntegerAttr>(op.getValue());
+                if (attr && attr.getInt() == value &&
+                    op.getType().isInteger(width)) {
+                    found_literal = true;
+                }
+            });
+            EXPECT_TRUE(found_literal);
+
+            mlir::PassManager pm(module.getContext());
+            pm.addPass(mlir::createCanonicalizerPass());
+            ASSERT_TRUE(mlir::succeeded(pm.run(module)));
+            unsigned stores = 0;
+            module.walk([&](cf::AveLangMemRefStoreOp op) {
+                auto constant =
+                    op.getValue().getDefiningOp<mlir::arith::ConstantOp>();
+                ASSERT_TRUE(constant);
+                EXPECT_TRUE(constant.getType().isInteger(64));
+                EXPECT_EQ(
+                    mlir::cast<mlir::IntegerAttr>(constant.getValue()).getInt(),
+                    sign[0] == '-' ? -value : value);
+                ++stores;
+            });
+            EXPECT_EQ(stores, 1u);
+        }
+    }
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRMakeTensorPreservesSignedness) {
     ast::ASTNode *root = nullptr;
     TryParse(R"(
