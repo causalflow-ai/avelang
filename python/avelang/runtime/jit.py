@@ -715,7 +715,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
     def _infer_constexpr_type(self, value):
         """Infer MLIR type string from Python value."""
-        if isinstance(value, bool):
+        if isinstance(value, JITCallable):
+            return "jit"
+        elif isinstance(value, bool):
             return "i1"
         elif isinstance(value, int):
             if -2147483648 <= value <= 2147483647:
@@ -727,6 +729,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
         else:
             raise ValueError(f"Unsupported constexpr type: {type(value)}")
 
+    def _make_constexpr_info(self, value):
+        if hasattr(value, "value"):
+            value = value.value
+        constexpr_type = self._infer_constexpr_type(value)
+        if constexpr_type == "jit":
+            return {
+                "type": constexpr_type,
+                "value": value.__name__,
+                "_jit_callable": value,
+            }
+        return {"type": constexpr_type, "value": value}
+
     def _collect_global_constexprs(self, skip_names=None):
         _ = self.cache_key
         constexprs = {}
@@ -737,10 +751,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if hasattr(value, "value"):
                 value = value.value
             try:
-                constexpr_type = self._infer_constexpr_type(value)
+                info = self._make_constexpr_info(value)
             except ValueError:
                 continue
-            constexprs[name] = {"type": constexpr_type, "value": value}
+            constexprs[name] = info
         return constexprs
 
     def create_binder(self):
@@ -777,11 +791,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             param_idx = path[0]
             param_name = self.arg_names[param_idx]
             value = get_iterable_path(list(bound_args.values()), path)
-            # Unwrap constexpr wrapper if present
-            if hasattr(value, "value"):
-                value = value.value
-            constexpr_type = self._infer_constexpr_type(value)
-            constexprs[param_name] = {"type": constexpr_type, "value": value}
+            constexprs[param_name] = self._make_constexpr_info(value)
         global_constexprs = self._collect_global_constexprs(constexprs.keys())
         # attributes
         attrs = None
