@@ -616,6 +616,24 @@ def bitcast_test(a: S.Tensor((2, 3), S.f32), b: S.Tensor((2, 3), S.f32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRBooleanJitHelper) {
+    RunMLIRGenerationTestWithJitDeps(R"(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def boolean_helper(value: al.u1) -> al.u1:
+    return al.convert(value, al.u1)
+
+@avelang.jit
+def kernel(out: al.Tensor((3,), al.i32), value: al.i32):
+    out[0] = al.convert(boolean_helper(True), al.i32)
+    out[1] = al.convert(boolean_helper(False), al.i32)
+    out[2] = al.convert(boolean_helper(al.convert(value, al.u1)), al.i32)
+)",
+                                     {"boolean_helper"});
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRF32Tensor) {
     static const std::string kSourceCode = R"""""(
 import avelang
