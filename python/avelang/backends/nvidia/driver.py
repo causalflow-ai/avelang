@@ -186,6 +186,8 @@ def make_launcher(constants, signature) -> str:
             "i64": "long long",
             "float": "float",
             "double": "double",
+            "fp32": "float",
+            "fp64": "double",
             "u32": "unsigned",
             "u64": "unsigned long long",
         }

@@ -513,6 +513,7 @@ void AveLangModule::Initialize() {
 
     // MLIR uses integer types for both signed and unsigned integers. Therefore
     // we tag the type at the definition of values
+    AddType("u1", builder.getI1Type());
     AddType("u8", builder.getI8Type());
     AddType("u16", builder.getI16Type());
     AddType("u32", builder.getI32Type());
@@ -1370,6 +1371,7 @@ mlir::Value AveLangModule::CreateMakeTensorFunction(
 
     auto castOp = cf::AveLangMemRefCastOp::create(builder, location, ptrValue,
                                                   layoutValue, resultType);
+    SetTypeInfo(castOp.getResult(), GetTypeInfo(args[1]));
     return castOp.getResult();
 }
 

@@ -622,6 +622,11 @@ def _normalize_ty(ty) -> str:
             return "*" + _normalize_ty(ty[:-1])
         if ty.startswith("*"):
             return "*" + _normalize_ty(ty[1:])
+        # With `from __future__ import annotations`, al.f32 arrives as "al.f32".
+        # Look up core.f32 and reuse dtype handling below to return "fp32".
+        scalar_ty = getattr(core, ty.rsplit(".", 1)[-1], None)
+        if isinstance(scalar_ty, core.dtype):
+            return _normalize_ty(scalar_ty)
         if ty.startswith("S."):
             return _normalize_ty(ty.removeprefix("S."))
     elif isinstance(ty, core.pointer_type):
