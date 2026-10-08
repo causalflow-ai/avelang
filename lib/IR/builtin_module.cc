@@ -525,7 +525,8 @@ void AveLangModule::Initialize() {
     AddType("f8e4m3fn", Float8E4M3FNType::get(builder.getContext()));
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
 
-    // FIXME: Constexpr type (placeholder, currently i32)
+    // Annotation marker only.  Canonical constexpr symbols retain their own
+    // typed attributes; this type never represents a constexpr payload.
     AddType("constexpr", builder.getI32Type());
 
     AddSymbol("jit", [&builder]() -> mlir::Value {

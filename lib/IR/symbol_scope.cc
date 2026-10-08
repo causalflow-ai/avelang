@@ -5,7 +5,7 @@
 
 namespace causalflow::avelang::ir {
 
-SymbolScope::Symbol::Symbol() : kind(kValue), value() {}
+SymbolScope::Symbol::Symbol() = default;
 
 SymbolScope::Symbol::Symbol(NamedModule *m) : kind(kModule), module(m) {}
 
@@ -19,71 +19,8 @@ SymbolScope::Symbol::Symbol(mlir::Type t) : kind(kType), type(t) {}
 
 SymbolScope::Symbol::Symbol(mlir::Value v) : kind(kValue), value(v) {}
 
-SymbolScope::Symbol::~Symbol() {
-    switch (kind) {
-    case kTypeFactory:
-        type_factory.~TypeFactoryFunction();
-        break;
-    case kFunction:
-        function.~Function();
-        break;
-    case kModule:
-    case kType:
-    case kValue:
-        // These types don't need explicit destruction
-        break;
-    }
-}
-
-SymbolScope::Symbol::Symbol(const Symbol &other)
-    : kind(other.kind), immutable(other.immutable) {
-    switch (kind) {
-    case kModule:
-        module = other.module;
-        break;
-    case kTypeFactory:
-        new (&type_factory) TypeFactoryFunction(other.type_factory);
-        break;
-    case kFunction:
-        new (&function) Function(other.function);
-        break;
-    case kType:
-        type = other.type;
-        break;
-    case kValue:
-        value = other.value;
-        break;
-    }
-}
-
-SymbolScope::Symbol &SymbolScope::Symbol::operator=(const Symbol &other) {
-    if (this != &other) {
-        // Destroy current content
-        this->~Symbol();
-
-        // Copy construct new content
-        kind = other.kind;
-        immutable = other.immutable;
-        switch (kind) {
-        case kModule:
-            module = other.module;
-            break;
-        case kTypeFactory:
-            new (&type_factory) TypeFactoryFunction(other.type_factory);
-            break;
-        case kFunction:
-            new (&function) Function(other.function);
-            break;
-        case kType:
-            type = other.type;
-            break;
-        case kValue:
-            value = other.value;
-            break;
-        }
-    }
-    return *this;
-}
+SymbolScope::Symbol::Symbol(ConstexprValue v)
+    : kind(kConstexpr), constexpr_value(std::move(v)) {}
 
 bool SymbolScope::Symbol::isa(SymbolKind k) const { return this->kind == k; }
 
@@ -100,11 +37,12 @@ SymbolScope::LookupSymbol(const std::string &name) const {
     return std::nullopt;
 }
 
-void SymbolScope::AddValue(const std::string &name, mlir::Value value,
-                           bool immutable) {
-    Symbol sym(value);
-    sym.immutable = immutable;
-    symbols_[name] = sym;
+void SymbolScope::AddValue(const std::string &name, mlir::Value value) {
+    symbols_[name] = Symbol(value);
+}
+
+void SymbolScope::AddConstexpr(const std::string &name, ConstexprValue value) {
+    symbols_[name] = Symbol(std::move(value));
 }
 
 void SymbolScope::AddType(const std::string &name, mlir::Type type) {
@@ -137,6 +75,15 @@ mlir::Value SymbolScope::LookupValue(const std::string &name) const {
         return it->second.value;
     }
     return mlir::Value();
+}
+
+std::optional<ConstexprValue>
+SymbolScope::LookupConstexpr(const std::string &name) const {
+    auto it = symbols_.find(name);
+    if (it != symbols_.end() && it->second.isa(kConstexpr)) {
+        return it->second.constexpr_value;
+    }
+    return std::nullopt;
 }
 
 mlir::Type SymbolScope::LookupType(const std::string &name) const {

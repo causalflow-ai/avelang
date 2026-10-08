@@ -11,6 +11,7 @@
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/BuiltinAttributes.h>
 
+#include <llvm/ADT/APFloat.h>
 #include <llvm/Support/Casting.h>
 
 namespace causalflow::avelang::ir {
@@ -330,6 +331,71 @@ std::optional<bool> ConstantFolder::FoldBoolValue(mlir::Value value) {
     return std::nullopt;
 }
 
+std::optional<mlir::FloatAttr>
+ConstantFolder::FoldFloatValue(mlir::Value value) {
+    if (!value || !mlir::isa<mlir::FloatType>(value.getType())) {
+        return std::nullopt;
+    }
+
+    if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto floatAttr =
+                mlir::dyn_cast<mlir::FloatAttr>(constant.getValue())) {
+            return floatAttr;
+        }
+    }
+
+    auto foldBinary = [&](mlir::Value lhsValue, mlir::Value rhsValue,
+                          auto calculate) -> std::optional<mlir::FloatAttr> {
+        auto lhs = FoldFloatValue(lhsValue);
+        auto rhs = FoldFloatValue(rhsValue);
+        if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+        llvm::APFloat folded = lhs->getValue();
+        calculate(folded, rhs->getValue());
+        return mlir::FloatAttr::get(value.getType(), folded);
+    };
+
+    if (auto add = value.getDefiningOp<mlir::arith::AddFOp>()) {
+        return foldBinary(add.getLhs(), add.getRhs(),
+                          [](llvm::APFloat &lhs, const llvm::APFloat &rhs) {
+                              lhs.add(rhs, llvm::APFloat::rmNearestTiesToEven);
+                          });
+    }
+    if (auto sub = value.getDefiningOp<mlir::arith::SubFOp>()) {
+        return foldBinary(sub.getLhs(), sub.getRhs(),
+                          [](llvm::APFloat &lhs, const llvm::APFloat &rhs) {
+                              lhs.subtract(
+                                  rhs, llvm::APFloat::rmNearestTiesToEven);
+                          });
+    }
+    if (auto mul = value.getDefiningOp<mlir::arith::MulFOp>()) {
+        return foldBinary(mul.getLhs(), mul.getRhs(),
+                          [](llvm::APFloat &lhs, const llvm::APFloat &rhs) {
+                              lhs.multiply(
+                                  rhs, llvm::APFloat::rmNearestTiesToEven);
+                          });
+    }
+    if (auto div = value.getDefiningOp<mlir::arith::DivFOp>()) {
+        return foldBinary(div.getLhs(), div.getRhs(),
+                          [](llvm::APFloat &lhs, const llvm::APFloat &rhs) {
+                              lhs.divide(
+                                  rhs, llvm::APFloat::rmNearestTiesToEven);
+                          });
+    }
+    if (auto neg = value.getDefiningOp<mlir::arith::NegFOp>()) {
+        auto operand = FoldFloatValue(neg.getOperand());
+        if (!operand) {
+            return std::nullopt;
+        }
+        llvm::APFloat folded = operand->getValue();
+        folded.changeSign();
+        return mlir::FloatAttr::get(value.getType(), folded);
+    }
+
+    return std::nullopt;
+}
+
 std::optional<int64_t> ConstantFolder::FoldIntValue(mlir::Value value) {
     if (!value) {
         return std::nullopt;
@@ -379,6 +445,33 @@ std::optional<int64_t> ConstantFolder::FoldIntValue(mlir::Value value) {
         auto rhs = FoldIntValue(mul.getRhs());
         if (lhs && rhs) {
             return *lhs * *rhs;
+        }
+        return std::nullopt;
+    }
+
+    if (auto bitAnd = value.getDefiningOp<mlir::arith::AndIOp>()) {
+        auto lhs = FoldIntValue(bitAnd.getLhs());
+        auto rhs = FoldIntValue(bitAnd.getRhs());
+        if (lhs && rhs) {
+            return *lhs & *rhs;
+        }
+        return std::nullopt;
+    }
+
+    if (auto bitOr = value.getDefiningOp<mlir::arith::OrIOp>()) {
+        auto lhs = FoldIntValue(bitOr.getLhs());
+        auto rhs = FoldIntValue(bitOr.getRhs());
+        if (lhs && rhs) {
+            return *lhs | *rhs;
+        }
+        return std::nullopt;
+    }
+
+    if (auto bitXor = value.getDefiningOp<mlir::arith::XOrIOp>()) {
+        auto lhs = FoldIntValue(bitXor.getLhs());
+        auto rhs = FoldIntValue(bitXor.getRhs());
+        if (lhs && rhs) {
+            return *lhs ^ *rhs;
         }
         return std::nullopt;
     }
@@ -458,6 +551,49 @@ std::optional<int64_t> ConstantFolder::FoldIntValue(mlir::Value value) {
     return std::nullopt;
 }
 
+std::optional<ConstexprValue>
+ConstantFolder::FoldConstexprValue(mlir::Value value) {
+    if (!value) {
+        return std::nullopt;
+    }
+
+    ConstexprValue result;
+    result.type_info = GetTypeInfo(value);
+
+    if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        result.attribute =
+            mlir::dyn_cast<mlir::TypedAttr>(constant.getValue());
+        if (result.attribute) {
+            return result;
+        }
+    }
+
+    if (value.getType().isInteger(1)) {
+        if (auto folded = FoldBoolValue(value)) {
+            result.attribute = mlir::IntegerAttr::get(value.getType(),
+                                                      *folded ? 1 : 0);
+            return result;
+        }
+    }
+
+    if (value.getType().isIntOrIndex()) {
+        if (auto folded = FoldIntValue(value)) {
+            result.attribute =
+                mlir::IntegerAttr::get(value.getType(), *folded);
+            return result;
+        }
+    }
+
+    if (mlir::isa<mlir::FloatType>(value.getType())) {
+        if (auto folded = FoldFloatValue(value)) {
+            result.attribute = *folded;
+            return result;
+        }
+    }
+
+    return std::nullopt;
+}
+
 std::optional<int64_t>
 ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
     if (!ctx_ || !ctx_->syms || !expr) {
@@ -466,7 +602,17 @@ ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
 
     if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
         auto symbol = ctx_->syms->LookupSymbol(name->GetId());
-        if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue)) {
+        if (!symbol) {
+            return std::nullopt;
+        }
+        if (symbol->isa(SymbolTable::SymbolKind::kConstexpr)) {
+            if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(
+                    symbol->constexpr_value.attribute)) {
+                return integer.getInt();
+            }
+            return std::nullopt;
+        }
+        if (!symbol->isa(SymbolTable::SymbolKind::kValue)) {
             return std::nullopt;
         }
         if (auto value = FoldIntValue(symbol->value)) {
@@ -478,7 +624,17 @@ ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
     if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(expr)) {
         auto symbol = ctx_->syms->ResolveSymbol(attr, std::nullopt,
                                                 /*report_not_found=*/false);
-        if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue)) {
+        if (!symbol) {
+            return std::nullopt;
+        }
+        if (symbol->isa(SymbolTable::SymbolKind::kConstexpr)) {
+            if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(
+                    symbol->constexpr_value.attribute)) {
+                return integer.getInt();
+            }
+            return std::nullopt;
+        }
+        if (!symbol->isa(SymbolTable::SymbolKind::kValue)) {
             return std::nullopt;
         }
         if (auto value = FoldIntValue(symbol->value)) {

@@ -260,6 +260,8 @@ void AveLangMLIRGenerator::Generate(ast::ASTNode *root) {
 
 void AveLangMLIRGenerator::InjectConstexprs(
     const std::string &constexprs_json) {
+    // Injection records canonical attributes; function-local SSA constants are
+    // materialized later by the IR generator.
     auto error = generator_.InjectConstexprs(constexprs_json);
     if (error) {
         throw std::runtime_error("Constexpr injection failed: " +

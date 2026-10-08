@@ -71,6 +71,12 @@ void SymbolTable::DefineSymbol(const std::string &name, mlir::Value value) {
     frame.AddValue(name, value);
 }
 
+void SymbolTable::DefineConstexpr(const std::string &name,
+                                  ConstexprValue value) {
+    auto &frame = GetCurrentFrame();
+    frame.AddConstexpr(name, std::move(value));
+}
+
 std::optional<SymbolTable::Symbol>
 SymbolTable::LookupSymbol(const std::string &name) const {
     // Walk frames from innermost to outermost
@@ -231,6 +237,14 @@ mlir::Value SymbolTable::ResolveRefExpr(ast::Expr *expr) {
     auto symbol =
         ResolveSymbol(expr, SymbolKind::kValue, /*report_not_found=*/false);
     return symbol ? symbol->value : mlir::Value();
+}
+
+std::optional<ConstexprValue>
+SymbolTable::ResolveConstexpr(ast::Expr *expr, bool report_not_found) {
+    auto symbol =
+        ResolveSymbol(expr, SymbolKind::kConstexpr, report_not_found);
+    return symbol ? std::optional<ConstexprValue>(symbol->constexpr_value)
+                  : std::nullopt;
 }
 
 mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
