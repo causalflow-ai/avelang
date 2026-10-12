@@ -1584,7 +1584,8 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
         const auto &symbol_name = function.symbol_name;
 
         if (module_name == "amdgpu") {
-            if (symbol_name.rfind("raw_buffer_load_x", 0) == 0) {
+            if (symbol_name.rfind("raw_buffer_load_x", 0) == 0 ||
+                symbol_name == "raw_buffer_load_u8") {
                 if (resolved_args.size() > 0 && resolved_args[0] &&
                     mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
                     auto loaded = LoadVectorFromMemref(

@@ -1513,6 +1513,7 @@ def raw_buffer_load_test(rsrc: S.Tensor((4,), S.u32),
     result1 = S.amdgpu.raw_buffer_load_x1(rsrc, vindex, soffset, aux)
     result2 = S.amdgpu.raw_buffer_load_x2(rsrc, vindex, soffset, aux)
     result4 = S.amdgpu.raw_buffer_load_x4(rsrc, vindex, soffset, aux)
+    result8 = S.amdgpu.raw_buffer_load_u8(rsrc, vindex, soffset, 0)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);

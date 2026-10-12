@@ -83,6 +83,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateMfmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                    llvm::ArrayRef<mlir::Value> resolved_args,
                                    const amdgpu_mfma::MFMAConfig &config) const;
+    mlir::Value CreateRawBufferLoadU8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value CreateRawBufferLoadX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -168,6 +171,9 @@ class AMDGPUIntrinsic : public NamedModule {
     bool CheckGenericRawBufferLoadFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
+    bool CheckRawBufferLoadU8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRawBufferLoadX1LdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -309,6 +315,19 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckReadFirstLaneFunction(call_expr, gen_ctx,
                                               resolved_args);
+        });
+
+    AddFunction(
+        "raw_buffer_load_u8",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateRawBufferLoadU8Function(call_expr, gen_ctx,
+                                                 resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckRawBufferLoadU8Function(call_expr, gen_ctx,
+                                                resolved_args);
         });
 
     AddFunction(
@@ -650,6 +669,22 @@ mlir::Value AMDGPUIntrinsic::CreateMfmaFunction(
     llvm::ArrayRef<mlir::Value> resolved_args,
     const amdgpu_mfma::MFMAConfig &config) const {
     return CreateGenericMFMAFunction(call_expr, ctx, resolved_args, config);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadU8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto aux = mlir::arith::ConstantIntOp::create(
+        builder, location, *ConstantFolder::FoldIntValue(resolved_args[3]), 32);
+    auto load = mlir::LLVM::CallIntrinsicOp::create(
+        builder, location, builder.getI8Type(),
+        builder.getStringAttr("llvm.amdgcn.raw.buffer.load"),
+        mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2],
+                         aux});
+    SetTypeInfo(load.getResult(0), TypeInfo{true});
+    return load.getResult(0);
 }
 
 mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1Function(
@@ -1193,6 +1228,41 @@ bool AMDGPUIntrinsic::CheckGenericRawBufferLoadFunction(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckRawBufferLoadU8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_load_u8 requires exactly 4 arguments: "
+               "resource, byte_offset, scalar_offset, aux";
+        return false;
+    }
+    for (auto value : resolved_args) {
+        if (!value)
+            return false;
+    }
+
+    auto resource = mlir::dyn_cast<mlir::VectorType>(resolved_args[0].getType());
+    if (!resource || resource.getRank() != 1 || resource.getNumElements() != 4 ||
+        !resource.getElementType().isInteger(32) ||
+        !resolved_args[1].getType().isInteger(32) ||
+        !resolved_args[2].getType().isInteger(32)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_load_u8 expects vector<4xi32> resource and i32 offsets";
+        return false;
+    }
+    auto aux = ConstantFolder::FoldIntValue(resolved_args[3]);
+    if (!aux || *aux < 0 || *aux > 31) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "raw_buffer_load_u8 aux must be a constant in [0, 31]";
+        return false;
+    }
     return true;
 }
 
