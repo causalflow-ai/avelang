@@ -44,6 +44,11 @@ class MLIRGenerator {
     // Register a JIT dependency for lazy generation.
     void RegisterJitDependency(ast::FunctionDef *func);
 
+    // Register an alias for a JIT dependency, used when a constexpr parameter
+    // is specialized with a JIT function.
+    llvm::Error RegisterJitDependencyAlias(llvm::StringRef alias,
+                                           llvm::StringRef dependency_name);
+
     // Inject constexpr values into the current module.
     llvm::Error InjectConstexprs(llvm::StringRef constexprs_json);
 

@@ -40,6 +40,23 @@ namespace causalflow::avelang::ir {
 using namespace mlir;
 using namespace llvm;
 
+static void AddJitFunctionSymbol(SymbolScope &scope, llvm::StringRef alias,
+                                 ast::FunctionDef *func) {
+    scope.AddFunction(
+        alias.str(),
+        SymbolScope::Function(
+            [func](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                if (!gen_ctx || !gen_ctx->GetCurrentFunctionGenerator()) {
+                    return mlir::Value();
+                }
+                auto *expr_generator = gen_ctx->GetExprGenerator();
+                return expr_generator ? expr_generator->GenerateJitFunctionCall(
+                                            call_expr, func, resolved_args)
+                                      : mlir::Value();
+            }));
+}
+
 GeneratorContext::GeneratorContext(
     IRContext *ir_context,
     llvm::IntrusiveRefCntPtr<basic::DiagnosticManager> diagnostic_manager)
@@ -117,6 +134,21 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
         }
 
         mlir::Value constValue;
+
+        if (*type == "jit") {
+            auto targetName = value->getAsString();
+            if (!targetName || targetName->empty()) {
+                return llvm::createStringError(
+                    llvm::inconvertibleErrorCode(),
+                    "constexpr jit value must be function name string");
+            }
+            if (auto E =
+                    Generator.RegisterJitDependencyAlias(name->str(),
+                                                         targetName->str())) {
+                return E;
+            }
+            continue;
+        }
 
         if (*type == "i32") {
             auto intVal = value->getAsInteger();
@@ -209,6 +241,12 @@ void MLIRGenerator::RegisterJitDependency(ast::FunctionDef *func) {
         return;
     }
     impl_->RegisterJitDependency(func);
+}
+
+llvm::Error
+MLIRGenerator::RegisterJitDependencyAlias(llvm::StringRef alias,
+                                          llvm::StringRef dependency_name) {
+    return impl_->RegisterJitDependencyAlias(alias, dependency_name);
 }
 
 MLIRGeneratorImpl::MLIRGeneratorImpl(GeneratorContext *context)
@@ -321,22 +359,35 @@ void MLIRGeneratorImpl::RegisterJitDependency(ast::FunctionDef *func) {
     if (name.empty()) {
         return;
     }
-    if (!ctx_ || !ctx_->GetCurrentFunctionGenerator()) {
+    if (!ctx_ || !ctx_->syms) {
+        return;
+    }
+    if (!ctx_->GetCurrentFunctionGenerator()) {
         jit_function_deps_[name] = func;
     }
-    ctx_->syms->GetCurrentFrame().AddFunction(
-        name,
-        SymbolScope::Function(
-            [func](ast::Call *call_expr, GeneratorContext *gen_ctx,
-                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
-                if (!gen_ctx || !gen_ctx->GetCurrentFunctionGenerator()) {
-                    return mlir::Value();
-                }
-                auto *expr_generator = gen_ctx->GetExprGenerator();
-                return expr_generator ? expr_generator->GenerateJitFunctionCall(
-                                            call_expr, func, resolved_args)
-                                      : mlir::Value();
-            }));
+    AddJitFunctionSymbol(ctx_->syms->GetCurrentFrame(), name, func);
+}
+
+llvm::Error MLIRGeneratorImpl::RegisterJitDependencyAlias(
+    llvm::StringRef alias, llvm::StringRef dependency_name) {
+    if (!ctx_ || !ctx_->syms) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "Generator context or symbol table is not initialized");
+    }
+    if (alias.empty() || dependency_name.empty()) {
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "JIT dependency alias is empty");
+    }
+    auto it = jit_function_deps_.find(dependency_name.str());
+    if (it == jit_function_deps_.end() || !it->second) {
+        return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            "Unknown JIT dependency for constexpr alias '" + alias.str() +
+                "': " + dependency_name.str());
+    }
+    auto *func = it->second;
+    AddJitFunctionSymbol(ctx_->syms->GetCurrentFrame(), alias, func);
+    return llvm::Error::success();
 }
 
 void MLIRGeneratorImpl::InitializeSymbolTable() {
