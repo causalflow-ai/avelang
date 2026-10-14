@@ -59,6 +59,10 @@ def readfirstlane(value):
     pass
 
 
+def raw_buffer_load_u8(resource, byte_offset, scalar_offset, aux):
+    pass
+
+
 def raw_buffer_load_x1(rsrc, vindex, soffset, aux):
     pass
 
@@ -72,6 +76,11 @@ def raw_buffer_load_x4(rsrc, vindex, soffset, aux):
 
 
 def raw_buffer_load_x1_lds(rsrc, lds_ptr, size, vindex, soffset, offset, aux):
+    pass
+
+
+def raw_buffer_store_u8(value, resource, byte_offset, scalar_offset, aux):
+    """Store a u8 using i32 offsets and constant aux in [0, 31]."""
     pass
 
 
