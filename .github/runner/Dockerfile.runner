@@ -1,0 +1,35 @@
+FROM docker:29.4.0-cli AS docker-cli
+
+FROM ubuntu:24.04
+
+ARG RUNNER_VERSION=2.334.0
+ARG RUNNER_SHA256=048024cd2c848eb6f14d5646d56c13a4def2ae7ee3ad12122bee960c56f3d271
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        libicu74 \
+        libssl3t64 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1001 --shell /bin/bash runner \
+    && mkdir -p /home/runner/actions-runner /home/runner/_work \
+    && chown -R runner:runner /home/runner
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
+USER runner
+WORKDIR /home/runner/actions-runner
+
+RUN curl --fail --location --retry 3 \
+        --output actions-runner.tar.gz \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+    && echo "${RUNNER_SHA256}  actions-runner.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file actions-runner.tar.gz \
+    && rm actions-runner.tar.gz
+
+COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/home/runner/entrypoint.sh"]
