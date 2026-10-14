@@ -946,25 +946,20 @@ mlir::Value AveLangModule::CreateConvertFunction(
 
     // Resolve the target type from the second argument
     auto target_type = ctx->syms->ResolveType(args[1]);
+    auto location = GetCallLocation(ctx, call_expr);
+    if (auto target_tensor =
+            mlir::dyn_cast_if_present<cf::MemRefType>(target_type)) {
+        target_type = mlir::VectorType::getChecked(
+            location, target_tensor.getShape(), target_tensor.getElementType());
+    }
     if (!target_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "Failed to resolve target type for convert";
         return nullptr;
     }
-    if (!target_type.isIntOrIndexOrFloat()) {
-        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                        call_expr->GetSourceRange().getBegin())
-            << "avelang.convert requires a scalar numeric target dtype";
-        return nullptr;
-    }
 
     auto source_type = value.getType();
-    if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(source_type)) {
-        target_type = mlir::VectorType::get(vector_type.getShape(), target_type,
-                                            vector_type.getScalableDims());
-    }
-    auto location = GetCallLocation(ctx, call_expr);
 
     // Explicit type conversion (allows demotion since user explicitly requested
     // it)

@@ -16,7 +16,7 @@ These functions are part of the language surface. They are parsed by the JIT and
 
 ## Math And Conversion
 
-Use `al.convert(value, dtype)` for numeric conversion to a scalar dtype. It accepts a scalar or a loaded vector value. For vectors, every element is converted and the shape is preserved. Signed and unsigned integer conversions follow the source and target dtypes.
+Use `al.convert(value, target_type)` for numeric conversion. Scalar values require a scalar target dtype. Loaded vectors require an explicit `al.Tensor(shape, dtype)` target with a static shape matching the input vector. Every element is converted, and the shape is preserved. Signed and unsigned integer conversions follow the source and target dtypes.
 
 ```python
 acc = al.convert(0.0, al.f32)
@@ -26,16 +26,16 @@ a = al.convert(A[row, k], al.f32)
 For `A` of type `al.Tensor((8, 2), al.f32)`, indexing one row loads a two-element vector:
 
 ```python
-pair = al.convert(A[row], al.f16)  # Two f16 values, with shape (2,).
+pair = al.convert(A[row], al.Tensor((2,), al.f16))
 packed = al.view(pair, al.Tensor((1,), al.u32))[0]
 ```
 
-The conversion changes the numeric values' representation. The subsequent view reinterprets their bits as a packed word. A tensor memory view must first be indexed to load the values to convert.
+The `al.Tensor` target describes the vector result; it does not allocate memory. The conversion changes the numeric values' representation. The subsequent view reinterprets their bits as a packed word. A tensor memory view must first be indexed to load the values to convert.
 
 On gfx950, four FP8 values can be packed into one `u32`. For `A` of type `al.Tensor((8, 4), al.f32)`:
 
 ```python
-values = al.convert(A[row], al.f8e4m3fn)
+values = al.convert(A[row], al.Tensor((4,), al.f8e4m3fn))
 packed = al.view(values, al.Tensor((1,), al.u32))[0]
 ```
 

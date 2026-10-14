@@ -87,8 +87,8 @@ class constexpr:
 
 
 # Built-in functions for GPU kernels
-def convert(value, dtype):
-    """Numerically convert a scalar or vector to dtype, preserving its shape."""
+def convert(value, target_type):
+    """Convert a scalar to a dtype or a vector to an explicit Tensor type."""
     pass
 
 
