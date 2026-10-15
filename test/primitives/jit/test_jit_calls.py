@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import unittest
 
-import torch
 import avelang
 import avelang.language as S
+import pytest
+import torch
+from avelang.backends.amdgpu.driver import make_launcher as make_hip_launcher
+from avelang.backends.nvidia.driver import make_launcher as make_cuda_launcher
 
 
 def helper(x):
@@ -90,6 +93,13 @@ class TestJitCalls(unittest.TestCase):
             c[tid] = helper(a[tid], b[tid])
 
         self.assertIsInstance(kernel_shadow.cache_key, str)
+
+
+@pytest.mark.no_gpu
+@pytest.mark.parametrize("make_launcher", [make_cuda_launcher, make_hip_launcher], ids=["cuda", "hip"])
+@pytest.mark.parametrize("ty, cpp_type", [("fp32", "float"), ("fp64", "double")])
+def test_launcher_scalar_float_types(make_launcher, ty, cpp_type):
+    assert make_launcher({}, {0: ty}) == make_launcher({}, {0: cpp_type})
 
 
 if __name__ == "__main__":
