@@ -856,7 +856,6 @@ mlir::Value AMDGPUIntrinsic::CreateReadFirstLaneFunction(
     auto value = ConvertToI32(builder, location, resolved_args[0]);
     auto op = mlir::ROCDL::ReadfirstlaneOp::create(builder, location,
                                                    value.getType(), value);
-    SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
     return op.getResult();
 }
 
