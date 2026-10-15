@@ -969,8 +969,8 @@ mlir::Value AveLangModule::CreateConvertFunction(
         targetUnsigned = typeInfo.is_unsigned_integer;
     }
 
-    auto result = causalflow::avelang::ir::CreateTypeConversion(
-        value, source_type, target_type, location, builder, true,
+    auto result = causalflow::avelang::ir::CreateExplicitTypeConversion(
+        value, source_type, target_type, location, builder,
         GetTypeInfo(value).is_unsigned_integer, targetUnsigned);
     if (!result) {
         std::string source_str, target_str;

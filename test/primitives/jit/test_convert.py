@@ -185,6 +185,20 @@ def test_convert_rejects_invalid_vector_targets(kernel, diagnostic, capfd):
     assert diagnostic in capfd.readouterr().err
 
 
+@avelang.jit
+def return_vector_with_implicit_conversion(src: al.Tensor((1, 2), al.f16)) -> al.Tensor((2,), al.f32):
+    return src[0]
+
+
+def test_vector_return_requires_explicit_conversion(capfd):
+    jit_fn = return_vector_with_implicit_conversion
+    generator = _C.MLIRGenerator()
+    generator.generate_from_python_ast(_build_import_module([jit_fn]))
+    with pytest.raises(RuntimeError, match="compiler diagnostics"):
+        generator.visit_function_def(_get_function_def(jit_fn.parse()), "[]", "jit")
+    assert "Failed to convert return value" in capfd.readouterr().err
+
+
 @unittest.skipUnless(testing.has_cuda(), "GPU not available.")
 class TestConvert(unittest.TestCase):
     def assert_float_conversion(self, actual, expected):
