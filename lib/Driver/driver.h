@@ -70,7 +70,7 @@ class Driver {
                                   const CompilationOptions &Options = {},
                                   llvm::StringRef BufferName = "<input>");
 
-    /// Compile with constexpr values pre-populated as JSON.
+    /// Compile with JSON constexprs parsed into canonical typed attributes.
     llvm::Error compileFromBufferWithConstexprs(
         const llvm::MemoryBuffer &InputBuffer, llvm::raw_ostream &OS,
         const CompilationOptions &Options, llvm::StringRef BufferName,

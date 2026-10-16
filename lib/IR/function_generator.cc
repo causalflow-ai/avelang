@@ -1,4 +1,5 @@
 #include "Utils/assert.h"
+#include "constant_folder.h"
 #include "layout_operation.h"
 #include "mlir_generator_impl.h"
 #include "type_promotion.h"
@@ -55,6 +56,18 @@ static bool ExtractTupleElements(mlir::Value value,
     return false;
 }
 
+static bool IsInsertionPointTerminated(mlir::OpBuilder &builder) {
+    auto *block = builder.getInsertionBlock();
+    if (!block || builder.getInsertionPoint() == block->begin()) {
+        return false;
+    }
+
+    auto insertion_point = builder.getInsertionPoint();
+    auto *previous_op = &*--insertion_point;
+    return llvm::isa<cf::ReturnOp>(previous_op) ||
+           previous_op->mightHaveTrait<mlir::OpTrait::IsTerminator>();
+}
+
 static bool
 CanImplicitlyDemoteConstantWithoutPrecisionLoss(mlir::Value value,
                                                 mlir::Type targetType) {
@@ -98,12 +111,14 @@ CanImplicitlyDemoteConstantWithoutPrecisionLoss(mlir::Value value,
 FunctionGenerator::FunctionGenerator(MLIRGeneratorImpl &parent,
                                      MLIRGenerator::FunctionType function_type,
                                      ArgAddressSpaceMap argument_address_spaces,
-                                     std::string name_prefix)
+                                     std::string name_prefix,
+                                     ConstexprValueMap constexpr_values)
     : parent_(parent), ctx_(parent.ctx_),
       builder_(parent.ctx_->ir_context->GetMLIRContext()),
       expr_generator_(this), function_type_(function_type),
       name_prefix_(std::move(name_prefix)),
-      argument_address_spaces_(std::move(argument_address_spaces)) {
+      argument_address_spaces_(std::move(argument_address_spaces)),
+      constexpr_values_(std::move(constexpr_values)) {
     SS_ASSERT(ctx_);
 }
 
@@ -118,6 +133,30 @@ FunctionGenerator::GetMLIRLocation(clang::SourceLocation loc) const {
 }
 
 mlir::ModuleOp FunctionGenerator::GetModule() const { return parent_.module_; }
+
+mlir::Value FunctionGenerator::MaterializeConstexpr(
+    llvm::StringRef name, const ConstexprValue &value,
+    mlir::Location location) {
+    auto existing = materialized_constexprs_.find(name.str());
+    if (existing != materialized_constexprs_.end()) {
+        return existing->second;
+    }
+    if (!entry_block_ || !value) {
+        return mlir::Value();
+    }
+
+    mlir::OpBuilder::InsertionGuard guard(builder_);
+    if (auto *terminator = entry_block_->getTerminator()) {
+        builder_.setInsertionPoint(terminator);
+    } else {
+        builder_.setInsertionPointToEnd(entry_block_);
+    }
+    auto materialized =
+        mlir::arith::ConstantOp::create(builder_, location, value.attribute);
+    SetTypeInfo(materialized, value.type_info);
+    materialized_constexprs_.emplace(name.str(), materialized);
+    return materialized;
+}
 
 mlir::Value FunctionGenerator::GenerateExpr(ast::Expr *expr) {
     if (!expr) {
@@ -313,7 +352,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     std::string mangled_name;
     if (function_type_ == MLIRGenerator::FunctionType::kPrivateFunction) {
         mangled_name = parent_.GetMangledFunctionName(
-            func, &argument_address_spaces_, name_prefix_);
+            func, &argument_address_spaces_, name_prefix_,
+            &constexpr_values_);
         if (mangled_name.empty()) {
             ctx_->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
@@ -365,9 +405,15 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     for (size_t i = 0; i < argNames.size(); ++i) {
         ctx_->syms->DefineSymbol(argNames[i], entry_block.getArgument(i));
     }
+    for (const auto &[name, value] : constexpr_values_) {
+        ctx_->syms->GetCurrentFrame().AddConstexpr(name, value);
+    }
 
     for (auto *stmt : func->GetBody()) {
         DispatchStmt(stmt);
+        if (IsInsertionPointTerminated(builder_)) {
+            break;
+        }
     }
 
     // Add empty return to make function valid
@@ -967,20 +1013,20 @@ bool FunctionGenerator::ResolveNameAssignmentTarget(
     const std::string &target_name = name_target->GetId();
     auto existing_symbol = ctx_->syms->LookupSymbol(target_name);
     if (existing_symbol &&
-        !existing_symbol->isa(SymbolTable::SymbolKind::kValue)) {
-        ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kTypeMismatch,
-                                         source_loc)
-            << "Symbol has wrong type";
-        return false;
-    }
-    if (existing_symbol && existing_symbol->immutable) {
+        existing_symbol->isa(SymbolTable::SymbolKind::kConstexpr)) {
         ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                          source_loc)
             << "Cannot assign to immutable (constexpr) variable '" +
                    target_name + "'";
         return false;
     }
-
+    if (existing_symbol &&
+        !existing_symbol->isa(SymbolTable::SymbolKind::kValue)) {
+        ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kTypeMismatch,
+                                         source_loc)
+            << "Symbol has wrong type";
+        return false;
+    }
     mlir::Value existing_value =
         existing_symbol ? existing_symbol->value : mlir::Value();
     if (existing_value && mlir::isa<cf::MemRefType>(existing_value.getType())) {
@@ -1288,6 +1334,19 @@ void FunctionGenerator::VisitIf(ast::If *if_stmt) {
         ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                          if_stmt->GetSourceRange().getBegin())
             << "Failed to generate condition expression for if statement";
+        return;
+    }
+
+    if (auto folded = ConstantFolder::FoldBoolValue(condition)) {
+        SymbolTable::FrameGuard guard(ctx_->syms.get());
+        const auto &body =
+            *folded ? if_stmt->GetBody() : if_stmt->GetOrelse();
+        for (auto *stmt : body) {
+            DispatchStmt(stmt);
+            if (IsInsertionPointTerminated(builder_)) {
+                break;
+            }
+        }
         return;
     }
 
