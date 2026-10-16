@@ -14,9 +14,12 @@ env = Env()
 propagate_env = True
 
 
+CACHE_DIR_ENV = "AVELANG_CACHE_DIR"
+DISABLE_CACHE_ENV = "AVELANG_DISABLE_CACHE"
 CC_ENV = "CC"
 CXX_ENV = "CXX"
 LD_LIBRARY_PATH_ENV = "LD_LIBRARY_PATH"
+XDG_CACHE_HOME_ENV = "XDG_CACHE_HOME"
 
 
 def getenv(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -127,6 +130,13 @@ class env_opt_str(env_base[Optional[str], Optional[str]]):
         return getenv(self.key)
 
 
+def _default_cache_dir() -> str:
+    base = getenv(XDG_CACHE_HOME_ENV)
+    if base:
+        return os.path.join(os.path.abspath(os.path.expanduser(base)), "avelang")
+    return os.path.join(Path.home(), ".cache", "avelang")
+
+
 knobs_type = TypeVar("knobs_type", bound="base_knobs")
 
 
@@ -173,4 +183,10 @@ class build_knobs(base_knobs):
     ld_library_path: env_opt_str = env_opt_str(LD_LIBRARY_PATH_ENV)
 
 
+class cache_knobs(base_knobs):
+    dir: env_str_callable_default = env_str_callable_default(CACHE_DIR_ENV, _default_cache_dir)
+    disabled: env_bool = env_bool(DISABLE_CACHE_ENV, False)
+
+
+cache = cache_knobs()
 build = build_knobs()
