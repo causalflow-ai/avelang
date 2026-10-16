@@ -10,6 +10,7 @@
 #include <mlir/Dialect/ControlFlow/Transforms/BufferizableOpInterfaceImpl.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/Index/IR/IndexDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
@@ -40,6 +41,7 @@ IRContext::IRContext() {
                     mlir::memref::MemRefDialect, mlir::cf::ControlFlowDialect,
                     mlir::index::IndexDialect, mlir::scf::SCFDialect,
                     mlir::gpu::GPUDialect, mlir::vector::VectorDialect,
+                    mlir::nvgpu::NVGPUDialect,
                     mlir::ptr::PtrDialect,
                     causalflow::avelang::dialect::AveLangDialect>();
 
@@ -70,6 +72,7 @@ IRContext::IRContext() {
     mlir_context_->loadDialect<mlir::scf::SCFDialect>();
     mlir_context_->loadDialect<mlir::gpu::GPUDialect>();
     mlir_context_->loadDialect<mlir::vector::VectorDialect>();
+    mlir_context_->loadDialect<mlir::nvgpu::NVGPUDialect>();
     mlir_context_->loadDialect<mlir::ptr::PtrDialect>();
     mlir_context_->loadDialect<mlir::ROCDL::ROCDLDialect>();
     mlir_context_->loadDialect<mlir::NVVM::NVVMDialect>();

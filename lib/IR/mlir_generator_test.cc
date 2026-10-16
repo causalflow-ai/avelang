@@ -1,6 +1,7 @@
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "Dialect/AveLang/Transforms/lower_ave_lang_to_memref_pass.h"
 #include "Frontend/avelang_parser.h"
+#include "IR/constant_folder.h"
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
 #include "IR/symbol_table.h"
@@ -10,6 +11,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
@@ -26,6 +28,25 @@
 
 namespace causalflow::avelang::frontend {
 namespace cf = causalflow::avelang::dialect;
+
+TEST(ConstantFolderTest, FoldsIntegerConstantsAcrossDialects) {
+    auto irContext = ir::IRContext::Create();
+    mlir::OpBuilder builder(irContext->GetMLIRContext());
+    mlir::Block block;
+    builder.setInsertionPointToStart(&block);
+
+    auto location = builder.getUnknownLoc();
+    auto arithConstant =
+        mlir::arith::ConstantIntOp::create(builder, location, 7, 32);
+    auto llvmConstant = mlir::LLVM::ConstantOp::create(
+        builder, location, builder.getI32Type(), 35);
+    auto sum = mlir::arith::AddIOp::create(builder, location, arithConstant,
+                                           llvmConstant);
+
+    EXPECT_EQ(ir::ConstantFolder::FoldIntValue(arithConstant), 7);
+    EXPECT_EQ(ir::ConstantFolder::FoldIntValue(llvmConstant), 35);
+    EXPECT_EQ(ir::ConstantFolder::FoldIntValue(sum), 42);
+}
 
 class DiagnosticHandler : public clang::DiagnosticConsumer {
   public:
@@ -1444,6 +1465,54 @@ def stmatrix_comprehensive_test(data1: S.i32,
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMMakeTMADescriptor) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_descriptor_test(global_mem: S.Tensor((16, 16), S.f32)):
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, RejectNVVMTMADescriptorLowerRankLayout) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_descriptor_test(global_mem: S.Tensor((16, 16), S.f32)):
+    smem_layout = S.make_layout((256,), (1,))
+    desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode,
+        "make_tma_descriptor smem_layout rank must match tensor rank; got "
+        "layout rank 1 and tensor rank 2");
+}
+
+TEST_F(MLIRGeneratorTest, RejectNVVMTMADescriptorHigherRankLayout) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_descriptor_test(global_mem: S.Tensor((16, 16), S.f32)):
+    smem_layout = S.make_layout((1, 16, 16), (256, 16, 1))
+    desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode,
+        "make_tma_descriptor smem_layout rank must match tensor rank; got "
+        "layout rank 3 and tensor rank 2");
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUMFMASync) {

@@ -10,6 +10,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/Matchers.h>
 
 #include <llvm/Support/Casting.h>
 
@@ -278,13 +279,10 @@ std::optional<int64_t> ConstantFolder::GetConstantIntValue(mlir::Value value) {
         return std::nullopt;
     }
 
-    if (auto const_op = value.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto int_attr =
-                mlir::dyn_cast<mlir::IntegerAttr>(const_op.getValue())) {
-            return int_attr.getInt();
-        }
+    llvm::APInt integer;
+    if (mlir::matchPattern(value, mlir::m_ConstantInt(&integer))) {
+        return integer.getSExtValue();
     }
-
     return std::nullopt;
 }
 

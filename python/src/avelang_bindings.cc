@@ -56,6 +56,37 @@ static std::string NormalizeTargetTriple(llvm::StringRef triple) {
     return triple.str();
 }
 
+static py::object ToPython(const llvm::json::Value &value) {
+    switch (value.kind()) {
+    case llvm::json::Value::Null:
+        return py::none();
+    case llvm::json::Value::Boolean:
+        return py::bool_(*value.getAsBoolean());
+    case llvm::json::Value::Number:
+        if (auto integer = value.getAsInteger()) {
+            return py::int_(*integer);
+        }
+        return py::float_(*value.getAsNumber());
+    case llvm::json::Value::String:
+        return py::str(value.getAsString()->str());
+    case llvm::json::Value::Array: {
+        py::list result;
+        for (const auto &element : *value.getAsArray()) {
+            result.append(ToPython(element));
+        }
+        return result;
+    }
+    case llvm::json::Value::Object: {
+        py::dict result;
+        for (const auto &[key, element] : *value.getAsObject()) {
+            result[py::str(key.str())] = ToPython(element);
+        }
+        return result;
+    }
+    }
+    llvm_unreachable("unknown JSON value kind");
+}
+
 static std::string FormatMLIRLocation(mlir::Location loc) {
     std::string location;
     llvm::raw_string_ostream os(location);
@@ -165,6 +196,7 @@ class AveLangMLIRGenerator {
                           const std::string &function_type = "kernel");
     void GenerateFromPythonAST(const py::object &py_ast_node);
     void AddJitDependency(const py::object &py_ast_node);
+    py::dict GetKernelMetadata(const std::string &target_triple);
     std::string GetMLIR();
     std::string GetLLVMIR(const std::string &target_triple,
                           const std::string &target_chipset, unsigned opt_level,
@@ -333,6 +365,26 @@ void AveLangMLIRGenerator::AddJitDependency(const py::object &py_ast_node) {
         }
     }
     dependency_contexts_.push_back(std::move(ast_context));
+}
+
+py::dict
+AveLangMLIRGenerator::GetKernelMetadata(const std::string &target_triple) {
+    auto module = generator_.GetModule();
+    if (!module) {
+        return {};
+    }
+
+    std::string normalizedTriple = NormalizeTargetTriple(target_triple);
+    auto backend =
+        target::gpu::GPUBackendRegistry::getInstance().createBackendForTriple(
+            normalizedTriple);
+    if (!backend) {
+        throw std::runtime_error("No GPU backend found for target triple: " +
+                                 normalizedTriple);
+    }
+
+    auto metadata = backend->getKernelMetadata(module);
+    return ToPython(llvm::json::Value(std::move(metadata))).cast<py::dict>();
 }
 
 std::string AveLangMLIRGenerator::GetMLIR() {
@@ -515,6 +567,8 @@ PYBIND11_MODULE(_avelang_bindings, m) {
              py::arg("py_ast_node"))
         .def("add_jit_dependency", &AveLangMLIRGenerator::AddJitDependency,
              py::arg("py_ast_node"))
+        .def("get_kernel_metadata", &AveLangMLIRGenerator::GetKernelMetadata,
+             py::arg("target_triple"))
         .def("get_mlir", &AveLangMLIRGenerator::GetMLIR)
         .def("get_llvm_ir", &AveLangMLIRGenerator::GetLLVMIR,
              py::arg("target_triple"), py::arg("target_chipset"),
