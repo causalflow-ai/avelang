@@ -4,6 +4,7 @@
 #include "lower_math_to_amdgpu_pass.h"
 
 #include <mlir/Conversion/AffineToStandard/AffineToStandard.h>
+#include <mlir/Conversion/ArithToAMDGPU/ArithToAMDGPU.h>
 #include <mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h>
 #include <mlir/Conversion/LLVMCommon/LoweringOptions.h>
 #include <mlir/Conversion/Passes.h>
@@ -145,6 +146,11 @@ static void buildGpuPassPipeline(OpPassManager &pm,
     }
     pm.addNestedPass<gpu::GPUModuleOp>(createLegalizeGPUShuffleToIDXPass());
 
+    ArithToAMDGPUConversionPassOptions arithToAmdgpuOptions;
+    arithToAmdgpuOptions.chipset = options.chipset;
+    pm.addNestedPass<gpu::GPUModuleOp>(
+        createArithToAMDGPUConversionPass(std::move(arithToAmdgpuOptions)));
+
     ConvertGpuOpsToROCDLOpsOptions gpuToRocdlOptions;
     gpuToRocdlOptions.chipset = options.chipset;
     gpuToRocdlOptions.indexBitwidth = kDeriveIndexBitwidthFromDataLayout;
@@ -154,7 +160,10 @@ static void buildGpuPassPipeline(OpPassManager &pm,
     pm.addNestedPass<gpu::GPUModuleOp>(
         createConvertGpuOpsToROCDLOps(std::move(gpuToRocdlOptions)));
 
-    pm.addNestedPass<gpu::GPUModuleOp>(createConvertAMDGPUToROCDLPass());
+    ConvertAMDGPUToROCDLPassOptions amdgpuToRocdlOptions;
+    amdgpuToRocdlOptions.chipset = options.chipset;
+    pm.addNestedPass<gpu::GPUModuleOp>(
+        createConvertAMDGPUToROCDLPass(std::move(amdgpuToRocdlOptions)));
 
     pm.addNestedPass<gpu::GPUModuleOp>(createConvertVectorToLLVMPass());
     pm.addNestedPass<gpu::GPUModuleOp>(createCanonicalizerPass());

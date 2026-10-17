@@ -18,6 +18,15 @@ For value types, Ave supports signed integers (`al.i8`, `al.i16`, `al.i32`, `al.
 
 Value conversion is described in [Builtin Functions](../builtin-functions/).
 
+FP8/BF8 type annotations distinguish the following formats:
+
+| Type | Format | Encoding |
+| --- | --- | --- |
+| `al.f8e4m3fn` | E4M3 (FP8) | OCP |
+| `al.f8e4m3fnuz` | E4M3 (FP8) | FNUZ |
+| `al.f8e5m2` | E5M2 (BF8) | OCP |
+| `al.f8e5m2fnuz` | E5M2 (BF8) | FNUZ |
+
 ## Tensor Types
 
 `al.Tensor(shape, type)` denotes the type of a tensor. A tensor is a multidimensional view over a memory region. The shape describes the logical dimensions of the tensor, and the type describes the value type of each element. For example, `al.Tensor((16, 16), al.f32)` denotes a two-dimensional tensor with 16 rows and 16 columns of 32-bit floating point values.
