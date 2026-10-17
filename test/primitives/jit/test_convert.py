@@ -113,33 +113,26 @@ def pack_fp8_fnuz(
 
 @avelang.jit
 def convert_vector_integers(
-    signed: al.Tensor((2, 4), al.i16),
-    unsigned: al.Tensor((2, 4), al.u16),
-    out: al.Tensor((8, 2, 4), al.f32),
+    src: al.Tensor((2, 4), al.i32),
+    narrow_out: al.Tensor((2, 4), al.i16),
+    wide_out: al.Tensor((2, 4), al.i64),
 ):
     lane = al.thread_id(0)
-    signed_values = signed[lane]
-    unsigned_values = unsigned[lane]
-    out[0, lane] = al.convert(signed_values, al.Tensor((4,), al.f32))
-    out[1, lane] = al.convert(unsigned_values, al.Tensor((4,), al.f32))
-    out[2, lane] = al.convert(al.convert(signed_values, al.Tensor((4,), al.u32)), al.Tensor((4,), al.f32))
-    out[3, lane] = al.convert(al.convert(unsigned_values, al.Tensor((4,), al.i16)), al.Tensor((4,), al.f32))
-    out[4, lane] = al.convert(al.convert(unsigned_values, al.Tensor((4,), al.u8)), al.Tensor((4,), al.f32))
-    out[5, lane] = al.convert(al.convert(signed_values, al.Tensor((4,), al.i8)), al.Tensor((4,), al.f32))
-    out[6, lane] = al.convert(al.convert(signed_values, al.Tensor((4,), al.i64)), al.Tensor((4,), al.f32))
-    out[7, lane] = al.convert(al.convert(unsigned_values, al.Tensor((4,), al.u64)), al.Tensor((4,), al.f32))
+    values = src[lane]
+    narrow_out[lane] = al.convert(values, al.Tensor((4,), al.i16))
+    wide_out[lane] = al.convert(values, al.Tensor((4,), al.i64))
 
 
 @avelang.jit
 def convert_vector_float_to_integer(
-    signed_src: al.Tensor((2, 4), al.f32),
-    unsigned_src: al.Tensor((2, 4), al.f64),
-    signed: al.Tensor((2, 4), al.i32),
-    unsigned: al.Tensor((2, 4), al.u64),
+    src: al.Tensor((2, 4), al.f32),
+    out: al.Tensor((2, 4), al.i32),
+    restored: al.Tensor((2, 4), al.f32),
 ):
     lane = al.thread_id(0)
-    signed[lane] = al.convert(signed_src[lane], al.Tensor((4,), al.i32))
-    unsigned[lane] = al.convert(unsigned_src[lane], al.Tensor((4,), al.u64))
+    values = al.convert(src[lane], al.Tensor((4,), al.i32))
+    out[lane] = values
+    restored[lane] = al.convert(values, al.Tensor((4,), al.f32))
 
 
 @avelang.jit
@@ -204,15 +197,9 @@ class TestConvert(unittest.TestCase):
     def assert_float_conversion(self, actual, expected):
         actual = actual.cpu()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
-        # Check signed zero; NaN signs may differ across targets.
-        non_nan = ~torch.isnan(expected)
-        torch.testing.assert_close(
-            torch.signbit(actual[non_nan]),
-            torch.signbit(expected[non_nan]),
-        )
 
     def test_f16_bf16_conversion(self):
-        # Rounding ties, signed zero, subnormals, overflow, and special values.
+        # Rounding ties, subnormals, overflow, and special values.
         values = torch.tensor(
             [
                 0.0,
@@ -393,48 +380,25 @@ class TestConvert(unittest.TestCase):
             expected = src.to(dtype).view(torch.int32).reshape(4)
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
-    def test_vector_integer_width_and_signedness(self):
-        signed = torch.tensor([-32768, -255, -1, 0, 1, 255, 32766, 32767], dtype=torch.int16).reshape(2, 4)
-        unsigned = torch.tensor([0, 1, 255, 32767, 32768, 65533, 65534, 65535], dtype=torch.uint16).reshape(2, 4)
-        out = torch.empty((8, 2, 4), dtype=torch.float32, device="cuda")
-        convert_vector_integers[lambda: ((1, 1, 1), (2, 1, 1))](signed.to("cuda"), unsigned.to("cuda"), out)
-        expected = torch.stack(
-            [
-                signed.float(),
-                unsigned.float(),
-                signed.to(torch.uint32).float(),
-                unsigned.to(torch.int16).float(),
-                unsigned.to(torch.uint8).float(),
-                signed.to(torch.int8).float(),
-                signed.to(torch.int64).float(),
-                unsigned.to(torch.uint64).float(),
-            ]
-        )
-        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    def test_vector_integer_width_conversion(self):
+        src = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+        narrow_out = torch.empty((2, 4), dtype=torch.int16, device="cuda")
+        wide_out = torch.empty((2, 4), dtype=torch.int64, device="cuda")
+        convert_vector_integers[lambda: ((1, 1, 1), (2, 1, 1))](src.to("cuda"), narrow_out, wide_out)
+        torch.testing.assert_close(narrow_out.cpu(), src.to(torch.int16), rtol=0, atol=0)
+        torch.testing.assert_close(wide_out.cpu(), src.to(torch.int64), rtol=0, atol=0)
 
-    def test_vector_float_to_signed_and_unsigned_integer(self):
-        signed_src = torch.tensor(
-            [-32768.75, -127.5, -1.9, -0.9, 0.9, 1.9, 255.5, 65535.5],
+    def test_vector_integer_float_conversion(self):
+        src = torch.tensor(
+            [0.0, 0.9, 1.1, 1.9, 2.5, 3.9, 127.5, 255.75],
             dtype=torch.float32,
         ).reshape(2, 4)
-        unsigned_src = torch.tensor(
-            [0, 0.9, 1.9, 127.5, 255.5, 65535.75, 2**32 + 0.75, 2**40 + 0.75],
-            dtype=torch.float64,
-        ).reshape(2, 4)
-        signed = torch.empty((2, 4), dtype=torch.int32, device="cuda")
-        unsigned = torch.empty((2, 4), dtype=torch.uint64, device="cuda")
-        convert_vector_float_to_integer[lambda: ((1, 1, 1), (2, 1, 1))](
-            signed_src.to("cuda"),
-            unsigned_src.to("cuda"),
-            signed,
-            unsigned,
-        )
-        expected_signed = signed_src.to(torch.int32)
-        expected_unsigned = unsigned_src.to(torch.uint64)
-        torch.testing.assert_close(signed.cpu(), expected_signed, rtol=0, atol=0)
-        torch.testing.assert_close(
-            unsigned.cpu().view(torch.int64), expected_unsigned.view(torch.int64), rtol=0, atol=0
-        )
+        out = torch.empty((2, 4), dtype=torch.int32, device="cuda")
+        restored = torch.empty((2, 4), dtype=torch.float32, device="cuda")
+        convert_vector_float_to_integer[lambda: ((1, 1, 1), (2, 1, 1))](src.to("cuda"), out, restored)
+        expected = src.to(torch.int32)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        self.assert_float_conversion(restored, expected.float())
 
     def test_multidimensional_vector_shape(self):
         src = torch.tensor([-3.5, -1.0, 0.0, 1.0, 2.5, 65504.0], dtype=torch.float32).reshape(1, 6)

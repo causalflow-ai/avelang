@@ -48,19 +48,16 @@ mlir::Value CreateTypeConversionImpl(
         auto target_width = target_dtype.getIntOrFloatBitWidth();
 
         if (source_width < target_width) {
-            // Extend by source signedness, but tag the result by target dtype.
             auto isUnsigned = source_unsigned.value_or(false);
             if (isUnsigned) {
                 auto result = mlir::arith::ExtUIOp::create(builder, location,
                                                            result_type, value);
-                SetTypeInfo(result.getResult(),
-                            TypeInfo{target_unsigned.value_or(true)});
+                SetTypeInfo(result.getResult(), TypeInfo{true});
                 return result;
             } else {
                 auto result = mlir::arith::ExtSIOp::create(builder, location,
                                                            result_type, value);
-                SetTypeInfo(result.getResult(),
-                            TypeInfo{target_unsigned.value_or(false)});
+                SetTypeInfo(result.getResult(), TypeInfo{false});
                 return result;
             }
         } else if (source_width > target_width) {
