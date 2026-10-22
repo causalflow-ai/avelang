@@ -114,7 +114,6 @@ class LowerToLLVM::Impl {
             ::mlir::registerConvertFuncToLLVMInterface(registry);
             ::mlir::index::registerConvertIndexToLLVMInterface(registry);
             ::mlir::LLVM::registerInlinerInterface(registry);
-            ::mlir::NVVM::registerInlinerInterface(registry);
             ::mlir::registerConvertMathToLLVMInterface(registry);
             ::mlir::registerConvertMemRefToLLVMInterface(registry);
             ::mlir::registerConvertNVVMToLLVMInterface(registry);

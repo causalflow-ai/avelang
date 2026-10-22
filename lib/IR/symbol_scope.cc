@@ -5,87 +5,63 @@
 
 namespace causalflow::avelang::ir {
 
-SymbolScope::Symbol::Symbol() : kind(kValue), value() {}
+SymbolScope::Symbol::Symbol(NamedModule *m) : payload_(m) {}
 
-SymbolScope::Symbol::Symbol(NamedModule *m) : kind(kModule), module(m) {}
+SymbolScope::Symbol::Symbol(TypeFactoryFunction tf, NamedModule *module)
+    : payload_(TypeFactory{module, std::move(tf)}) {}
 
-SymbolScope::Symbol::Symbol(TypeFactoryFunction tf)
-    : kind(kTypeFactory), type_factory(tf) {}
+SymbolScope::Symbol::Symbol(Function ff) : payload_(std::move(ff)) {}
 
-SymbolScope::Symbol::Symbol(Function ff)
-    : kind(kFunction), function(std::move(ff)) {}
+SymbolScope::Symbol::Symbol(mlir::Type t) : payload_(t) {}
 
-SymbolScope::Symbol::Symbol(mlir::Type t) : kind(kType), type(t) {}
+SymbolScope::Symbol::Symbol(mlir::Value v, bool immutable)
+    : payload_(v), immutable_(immutable) {}
 
-SymbolScope::Symbol::Symbol(mlir::Value v) : kind(kValue), value(v) {}
-
-SymbolScope::Symbol::~Symbol() {
-    switch (kind) {
-    case kTypeFactory:
-        type_factory.~TypeFactoryFunction();
-        break;
-    case kFunction:
-        function.~Function();
-        break;
+bool SymbolScope::Symbol::isa(SymbolKind k) const {
+    switch (k) {
     case kModule:
-    case kType:
-    case kValue:
-        // These types don't need explicit destruction
-        break;
-    }
-}
-
-SymbolScope::Symbol::Symbol(const Symbol &other)
-    : kind(other.kind), immutable(other.immutable) {
-    switch (kind) {
-    case kModule:
-        module = other.module;
-        break;
+        return std::holds_alternative<NamedModule *>(payload_);
     case kTypeFactory:
-        new (&type_factory) TypeFactoryFunction(other.type_factory);
-        break;
+        return std::holds_alternative<TypeFactory>(payload_);
     case kFunction:
-        new (&function) Function(other.function);
-        break;
+        return std::holds_alternative<Function>(payload_);
     case kType:
-        type = other.type;
-        break;
+        return std::holds_alternative<mlir::Type>(payload_);
     case kValue:
-        value = other.value;
-        break;
+        return std::holds_alternative<mlir::Value>(payload_);
     }
+    return false;
 }
 
-SymbolScope::Symbol &SymbolScope::Symbol::operator=(const Symbol &other) {
-    if (this != &other) {
-        // Destroy current content
-        this->~Symbol();
-
-        // Copy construct new content
-        kind = other.kind;
-        immutable = other.immutable;
-        switch (kind) {
-        case kModule:
-            module = other.module;
-            break;
-        case kTypeFactory:
-            new (&type_factory) TypeFactoryFunction(other.type_factory);
-            break;
-        case kFunction:
-            new (&function) Function(other.function);
-            break;
-        case kType:
-            type = other.type;
-            break;
-        case kValue:
-            value = other.value;
-            break;
-        }
+NamedModule *SymbolScope::Symbol::GetModule() const {
+    if (auto *module = std::get_if<NamedModule *>(&payload_)) {
+        return *module;
     }
-    return *this;
+    if (auto *factory = std::get_if<TypeFactory>(&payload_)) {
+        return factory->module;
+    }
+    return nullptr;
 }
 
-bool SymbolScope::Symbol::isa(SymbolKind k) const { return this->kind == k; }
+SymbolScope::TypeFactoryFunction SymbolScope::Symbol::GetTypeFactory() const {
+    auto *factory = std::get_if<TypeFactory>(&payload_);
+    return factory ? factory->implementation : TypeFactoryFunction();
+}
+
+SymbolScope::Function SymbolScope::Symbol::GetFunction() const {
+    auto *function = std::get_if<Function>(&payload_);
+    return function ? *function : Function();
+}
+
+mlir::Type SymbolScope::Symbol::GetType() const {
+    auto *type = std::get_if<mlir::Type>(&payload_);
+    return type ? *type : mlir::Type();
+}
+
+mlir::Value SymbolScope::Symbol::GetValue() const {
+    auto *value = std::get_if<mlir::Value>(&payload_);
+    return value ? *value : mlir::Value();
+}
 
 void SymbolScope::AddSymbol(const std::string &name, const Symbol &symbol) {
     symbols_[name] = symbol;
@@ -102,9 +78,7 @@ SymbolScope::LookupSymbol(const std::string &name) const {
 
 void SymbolScope::AddValue(const std::string &name, mlir::Value value,
                            bool immutable) {
-    Symbol sym(value);
-    sym.immutable = immutable;
-    symbols_[name] = sym;
+    symbols_[name] = Symbol(value, immutable);
 }
 
 void SymbolScope::AddType(const std::string &name, mlir::Type type) {
@@ -116,8 +90,9 @@ void SymbolScope::AddModule(const std::string &name, NamedModule *module) {
 }
 
 void SymbolScope::AddTypeFactory(const std::string &name,
-                                 TypeFactoryFunction factory) {
-    symbols_[name] = Symbol(factory);
+                                 TypeFactoryFunction factory,
+                                 NamedModule *module) {
+    symbols_[name] = Symbol(std::move(factory), module);
 }
 
 void SymbolScope::AddFunction(const std::string &name,
@@ -134,7 +109,7 @@ void SymbolScope::AddFunction(const std::string &name, Function function) {
 mlir::Value SymbolScope::LookupValue(const std::string &name) const {
     auto it = symbols_.find(name);
     if (it != symbols_.end() && it->second.isa(kValue)) {
-        return it->second.value;
+        return it->second.GetValue();
     }
     return mlir::Value();
 }
@@ -142,7 +117,7 @@ mlir::Value SymbolScope::LookupValue(const std::string &name) const {
 mlir::Type SymbolScope::LookupType(const std::string &name) const {
     auto it = symbols_.find(name);
     if (it != symbols_.end() && it->second.isa(kType)) {
-        return it->second.type;
+        return it->second.GetType();
     }
     return mlir::Type();
 }
@@ -150,7 +125,7 @@ mlir::Type SymbolScope::LookupType(const std::string &name) const {
 NamedModule *SymbolScope::LookupModule(const std::string &name) const {
     auto it = symbols_.find(name);
     if (it != symbols_.end() && it->second.isa(kModule)) {
-        return it->second.module;
+        return it->second.GetModule();
     }
     return nullptr;
 }
@@ -159,7 +134,7 @@ SymbolScope::TypeFactoryFunction
 SymbolScope::LookupTypeFactory(const std::string &name) const {
     auto it = symbols_.find(name);
     if (it != symbols_.end() && it->second.isa(kTypeFactory)) {
-        return it->second.type_factory;
+        return it->second.GetTypeFactory();
     }
     return nullptr;
 }
@@ -168,7 +143,7 @@ SymbolScope::Function
 SymbolScope::LookupFunction(const std::string &name) const {
     auto it = symbols_.find(name);
     if (it != symbols_.end() && it->second.isa(kFunction)) {
-        return it->second.function;
+        return it->second.GetFunction();
     }
     return Function();
 }

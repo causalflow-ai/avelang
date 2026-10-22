@@ -33,7 +33,7 @@ void NamedModule::AddModule(const std::string &name, NamedModule *module) {
 
 void NamedModule::AddTypeFactory(const std::string &name,
                                  TypeFactoryFunction factory) {
-    symbols_.AddTypeFactory(name, factory);
+    symbols_.AddTypeFactory(name, std::move(factory), this);
 }
 
 void NamedModule::AddFunction(const std::string &name,
@@ -94,10 +94,11 @@ NamedModule *NamedModuleRegistry::GetModule(const std::string &name) {
         }
 
         auto symbol = module->LookupSymbol(segment);
-        if (!symbol || !symbol->isa(SymbolScope::kModule) || !symbol->module) {
+        if (!symbol || !symbol->isa(SymbolScope::kModule) ||
+            !symbol->GetModule()) {
             return nullptr;
         }
-        module = symbol->module;
+        module = symbol->GetModule();
         segment_end = next_end;
     }
 

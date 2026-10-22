@@ -15,6 +15,7 @@
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Support/LLVM.h>
@@ -553,7 +554,11 @@ class AMDGPURawBufferLoadLowering
         auto rsrc = op.getRsrc();
         auto vindex = op.getVindex();
         auto soffset = op.getSoffset();
-        auto aux = op.getAux();
+        mlir::Attribute aux;
+        if (!mlir::matchPattern(op.getAux(), mlir::m_Constant(&aux))) {
+            return rewriter.notifyMatchFailure(op,
+                                               "expected a constant aux value");
+        }
         auto resultType = op.getResult().getType();
 
         auto loadOp = mlir::ROCDL::RawBufferLoadOp::create(
@@ -575,7 +580,11 @@ class AMDGPURawBufferStoreLowering
         auto rsrc = op.getRsrc();
         auto vindex = op.getVindex();
         auto soffset = op.getSoffset();
-        auto aux = op.getAux();
+        mlir::Attribute aux;
+        if (!mlir::matchPattern(op.getAux(), mlir::m_Constant(&aux))) {
+            return rewriter.notifyMatchFailure(op,
+                                               "expected a constant aux value");
+        }
 
         mlir::ROCDL::RawBufferStoreOp::create(rewriter, op.getLoc(), data, rsrc,
                                               vindex, soffset, aux);

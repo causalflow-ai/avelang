@@ -3,14 +3,16 @@
 #include <string>
 
 #include <llvm/ADT/ArrayRef.h>
-#include <llvm/ADT/StringRef.h>
+#include <mlir/IR/Value.h>
+
+namespace causalflow::avelang::ast {
+class FunctionDef;
+} // namespace causalflow::avelang::ast
 
 namespace causalflow::avelang::ir {
 
-std::string MangleFunctionName(llvm::ArrayRef<std::string> scope,
-                               llvm::StringRef name);
-std::string MangleFunctionName(llvm::ArrayRef<std::string> scope,
-                               llvm::StringRef name,
-                               llvm::ArrayRef<std::string> address_space_tags);
+std::string MangleFunctionName(ast::FunctionDef *func,
+                               llvm::ArrayRef<std::string> scope = {},
+                               llvm::ArrayRef<mlir::Value> arguments = {});
 
 } // namespace causalflow::avelang::ir

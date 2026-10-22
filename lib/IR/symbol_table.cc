@@ -10,6 +10,7 @@
 
 #include <llvm/Support/Error.h>
 #include <ranges>
+#include <set>
 
 namespace causalflow::avelang::ir {
 
@@ -66,9 +67,10 @@ bool SymbolTable::ImportSymbolFrom(const std::string &module_name,
     return true;
 }
 
-void SymbolTable::DefineSymbol(const std::string &name, mlir::Value value) {
+void SymbolTable::DefineSymbol(const std::string &name, mlir::Value value,
+                               bool immutable) {
     auto &frame = GetCurrentFrame();
-    frame.AddValue(name, value);
+    frame.AddValue(name, value, immutable);
 }
 
 std::optional<SymbolTable::Symbol>
@@ -81,6 +83,23 @@ SymbolTable::LookupSymbol(const std::string &name) const {
         }
     }
     return std::nullopt;
+}
+
+std::map<std::string, mlir::Value>
+SymbolTable::GetVisibleImmutableValues() const {
+    std::map<std::string, mlir::Value> values;
+    std::set<std::string> seen;
+    for (const auto &frame : frames_ | std::views::reverse) {
+        for (const auto &[name, symbol] : frame.GetSymbols()) {
+            if (!seen.insert(name).second) {
+                continue;
+            }
+            if (symbol.isa(SymbolKind::kValue) && symbol.IsImmutable()) {
+                values.emplace(name, symbol.GetValue());
+            }
+        }
+    }
+    return values;
 }
 
 void SymbolTable::DeclareModules(mlir::ModuleOp module) {
@@ -200,7 +219,7 @@ SymbolTable::ResolveSymbolImpl(ast::Expr *expr, bool report_not_found) {
             return std::nullopt;
         }
 
-        auto next_symbol = current_symbol->module->LookupSymbol(attr_name);
+        auto next_symbol = current_symbol->GetModule()->LookupSymbol(attr_name);
         if (!next_symbol) {
             std::string path_so_far;
             for (size_t j = 0; j <= i; ++j) {
@@ -230,7 +249,7 @@ mlir::Value SymbolTable::ResolveRefExpr(ast::Expr *expr) {
 
     auto symbol =
         ResolveSymbol(expr, SymbolKind::kValue, /*report_not_found=*/false);
-    return symbol ? symbol->value : mlir::Value();
+    return symbol ? symbol->GetValue() : mlir::Value();
 }
 
 mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
@@ -239,7 +258,7 @@ mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
         return mlir::Type();
     }
 
-    auto type = symbol->type;
+    auto type = symbol->GetType();
 
     // Validate that this is a builtin type (builtin scalar / vector types)
     if (!type.isIntOrFloat() && !type.isIndex() &&
@@ -258,7 +277,8 @@ mlir::Type SymbolTable::ResolveType(ast::Expr *expr) {
         auto symbol =
             ResolveSymbol(call_expr->GetFunc(), SymbolKind::kTypeFactory);
         if (symbol) {
-            return symbol->type_factory(symbol->module, call_expr, parent_);
+            return symbol->GetTypeFactory()(symbol->GetModule(), call_expr,
+                                            parent_);
         }
     }
 
@@ -267,26 +287,26 @@ mlir::Type SymbolTable::ResolveType(ast::Expr *expr) {
     if (llvm::isa<ast::AttributeExpr>(expr)) {
         // Try to resolve it as a type first
         auto symbol = ResolveSymbol(expr, SymbolKind::kType);
-        if (symbol && symbol->type) {
-            return symbol->type;
+        if (symbol && symbol->GetType()) {
+            return symbol->GetType();
         }
         // If not a type directly, try as a type factory with empty args
         auto factory_symbol = ResolveSymbol(expr, SymbolKind::kTypeFactory);
         if (factory_symbol) {
             // Create a dummy call with no arguments for the type factory
             // This handles cases like S.f32 where f32 is a type factory
-            return factory_symbol->type;
+            return factory_symbol->GetType();
         }
     }
 
     // Handle direct Name symbols
     auto symbol = ResolveSymbol(expr, SymbolKind::kType);
-    return symbol ? symbol->type : mlir::Type();
+    return symbol ? symbol->GetType() : mlir::Type();
 }
 
 NamedModule::Function SymbolTable::ResolveFunction(ast::Expr *expr) {
     auto symbol = ResolveSymbol(expr, SymbolKind::kFunction);
-    return symbol ? symbol->function : NamedModule::Function();
+    return symbol ? symbol->GetFunction() : NamedModule::Function();
 }
 
 } // namespace causalflow::avelang::ir

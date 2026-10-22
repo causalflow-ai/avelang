@@ -6,12 +6,12 @@
 #include "mangler.h"
 #include "mlir_generator_impl.h"
 #include "symbol_table.h"
+#include "type_system.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
-#include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
@@ -29,11 +29,11 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/JSON.h>
-#include <llvm/Support/raw_ostream.h>
 
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace causalflow::avelang::ir {
 
@@ -88,7 +88,6 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
     builder.setInsertionPointToStart(module.getBody());
 
     auto *symbolTable = Generator.GetSymbolTable();
-    auto &globalFrame = symbolTable->GetCurrentFrame();
 
     for (size_t index = 0; index < ConstexprsArray->size(); ++index) {
         const auto &item = (*ConstexprsArray)[index];
@@ -116,7 +115,8 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
                                            "constexprs entry missing 'value'");
         }
 
-        mlir::Value constValue;
+        mlir::TypedAttr attribute;
+        TypeInfo typeInfo;
 
         if (*type == "i32") {
             auto intVal = value->getAsInteger();
@@ -131,10 +131,9 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
                     llvm::inconvertibleErrorCode(),
                     "constexpr i32 value out of range");
             }
-            auto attr =
+            attribute =
                 builder.getI32IntegerAttr(static_cast<int32_t>(*intVal));
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
+            typeInfo.is_unsigned_integer = false;
         } else if (*type == "i64") {
             auto intVal = value->getAsInteger();
             if (!intVal) {
@@ -142,9 +141,8 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
                     llvm::inconvertibleErrorCode(),
                     "constexpr i64 value must be integer");
             }
-            auto attr = builder.getI64IntegerAttr(*intVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
+            attribute = builder.getI64IntegerAttr(*intVal);
+            typeInfo.is_unsigned_integer = false;
         } else if (*type == "f64") {
             auto floatVal = value->getAsNumber();
             if (!floatVal) {
@@ -152,9 +150,7 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
                     llvm::inconvertibleErrorCode(),
                     "constexpr f64 value must be number");
             }
-            auto attr = builder.getF64FloatAttr(*floatVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
+            attribute = builder.getF64FloatAttr(*floatVal);
         } else if (*type == "i1") {
             auto boolVal = value->getAsBoolean();
             if (!boolVal) {
@@ -162,15 +158,18 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
                     llvm::inconvertibleErrorCode(),
                     "constexpr i1 value must be boolean");
             }
-            auto attr = builder.getBoolAttr(*boolVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
+            attribute = builder.getBoolAttr(*boolVal);
+            typeInfo.is_unsigned_integer = false;
         } else {
             return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                            "Unsupported constexpr type");
         }
 
-        globalFrame.AddValue(name->str(), constValue, /*immutable=*/true);
+        auto constant = mlir::arith::ConstantOp::create(
+            builder, builder.getUnknownLoc(), attribute);
+        SetTypeInfo(constant.getResult(), typeInfo);
+        symbolTable->DefineSymbol(name->str(), constant.getResult(),
+                                  /*immutable=*/true);
     }
 
     return llvm::Error::success();
@@ -199,6 +198,12 @@ MLIRGenerator::VisitFunctionDefWithType(ast::FunctionDef *func,
         return E;
     impl_->SnapshotModuleSymbolTable();
 
+    if (func_type == FunctionType::kPrivateFunction) {
+        // Private JIT functions are emitted lazily from their call sites,
+        // where concrete ordered argument values are available.
+        return llvm::Error::success();
+    }
+
     FunctionGenerator function_generator(*impl_, func_type);
     function_generator.Generate(func);
     return llvm::Error::success();
@@ -217,77 +222,9 @@ MLIRGeneratorImpl::MLIRGeneratorImpl(GeneratorContext *context)
     named_module_registry_.Initialize();
 }
 
-static std::string AddressSpaceTag(mlir::Attribute memorySpace) {
-    if (!memorySpace) {
-        return "default";
-    }
-    if (auto gpuSpace =
-            mlir::dyn_cast<mlir::gpu::AddressSpaceAttr>(memorySpace)) {
-        switch (gpuSpace.getValue()) {
-        case mlir::gpu::AddressSpace::Global:
-            return "global";
-        case mlir::gpu::AddressSpace::Workgroup:
-            return "workgroup";
-        case mlir::gpu::AddressSpace::Private:
-            return "private";
-        default:
-            break;
-        }
-        return "as" + std::to_string(static_cast<int>(gpuSpace.getValue()));
-    }
-    if (auto intSpace = mlir::dyn_cast<mlir::IntegerAttr>(memorySpace)) {
-        return "as" + std::to_string(intSpace.getInt());
-    }
-    return "unknown";
-}
-
-llvm::SmallVector<std::string, 4>
-MLIRGeneratorImpl::GetFunctionAddressSpaceTags(
-    ast::FunctionDef *func,
-    const ArgAddressSpaceMap *arg_address_spaces) const {
-    llvm::SmallVector<std::string, 4> tags;
-    if (!func || !arg_address_spaces || arg_address_spaces->empty()) {
-        return tags;
-    }
-    auto *args = func->GetArguments();
-    if (!args) {
-        return tags;
-    }
-    for (auto *arg : args->GetArgs()) {
-        if (!arg) {
-            continue;
-        }
-        if (auto *attr_expr = llvm::dyn_cast_or_null<ast::AttributeExpr>(
-                arg->GetAnnotation())) {
-            if (attr_expr->GetAttr() == "constexpr") {
-                continue;
-            }
-        }
-        auto it = arg_address_spaces->find(arg->GetArgName());
-        if (it == arg_address_spaces->end()) {
-            continue;
-        }
-        tags.push_back(AddressSpaceTag(it->second));
-    }
-    return tags;
-}
-
-std::string MLIRGeneratorImpl::GetFunctionScopeName(
-    ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces) {
-    if (!func) {
-        return {};
-    }
-    const auto &name = func->GetName();
-    if (name.empty()) {
-        return {};
-    }
-    auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
-    return MangleFunctionName({}, name, tags);
-}
-
 std::string MLIRGeneratorImpl::GetMangledFunctionName(
-    ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces,
-    llvm::StringRef name_prefix) {
+    ast::FunctionDef *func, llvm::StringRef name_prefix,
+    llvm::ArrayRef<mlir::Value> arguments) {
     if (!func) {
         return {};
     }
@@ -299,8 +236,7 @@ std::string MLIRGeneratorImpl::GetMangledFunctionName(
     if (!name_prefix.empty()) {
         scope.push_back(name_prefix.str());
     }
-    auto tags = GetFunctionAddressSpaceTags(func, arg_address_spaces);
-    return MangleFunctionName(scope, name, tags);
+    return MangleFunctionName(func, scope, arguments);
 }
 
 mlir::ModuleOp MLIRGeneratorImpl::CreateModule() {
@@ -399,7 +335,7 @@ MLIRGeneratorImpl::EnsureMarker(ast::Expr *decorator) {
         return std::nullopt;
     }
 
-    auto marker_value = symbol->value;
+    auto marker_value = symbol->GetValue();
     if (!marker_value) {
         return std::nullopt;
     }
@@ -474,6 +410,11 @@ mlir::ModuleOp MLIRGeneratorImpl::Generate(ast::ASTNode *root) {
             auto func_type = ResolveFunctionType(func);
             if (!func_type ||
                 *func_type == MLIRGenerator::FunctionType::kHostFunction) {
+                continue;
+            }
+            if (*func_type == MLIRGenerator::FunctionType::kPrivateFunction) {
+                // Private JIT dependencies are specialized lazily at their
+                // call sites, once the ordered argument values are known.
                 continue;
             }
             SnapshotModuleSymbolTable();

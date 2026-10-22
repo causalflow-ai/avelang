@@ -945,7 +945,9 @@ mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
     }
 
     mlir::ROCDL::SchedGroupBarrier::create(
-        builder, location, static_cast<uint32_t>(*mask),
+        builder, location,
+        static_cast<mlir::ROCDL::SchedGroupMask>(
+            static_cast<uint32_t>(*mask)),
         static_cast<uint32_t>(*size), static_cast<uint32_t>(*group_id));
 
     return ctx->GetCurrentFunctionGenerator()
@@ -969,8 +971,10 @@ mlir::Value AMDGPUIntrinsic::CreateSchedBarrierFunction(
         return nullptr;
     }
 
-    mlir::ROCDL::SchedBarrier::create(builder, location,
-                                      static_cast<uint32_t>(*mask));
+    mlir::ROCDL::SchedBarrier::create(
+        builder, location,
+        static_cast<mlir::ROCDL::SchedGroupMask>(
+            static_cast<uint32_t>(*mask)));
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
