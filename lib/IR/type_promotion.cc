@@ -1,5 +1,7 @@
 #include "type_promotion.h"
 
+#include <algorithm>
+
 #include "type_system.h"
 
 #pragma clang diagnostic push
@@ -19,6 +21,63 @@ mlir::Value CreateTypeInfoCast(mlir::OpBuilder &builder, mlir::Location loc,
         mlir::ValueRange{value});
     SetTypeInfo(cast.getResult(0), typeInfo);
     return cast.getResult(0);
+}
+
+mlir::Value PromoteInteger(mlir::Value value, mlir::OpBuilder &builder,
+                           mlir::Location location) {
+    auto type = value.getType();
+    if (!type.isInteger() || type.getIntOrFloatBitWidth() >= 32) {
+        return value;
+    }
+
+    auto sourceUnsigned =
+        GetTypeInfo(value).is_unsigned_integer.value_or(false);
+    return CreateTypeConversion(value, type, builder.getI32Type(), location,
+                                builder, /*allow_demotion=*/false,
+                                sourceUnsigned, /*target_unsigned=*/false);
+}
+
+std::pair<mlir::Value, mlir::Value>
+ConvertIntegerTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
+                                 mlir::OpBuilder &builder,
+                                 mlir::Location location) {
+    lhs = PromoteInteger(lhs, builder, location);
+    rhs = PromoteInteger(rhs, builder, location);
+    if (!lhs || !rhs) {
+        return {nullptr, nullptr};
+    }
+
+    auto lhsType = lhs.getType();
+    auto rhsType = rhs.getType();
+    auto lhsUnsigned = GetTypeInfo(lhs).is_unsigned_integer.value_or(false);
+    auto rhsUnsigned = GetTypeInfo(rhs).is_unsigned_integer.value_or(false);
+    auto lhsWidth = lhsType.getIntOrFloatBitWidth();
+    auto rhsWidth = rhsType.getIntOrFloatBitWidth();
+
+    unsigned commonWidth = std::max(lhsWidth, rhsWidth);
+    bool commonUnsigned;
+    if (lhsUnsigned == rhsUnsigned) {
+        commonUnsigned = lhsUnsigned;
+    } else {
+        auto unsignedWidth = lhsUnsigned ? lhsWidth : rhsWidth;
+        auto signedWidth = lhsUnsigned ? rhsWidth : lhsWidth;
+        // With Ave's fixed-width integer types, a wider signed type can
+        // represent every value of a narrower unsigned type. Otherwise the
+        // common type is unsigned.
+        commonUnsigned = unsignedWidth >= signedWidth;
+    }
+
+    auto commonType = builder.getIntegerType(commonWidth);
+    lhs = CreateTypeConversion(lhs, lhsType, commonType, location, builder,
+                               /*allow_demotion=*/false, lhsUnsigned,
+                               commonUnsigned);
+    rhs = CreateTypeConversion(rhs, rhsType, commonType, location, builder,
+                               /*allow_demotion=*/false, rhsUnsigned,
+                               commonUnsigned);
+    if (!lhs || !rhs) {
+        return {nullptr, nullptr};
+    }
+    return {lhs, rhs};
 }
 
 // Explicit vector conversions pass element types and a vector result_type.
@@ -48,16 +107,17 @@ mlir::Value CreateTypeConversionImpl(
         auto target_width = target_dtype.getIntOrFloatBitWidth();
 
         if (source_width < target_width) {
-            auto isUnsigned = source_unsigned.value_or(false);
-            if (isUnsigned) {
+            auto sourceIsUnsigned = source_unsigned.value_or(false);
+            auto resultIsUnsigned = target_unsigned.value_or(sourceIsUnsigned);
+            if (sourceIsUnsigned) {
                 auto result = mlir::arith::ExtUIOp::create(builder, location,
                                                            result_type, value);
-                SetTypeInfo(result.getResult(), TypeInfo{true});
+                SetTypeInfo(result.getResult(), TypeInfo{resultIsUnsigned});
                 return result;
             } else {
                 auto result = mlir::arith::ExtSIOp::create(builder, location,
                                                            result_type, value);
-                SetTypeInfo(result.getResult(), TypeInfo{false});
+                SetTypeInfo(result.getResult(), TypeInfo{resultIsUnsigned});
                 return result;
             }
         } else if (source_width > target_width) {
@@ -194,17 +254,11 @@ ConvertTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
     auto common_unsigned =
         lhs_unsigned.value_or(false) || rhs_unsigned.value_or(false);
 
+    if (lhs_type.isInteger() && rhs_type.isInteger()) {
+        return ConvertIntegerTypesForArithmetic(lhs, rhs, builder, location);
+    }
+
     if (lhs_type == rhs_type) {
-        if (lhs_type.isInteger() && lhs_unsigned != rhs_unsigned) {
-            if (lhs_unsigned.value_or(false) != common_unsigned) {
-                lhs = CreateTypeInfoCast(builder, location, lhs,
-                                         TypeInfo{common_unsigned});
-            }
-            if (rhs_unsigned.value_or(false) != common_unsigned) {
-                rhs = CreateTypeInfoCast(builder, location, rhs,
-                                         TypeInfo{common_unsigned});
-            }
-        }
         return {lhs, rhs};
     }
 
@@ -218,36 +272,6 @@ ConvertTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
             mlir::arith::IndexCastOp::create(builder, location, lhs_type, rhs);
         SetTypeInfo(rhs, TypeInfo{common_unsigned});
         return {lhs, rhs};
-    }
-
-    if (lhs_type.isInteger() && rhs_type.isInteger()) {
-        auto lhs_width = lhs_type.getIntOrFloatBitWidth();
-        auto rhs_width = rhs_type.getIntOrFloatBitWidth();
-        auto common_type = lhs_width < rhs_width ? rhs_type : lhs_type;
-
-        if (lhs_width < rhs_width) {
-            lhs =
-                CreateTypeConversion(lhs, lhs_type, rhs_type, location, builder,
-                                     false, lhs_unsigned, common_unsigned);
-            return {lhs, rhs};
-        } else if (rhs_width < lhs_width) {
-            rhs =
-                CreateTypeConversion(rhs, rhs_type, lhs_type, location, builder,
-                                     false, rhs_unsigned, common_unsigned);
-            return {lhs, rhs};
-        }
-
-        if (lhs_unsigned.value_or(false) != common_unsigned) {
-            lhs = CreateTypeConversion(lhs, lhs_type, common_type, location,
-                                       builder, false, lhs_unsigned,
-                                       common_unsigned);
-        }
-        if (rhs_unsigned.value_or(false) != common_unsigned) {
-            rhs = CreateTypeConversion(rhs, rhs_type, common_type, location,
-                                       builder, false, rhs_unsigned,
-                                       common_unsigned);
-            return {lhs, rhs};
-        }
     }
 
     if (mlir::isa<mlir::FloatType>(lhs_type) &&
@@ -280,67 +304,41 @@ ConvertTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
 std::pair<mlir::Value, mlir::Value>
 ConvertTypesForBitwise(mlir::Value lhs, mlir::Value rhs,
                        mlir::OpBuilder &builder, mlir::Location location) {
-    auto lhs_type = lhs.getType();
-    auto rhs_type = rhs.getType();
-    auto lhs_unsigned = GetTypeInfo(lhs).is_unsigned_integer;
-    auto rhs_unsigned = GetTypeInfo(rhs).is_unsigned_integer;
-    bool common_unsigned =
-        lhs_unsigned.value_or(false) || rhs_unsigned.value_or(false);
-
-    if (lhs_type == rhs_type) {
-        if (lhs_type.isInteger() && lhs_unsigned != rhs_unsigned) {
-            if (lhs_unsigned.value_or(false) != common_unsigned) {
-                lhs = CreateTypeInfoCast(builder, location, lhs,
-                                         TypeInfo{common_unsigned});
-            }
-            if (rhs_unsigned.value_or(false) != common_unsigned) {
-                rhs = CreateTypeInfoCast(builder, location, rhs,
-                                         TypeInfo{common_unsigned});
-            }
-        }
-        return {lhs, rhs};
+    if (!lhs.getType().isIntOrIndex() || !rhs.getType().isIntOrIndex()) {
+        return {nullptr, nullptr};
     }
 
-    if (lhs_type.isIndex() && rhs_type.isInteger()) {
-        lhs =
-            mlir::arith::IndexCastOp::create(builder, location, rhs_type, lhs);
-        SetTypeInfo(lhs, TypeInfo{common_unsigned});
-        return {lhs, rhs};
-    } else if (rhs_type.isIndex() && lhs_type.isInteger()) {
-        rhs =
-            mlir::arith::IndexCastOp::create(builder, location, lhs_type, rhs);
-        SetTypeInfo(rhs, TypeInfo{common_unsigned});
-        return {lhs, rhs};
+    return ConvertTypesForArithmetic(lhs, rhs, builder, location);
+}
+
+std::pair<mlir::Value, mlir::Value>
+ConvertTypesForShift(mlir::Value lhs, mlir::Value rhs, mlir::OpBuilder &builder,
+                     mlir::Location location) {
+    if (!lhs.getType().isIntOrIndex() || !rhs.getType().isIntOrIndex()) {
+        return {nullptr, nullptr};
+    }
+    if (lhs.getType().isIndex() || rhs.getType().isIndex()) {
+        return ConvertTypesForBitwise(lhs, rhs, builder, location);
     }
 
-    if (lhs_type.isInteger() && rhs_type.isInteger()) {
-        auto lhs_width = lhs_type.getIntOrFloatBitWidth();
-        auto rhs_width = rhs_type.getIntOrFloatBitWidth();
-
-        if (lhs_width < rhs_width) {
-            lhs =
-                mlir::arith::ExtUIOp::create(builder, location, rhs_type, lhs);
-            SetTypeInfo(lhs, TypeInfo{common_unsigned});
-            return {lhs, rhs};
-        } else if (rhs_width < lhs_width) {
-            rhs =
-                mlir::arith::ExtUIOp::create(builder, location, lhs_type, rhs);
-            SetTypeInfo(rhs, TypeInfo{common_unsigned});
-            return {lhs, rhs};
-        }
-
-        if (lhs_unsigned.value_or(false) != common_unsigned) {
-            lhs = CreateTypeInfoCast(builder, location, lhs,
-                                     TypeInfo{common_unsigned});
-        }
-        if (rhs_unsigned.value_or(false) != common_unsigned) {
-            rhs = CreateTypeInfoCast(builder, location, rhs,
-                                     TypeInfo{common_unsigned});
-            return {lhs, rhs};
-        }
+    lhs = PromoteInteger(lhs, builder, location);
+    rhs = PromoteInteger(rhs, builder, location);
+    if (!lhs || !rhs) {
+        return {nullptr, nullptr};
     }
 
-    return {nullptr, nullptr};
+    auto lhsType = lhs.getType();
+    auto rhsType = rhs.getType();
+    if (lhsType != rhsType) {
+        auto rhsUnsigned = GetTypeInfo(rhs).is_unsigned_integer.value_or(false);
+        rhs = CreateTypeConversion(rhs, rhsType, lhsType, location, builder,
+                                   /*allow_demotion=*/true, rhsUnsigned,
+                                   rhsUnsigned);
+    }
+    if (!rhs) {
+        return {nullptr, nullptr};
+    }
+    return {lhs, rhs};
 }
 
 } // namespace causalflow::avelang::ir

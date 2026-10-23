@@ -224,6 +224,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
     // Resolve return type if present
     SmallVector<mlir::Type> returnTypes;
+    SmallVector<TypeInfo> returnTypeInfos;
     if (auto *returns_expr = func->GetReturns()) {
         auto materialize_value_return_type =
             [&](mlir::Type type) -> mlir::Type {
@@ -248,6 +249,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
         auto resolve_tuple_types = [&](auto *tuple_expr) -> bool {
             for (auto *elem : tuple_expr->GetElts()) {
+                auto elemTypeInfo = GetTypeInfo(elem);
                 auto elem_type = ctx_->syms->ResolveType(elem);
                 if (!elem_type) {
                     ctx_->diagnostic_manager->Report(
@@ -262,6 +264,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                     return false;
                 }
                 returnTypes.push_back(elem_type);
+                returnTypeInfos.push_back(elemTypeInfo);
             }
             if (returnTypes.empty()) {
                 ctx_->diagnostic_manager->Report(
@@ -282,6 +285,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                 return;
             }
         } else {
+            auto returnTypeInfo = GetTypeInfo(returns_expr);
             auto return_type = ctx_->syms->ResolveType(returns_expr);
             if (!return_type) {
                 ctx_->diagnostic_manager->Report(
@@ -296,6 +300,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                 return;
             }
             returnTypes.push_back(return_type);
+            returnTypeInfos.push_back(returnTypeInfo);
         }
     }
 
@@ -335,6 +340,10 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     func_op->setAttr("ave.gpu_func",
                      builder_.getI32IntegerAttr((int)function_type_));
     func_op.setAllArgAttrs(argAttrs);
+
+    for (size_t i = 0; i < returnTypeInfos.size(); ++i) {
+        SetFunctionResultTypeInfo(func_op, i, returnTypeInfos[i]);
+    }
 
     if (function_type_ == MLIRGenerator::FunctionType::kPrivateFunction) {
         func_op.setPrivate();
@@ -435,23 +444,32 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                     return;
                 }
 
-                auto prepare_return_value =
-                    [&](mlir::Value value, unsigned result_index) {
-                        auto expected_type =
-                            func_op.getFunctionType().getResult(result_index);
-                        auto cast_value = expr_generator_.CastTensorVector(
-                            value, expected_type,
-                            value_expr->GetSourceRange().getBegin());
-                        if (cast_value &&
-                            cast_value.getType() != expected_type) {
-                            cast_value = CreateTypeConversion(
-                                cast_value, cast_value.getType(), expected_type,
-                                return_loc, builder_);
-                        }
-                        return cast_value && cast_value.getType() == expected_type
-                                   ? cast_value
-                                   : mlir::Value();
-                    };
+                auto prepare_return_value = [&](mlir::Value value,
+                                                unsigned result_index) {
+                    auto expected_type =
+                        func_op.getFunctionType().getResult(result_index);
+                    auto expectedTypeInfo =
+                        GetFunctionResultTypeInfo(func_op, result_index);
+                    auto cast_value = expr_generator_.CastTensorVector(
+                        value, expected_type,
+                        value_expr->GetSourceRange().getBegin());
+                    auto sourceTypeInfo = GetTypeInfo(cast_value);
+                    bool needsTypeInfoConversion =
+                        cast_value && expectedTypeInfo.is_unsigned_integer &&
+                        sourceTypeInfo.is_unsigned_integer !=
+                            expectedTypeInfo.is_unsigned_integer;
+                    if (cast_value && (cast_value.getType() != expected_type ||
+                                       needsTypeInfoConversion)) {
+                        cast_value = CreateTypeConversion(
+                            cast_value, cast_value.getType(), expected_type,
+                            return_loc, builder_, false,
+                            sourceTypeInfo.is_unsigned_integer,
+                            expectedTypeInfo.is_unsigned_integer);
+                    }
+                    return cast_value && cast_value.getType() == expected_type
+                               ? cast_value
+                               : mlir::Value();
+                };
 
                 if (num_results == 1) {
                     if (return_value.getDefiningOp<cf::MakeIntTupleOp>()) {
@@ -501,8 +519,7 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                 llvm::SmallVector<mlir::Value> cast_values;
                 cast_values.reserve(tuple_values.size());
                 for (size_t i = 0; i < tuple_values.size(); ++i) {
-                    auto cast_value =
-                        prepare_return_value(tuple_values[i], i);
+                    auto cast_value = prepare_return_value(tuple_values[i], i);
                     if (!cast_value) {
                         ctx_->diagnostic_manager->Report(
                             basic::DiagnosticCode::kTypeMismatch,

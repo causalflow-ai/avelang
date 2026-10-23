@@ -27,6 +27,50 @@ FP8/BF8 type annotations distinguish the following formats:
 | `al.f8e5m2` | E5M2 (BF8) | OCP |
 | `al.f8e5m2fnuz` | E5M2 (BF8) | FNUZ |
 
+### Automatic Integer Promotions In Expressions
+
+Ave distinguishes explicit conversion from automatic type promotion:
+
+- `al.convert(value, dtype)` and `al.bitcast(value, dtype)` produce the
+  explicitly requested `dtype`. The C++ promotion rules do not alter their
+  result type.
+- When values are used as operands of integer arithmetic, comparisons, or the
+  bitwise `&`, `|`, and `^` operators, Ave automatically follows [the C++ integral promotions](https://en.cppreference.com/c/language/conversion) and usual arithmetic conversions.
+- Shift operands undergo automatic integral promotion independently, as
+  described below.
+
+The automatic expression rules first promote narrow integers as follows:
+
+| Original type | Promoted type |
+| --- | --- |
+| `al.i8`, `al.u8`, `al.i16`, `al.u16` | `al.i32` |
+| `al.i32`, `al.u32`, `al.i64`, `al.u64` | unchanged |
+
+In C++ terms, the first row promotes to `int`. Ave defines that promotion type
+as the fixed-width `al.i32`; it is not derived from the host CPU or GPU ABI's
+`sizeof(int)`. In particular, `al.u16` promotes to `al.i32`, not `al.u32`,
+because every `al.u16` value is representable by `al.i32`. After integral
+promotion, operands are converted to a common type:
+
+- Operands with the same signedness use the wider type.
+- When signed and unsigned operands have the same width, the signed operand is
+  converted to unsigned.
+- A wider signed type remains signed when it can represent every value of the
+  narrower unsigned type; for example, `al.i64 + al.u32` has type `al.i64`.
+- Otherwise, both operands use the appropriate unsigned type.
+
+Shift operands receive integral promotion independently, and the result has
+the promoted type of the left operand. Consequently, right shift is arithmetic
+for a promoted signed left operand and logical for an unsigned left operand.
+
+Unsigned arithmetic wraps modulo 2<sup>N</sup>, where N is the type width. For
+example:
+
+```python
+value = al.convert(-3, al.u32)  # Explicit conversion produces al.u32.
+result = value + 2              # Arithmetic produces al.u32 0xffffffff.
+```
+
 ## Tensor Types
 
 `al.Tensor(shape, type)` denotes the type of a tensor. A tensor is a multidimensional view over a memory region. The shape describes the logical dimensions of the tensor, and the type describes the value type of each element. For example, `al.Tensor((16, 16), al.f32)` denotes a two-dimensional tensor with 16 rows and 16 columns of 32-bit floating point values.

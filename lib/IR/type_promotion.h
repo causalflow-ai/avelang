@@ -45,7 +45,8 @@ mlir::Value CreateExplicitTypeConversion(
 
 /// Converts two values to compatible types for arithmetic operations.
 /// This function promotes both operands to a common type following these rules:
-/// - Integer types are promoted to the wider integer type
+/// - Narrow integer types first undergo C++ integral promotion
+/// - Integer operands then follow the C++ usual arithmetic conversions
 /// - Float types are promoted to the wider float type
 /// - Integer operands are promoted to float when mixed with float operands
 /// - Index types are converted to integer types
@@ -62,7 +63,7 @@ ConvertTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
 /// Converts two values to compatible types for bitwise operations.
 /// This function is similar to ConvertTypesForArithmetic but:
 /// - Does not allow float types (bitwise ops are integer-only)
-/// - Uses zero extension for integer widening to preserve bit patterns
+/// - Extends integer operands according to their signedness metadata
 /// - Converts index types to integers
 ///
 /// @param lhs The left-hand side operand
@@ -73,5 +74,19 @@ ConvertTypesForArithmetic(mlir::Value lhs, mlir::Value rhs,
 std::pair<mlir::Value, mlir::Value>
 ConvertTypesForBitwise(mlir::Value lhs, mlir::Value rhs,
                        mlir::OpBuilder &builder, mlir::Location location);
+
+/// Converts two values to compatible types for shift operations.
+/// C++ integral promotions are applied independently. The operation uses the
+/// promoted left operand's type and signedness; the right operand is adapted to
+/// the same MLIR integer type because arith shift operations require it.
+///
+/// @param lhs The value being shifted
+/// @param rhs The shift amount
+/// @param builder The MLIR builder to use for creating conversion operations
+/// @return A pair of converted values, or {nullptr, nullptr} if conversion
+/// fails
+std::pair<mlir::Value, mlir::Value>
+ConvertTypesForShift(mlir::Value lhs, mlir::Value rhs, mlir::OpBuilder &builder,
+                     mlir::Location location);
 
 } // namespace causalflow::avelang::ir

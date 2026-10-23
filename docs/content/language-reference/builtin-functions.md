@@ -49,12 +49,28 @@ Use `al.bitcast(value, dtype)` when the bit pattern should be reinterpreted with
 word = al.bitcast(bits, al.u32)
 ```
 
+> Conversion is used when an expression is used in the context where a value of a different type is expected. 
+> Both `al.convert` and `al.bitcast` functions use the requested destination type exactly. 
+> However, there would be [implicit C++-compatible integer promotion](https://en.cppreference.com/c/language/conversion) when a scalar is used in an
+> arithmetic, comparison, bitwise, or shift expression that expecting a different result type. 
+> See Ave's implementation in [Automatic Integer Promotions In Expressions](../builtin-types/#automatic-integer-promotions-in-expressions).
+
 Ave also provides scalar math functions: `al.abs`, `al.exp2`, `al.exp`, `al.tanh`, `al.log`, `al.log2`, `al.erf`, and `al.sqrt`. Integer extrema are available through `al.min(lhs, rhs)` and `al.max(lhs, rhs)`.
 
 ```python
 idx = al.min(idx, limit)
 y = al.sqrt(x)
 ```
+
+## Bit Operations
+
+`al.bitreverse(value)` reverses all 32 bits of an `al.i32` or `al.u32` scalar and preserves its type. Bit 0 becomes bit 31, bit 1 becomes bit 30, and so on. The operation is available on both AMD and NVIDIA GPUs.
+
+```python
+reversed_word = al.bitreverse(word)
+```
+
+For example, `0x00000001` becomes `0x80000000`. Other integer widths, floating-point values, and vectors are not supported.
 
 ## Tensor Construction And Memory
 

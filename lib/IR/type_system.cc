@@ -9,6 +9,7 @@
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/SymbolTable.h>
 #pragma clang diagnostic pop
 
 namespace causalflow::avelang::ir {
@@ -82,6 +83,24 @@ std::optional<bool> GetFunctionArgTypeInfoAttr(mlir::BlockArgument arg,
 
 TypeInfo GetMemRefTypeInfo(mlir::Value value);
 
+std::optional<TypeInfo> GetCallResultTypeInfo(mlir::Value value) {
+    auto call = value.getDefiningOp<mlir::func::CallOp>();
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    if (!call || !result) {
+        return std::nullopt;
+    }
+
+    auto callee =
+        mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
+            call.getOperation(), call.getCalleeAttr());
+    if (!callee ||
+        result.getResultNumber() >= callee.getFunctionType().getNumResults()) {
+        return std::nullopt;
+    }
+
+    return GetFunctionResultTypeInfo(callee, result.getResultNumber());
+}
+
 TypeInfo GetValueTypeInfo(mlir::Value value) {
     if (!value || !IsIntegerValueOrVectorOfIntegers(value.getType())) {
         return {};
@@ -104,6 +123,9 @@ TypeInfo GetValueTypeInfo(mlir::Value value) {
         return TypeInfoFromAttr(attr);
     }
 
+    if (auto callInfo = GetCallResultTypeInfo(value)) {
+        return *callInfo;
+    }
     if (auto load = llvm::dyn_cast<cf::AveLangMemRefLoadOp>(defOp)) {
         return GetTypeInfo(load.getMemref());
     }
@@ -172,6 +194,9 @@ TypeInfo GetMemRefTypeInfo(mlir::Value value) {
         return TypeInfoFromAttr(attr);
     }
 
+    if (auto callInfo = GetCallResultTypeInfo(value)) {
+        return *callInfo;
+    }
     if (auto subview = llvm::dyn_cast<cf::AveLangMemRefSubViewOp>(defOp)) {
         return GetTypeInfo(subview.getSource());
     }
@@ -252,6 +277,48 @@ TypeInfo GetTypeInfo(ast::Expr *expr) {
         }
     }
     return info;
+}
+
+TypeInfo GetFunctionResultTypeInfo(mlir::func::FuncOp function,
+                                   unsigned resultIndex) {
+    if (!function ||
+        resultIndex >= function.getFunctionType().getNumResults()) {
+        return {};
+    }
+
+    auto type = function.getFunctionType().getResult(resultIndex);
+    llvm::StringRef attrName;
+    if (IsMemRefWithIntegerElements(type)) {
+        attrName = kMemRefTypeInfoAttr;
+    } else if (IsIntegerValueOrVectorOfIntegers(type)) {
+        attrName = kValueTypeInfoAttr;
+    } else {
+        return {};
+    }
+
+    auto attr =
+        function.getResultAttrOfType<mlir::IntegerAttr>(resultIndex, attrName);
+    return attr ? TypeInfoFromAttr(DecodeTypeInfoAttr(attr))
+                : DefaultTypeInfo(type);
+}
+
+void SetFunctionResultTypeInfo(mlir::func::FuncOp function,
+                               unsigned resultIndex, const TypeInfo &typeInfo) {
+    if (!function || !typeInfo.is_unsigned_integer ||
+        resultIndex >= function.getFunctionType().getNumResults()) {
+        return;
+    }
+
+    auto type = function.getFunctionType().getResult(resultIndex);
+    auto attrName = IsMemRefWithIntegerElements(type) ? kMemRefTypeInfoAttr
+                                                      : kValueTypeInfoAttr;
+    if (IsMemRefWithIntegerElements(type) ||
+        IsIntegerValueOrVectorOfIntegers(type)) {
+        function.setResultAttr(
+            resultIndex, attrName,
+            EncodeTypeInfoAttr(function.getContext(),
+                               *typeInfo.is_unsigned_integer));
+    }
 }
 
 void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo) {

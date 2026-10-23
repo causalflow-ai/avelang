@@ -575,6 +575,207 @@ def int_types_test(a: S.Tensor((2, 3), S.i64), b: S.Tensor((2, 3), S.i64)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRIntegerSignednessMetadata) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def signedness_metadata_test(out: S.Tensor((3,), S.i32)):
+    converted = S.convert(S.convert(1, S.u8), S.i32)
+    out[0] = converted
+
+    signed = S.convert(-5, S.i16)
+    unsigned = S.convert(3, S.u8)
+    out[1] = signed + unsigned
+    out[2] = unsigned + signed
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool foundSignedWidening = false;
+    int signedAddCount = 0;
+
+    mlir->walk([&](mlir::arith::ExtUIOp op) {
+        auto inputType = op.getIn().getType();
+        auto resultType = op.getResult().getType();
+        auto signedness = op->getAttrOfType<mlir::IntegerAttr>(
+            "ave.type_info.is_unsigned_integer");
+        if (inputType.isInteger(8) && resultType.isInteger(32)) {
+            ASSERT_TRUE(signedness);
+            EXPECT_EQ(signedness.getInt(), 1);
+            foundSignedWidening = true;
+        }
+    });
+    mlir->walk([&](mlir::arith::AddIOp op) {
+        if (!op.getResult().getType().isInteger(32)) {
+            return;
+        }
+        auto signedness = op->getAttrOfType<mlir::IntegerAttr>(
+            "ave.type_info.is_unsigned_integer");
+        ASSERT_TRUE(signedness);
+        EXPECT_EQ(signedness.getInt(), 1);
+        ++signedAddCount;
+    });
+
+    EXPECT_TRUE(foundSignedWidening);
+    EXPECT_EQ(signedAddCount, 2);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRBitwiseSignednessMetadata) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def bitwise_signedness_test(out: S.Tensor((8,), S.i32)):
+    signed = S.convert(-5, S.i16)
+    unsigned = S.convert(3, S.u8)
+    out[0] = S.convert(signed | unsigned, S.i32)
+    out[1] = S.convert(unsigned | signed, S.i32)
+    out[2] = S.convert(signed & unsigned, S.i32)
+    out[3] = S.convert(unsigned & signed, S.i32)
+    out[4] = S.convert(signed ^ unsigned, S.i32)
+    out[5] = S.convert(unsigned ^ signed, S.i32)
+    out[6] = S.convert(S.convert(-1, S.i8) >> 1, S.i32)
+    out[7] = S.convert(S.convert(-1, S.i16) >> 1, S.i32)
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    int signedOrCount = 0;
+    int signedAndCount = 0;
+    int signedXorCount = 0;
+    int signedNarrowWideningCount = 0;
+    int signedShiftCount = 0;
+    int unsignedShiftCount = 0;
+    auto checkSignedI32Result = [&](mlir::Operation *op, mlir::Value result,
+                                    int &count) {
+        if (!result.getType().isInteger(32)) {
+            return;
+        }
+        auto signedness = op->getAttrOfType<mlir::IntegerAttr>(
+            "ave.type_info.is_unsigned_integer");
+        ASSERT_TRUE(signedness);
+        EXPECT_EQ(signedness.getInt(), 1);
+        ++count;
+    };
+    mlir->walk([&](mlir::arith::OrIOp op) {
+        checkSignedI32Result(op, op.getResult(), signedOrCount);
+    });
+    mlir->walk([&](mlir::arith::AndIOp op) {
+        checkSignedI32Result(op, op.getResult(), signedAndCount);
+    });
+    mlir->walk([&](mlir::arith::XOrIOp op) {
+        checkSignedI32Result(op, op.getResult(), signedXorCount);
+    });
+    mlir->walk([&](mlir::arith::ExtSIOp op) {
+        if (op.getIn().getType().isInteger(8) ||
+            op.getIn().getType().isInteger(16)) {
+            ++signedNarrowWideningCount;
+        }
+    });
+    mlir->walk([&](mlir::arith::ShRSIOp) { ++signedShiftCount; });
+    mlir->walk([&](mlir::arith::ShRUIOp) { ++unsignedShiftCount; });
+
+    EXPECT_EQ(signedOrCount, 2);
+    EXPECT_EQ(signedAndCount, 2);
+    EXPECT_EQ(signedXorCount, 2);
+    EXPECT_GE(signedNarrowWideningCount, 2);
+    EXPECT_EQ(signedShiftCount, 2);
+    EXPECT_EQ(unsignedShiftCount, 0);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRFunctionResultSignednessMetadata) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def function_result_signedness_test(out: S.Tensor((3,), S.i32)):
+    def identity_unsigned(value: S.u32) -> S.u32:
+        return value
+
+    def mixed_pair(unsigned: S.u32, signed: S.i32) -> (S.u32, S.i32):
+        return unsigned, signed
+
+    unsigned = S.convert(-1, S.u32)
+    signed = S.convert(-1, S.i32)
+    out[0] = identity_unsigned(unsigned) >> 31
+    pair_unsigned, pair_signed = mixed_pair(unsigned, signed)
+    out[1] = pair_unsigned >> 31
+    out[2] = pair_signed >> 31
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    int unsignedResultCount = 0;
+    int signedResultCount = 0;
+    mlir->walk([&](mlir::func::FuncOp op) {
+        for (unsigned i = 0; i < op.getFunctionType().getNumResults(); ++i) {
+            auto signedness = op.getResultAttrOfType<mlir::IntegerAttr>(
+                i, "ave.type_info.is_unsigned_integer");
+            if (!signedness) {
+                continue;
+            }
+            if (signedness.getInt() == 2) {
+                ++unsignedResultCount;
+            } else if (signedness.getInt() == 1) {
+                ++signedResultCount;
+            }
+        }
+    });
+
+    int unsignedShiftCount = 0;
+    int signedShiftCount = 0;
+    mlir->walk([&](mlir::arith::ShRUIOp) { ++unsignedShiftCount; });
+    mlir->walk([&](mlir::arith::ShRSIOp) { ++signedShiftCount; });
+
+    EXPECT_EQ(unsignedResultCount, 2);
+    EXPECT_EQ(signedResultCount, 1);
+    EXPECT_EQ(unsignedShiftCount, 2);
+    EXPECT_EQ(signedShiftCount, 1);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRBitwiseOps) {
     static const std::string kSourceCode = R"""""(
 import avelang
@@ -586,6 +787,34 @@ def bitwise_and_test(a: S.Tensor((2, 3), S.i32), b: S.Tensor((2, 3), S.i32)):
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRBitReverseBuiltin) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def bitreverse_builtin(signed_value: al.i32, unsigned_value: al.u32):
+    signed_reversed = al.bitreverse(signed_value)
+    unsigned_reversed = al.bitreverse(unsigned_value)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, BitReverseRejectsFloat) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as al
+
+@avelang.jit
+def invalid_bitreverse(value: al.f32):
+    result = al.bitreverse(value)
+)""""";
+
+    RunMLIRGenerationErrorTest(
+        kSourceCode, "avelang.bitreverse() expects a 32-bit integer");
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRCast) {
@@ -1668,7 +1897,7 @@ import avelang.language as S
 
 @avelang.jit
 def readfirstlane_test(out: S.Tensor((1,), S.u32), value: S.u32):
-    out[0] = S.amdgpu.readfirstlane(value)
+    out[0] = S.amdgpu.readfirstlane(value) >> 31
 )""""";
 
     ast::ASTNode *root;
@@ -1686,13 +1915,23 @@ def readfirstlane_test(out: S.Tensor((1,), S.u32), value: S.u32):
     ASSERT_NE(mlir, nullptr);
 
     bool found_readfirstlane = false;
+    bool found_unsigned_shift = false;
+    bool found_signed_shift = false;
     mlir->walk([&](mlir::ROCDL::ReadfirstlaneOp op) {
         found_readfirstlane = true;
         EXPECT_TRUE(op.getSrc().getType().isInteger(32));
         EXPECT_TRUE(op.getResult().getType().isInteger(32));
+        auto signedness = op->getAttrOfType<mlir::IntegerAttr>(
+            "ave.type_info.is_unsigned_integer");
+        ASSERT_TRUE(signedness);
+        EXPECT_EQ(signedness.getInt(), 2);
     });
+    mlir->walk([&](mlir::arith::ShRUIOp) { found_unsigned_shift = true; });
+    mlir->walk([&](mlir::arith::ShRSIOp) { found_signed_shift = true; });
 
     EXPECT_TRUE(found_readfirstlane);
+    EXPECT_TRUE(found_unsigned_shift);
+    EXPECT_FALSE(found_signed_shift);
 
     mlir::PassManager pm(mlir.getContext());
     pm.addPass(mlir::createCanonicalizerPass());
@@ -1834,6 +2073,53 @@ def s_waitcnt_test():
     pm.addPass(mlir::createSymbolDCEPass());
     ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
 
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRShuffleIntegerSignednessMetadata) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def shuffle_signedness_test(value: S.u32,
+                            out: S.Tensor((4,), S.i32)):
+    out[0] = S.shuffle(value, 0, 32) >> 31
+    out[1] = S.shuffle_up(value, 0, 32) >> 31
+    out[2] = S.shuffle_down(value, 0, 32) >> 31
+    out[3] = S.shuffle_xor(value, 0, 32) >> 31
+)""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    int shuffleCount = 0;
+    int unsignedShiftCount = 0;
+    int signedShiftCount = 0;
+    mlir->walk([&](mlir::gpu::ShuffleOp op) {
+        auto signedness = op->getAttrOfType<mlir::IntegerAttr>(
+            "ave.type_info.is_unsigned_integer");
+        ASSERT_TRUE(signedness);
+        EXPECT_EQ(signedness.getInt(), 2);
+        ++shuffleCount;
+    });
+    mlir->walk([&](mlir::arith::ShRUIOp) { ++unsignedShiftCount; });
+    mlir->walk([&](mlir::arith::ShRSIOp) { ++signedShiftCount; });
+
+    EXPECT_EQ(shuffleCount, 4);
+    EXPECT_EQ(unsignedShiftCount, 4);
+    EXPECT_EQ(signedShiftCount, 0);
     ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
         << "MLIR verification failed!";
 }

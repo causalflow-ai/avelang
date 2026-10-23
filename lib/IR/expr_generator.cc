@@ -574,7 +574,6 @@ mlir::Value ExprGenerator::VisitBinOp(ast::BinOp *binop) {
         // Bitwise operations require integer types
         auto lhs_type = lhs.getType();
         auto rhs_type = rhs.getType();
-        auto lhsTypeInfo = GetTypeInfo(lhs);
 
         if (!lhs_type.isIntOrIndex() || !rhs_type.isIntOrIndex()) {
             Report(this, basic::DiagnosticCode::kUnimplemented,
@@ -583,30 +582,15 @@ mlir::Value ExprGenerator::VisitBinOp(ast::BinOp *binop) {
             return nullptr;
         }
 
-        // Convert types for bitwise operations (similar to arithmetic but no
-        // int-to-float conversion)
         auto [converted_lhs, converted_rhs] =
-            ConvertTypesForBitwise(lhs, rhs, builder, location);
+            op == "LShift" || op == "RShift"
+                ? ConvertTypesForShift(lhs, rhs, builder, location)
+                : ConvertTypesForBitwise(lhs, rhs, builder, location);
         if (!converted_lhs || !converted_rhs) {
             Report(this, basic::DiagnosticCode::kUnimplemented,
                    binop->GetSourceRange().getBegin())
                 << "Cannot perform bitwise operations with incompatible types";
             return nullptr;
-        }
-
-        if ((op == "LShift" || op == "RShift") &&
-            lhsTypeInfo.is_unsigned_integer &&
-            GetTypeInfo(converted_lhs).is_unsigned_integer !=
-                lhsTypeInfo.is_unsigned_integer) {
-            auto recast = CreateTypeConversion(
-                converted_lhs, converted_lhs.getType(), converted_lhs.getType(),
-                location, builder,
-                /*allow_demotion=*/false,
-                GetTypeInfo(converted_lhs).is_unsigned_integer,
-                lhsTypeInfo.is_unsigned_integer);
-            if (recast) {
-                converted_lhs = recast;
-            }
         }
 
         bool isUnsigned =
