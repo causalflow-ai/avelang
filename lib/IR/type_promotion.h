@@ -13,7 +13,7 @@
 
 namespace causalflow::avelang::ir {
 
-/// Comprehensive type conversion function with configurable demotion policy.
+/// Scalar type conversion function with configurable demotion policy.
 /// This function can perform both promotions and demotions based on the
 /// allow_demotion flag.
 ///
@@ -35,6 +35,13 @@ CreateTypeConversion(mlir::Value value, mlir::Type source_type,
                      mlir::OpBuilder &builder, bool allow_demotion = false,
                      std::optional<bool> source_unsigned = std::nullopt,
                      std::optional<bool> target_unsigned = std::nullopt);
+
+/// Explicit numeric conversion for scalars and same-shaped vectors.
+mlir::Value CreateExplicitTypeConversion(
+    mlir::Value value, mlir::Type source_type, mlir::Type result_type,
+    mlir::Location location, mlir::OpBuilder &builder,
+    std::optional<bool> source_unsigned = std::nullopt,
+    std::optional<bool> target_unsigned = std::nullopt);
 
 /// Converts two values to compatible types for arithmetic operations.
 /// This function promotes both operands to a common type following these rules:

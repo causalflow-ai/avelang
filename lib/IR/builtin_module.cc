@@ -525,6 +525,8 @@ void AveLangModule::Initialize() {
     AddType("bf16", builder.getBF16Type());
     AddType("f8e4m3fn", Float8E4M3FNType::get(builder.getContext()));
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
+    AddType("f8e5m2", Float8E5M2Type::get(builder.getContext()));
+    AddType("f8e5m2fnuz", Float8E5M2FNUZType::get(builder.getContext()));
 
     // FIXME: Constexpr type (placeholder, currently i32)
     AddType("constexpr", builder.getI32Type());
@@ -952,6 +954,12 @@ mlir::Value AveLangModule::CreateConvertFunction(
 
     // Resolve the target type from the second argument
     auto target_type = ctx->syms->ResolveType(args[1]);
+    auto location = GetCallLocation(ctx, call_expr);
+    if (auto target_tensor =
+            mlir::dyn_cast_if_present<cf::MemRefType>(target_type)) {
+        target_type = mlir::VectorType::getChecked(
+            location, target_tensor.getShape(), target_tensor.getElementType());
+    }
     if (!target_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -960,7 +968,6 @@ mlir::Value AveLangModule::CreateConvertFunction(
     }
 
     auto source_type = value.getType();
-    auto location = GetCallLocation(ctx, call_expr);
 
     // Explicit type conversion (allows demotion since user explicitly requested
     // it)
@@ -970,8 +977,8 @@ mlir::Value AveLangModule::CreateConvertFunction(
         targetUnsigned = typeInfo.is_unsigned_integer;
     }
 
-    auto result = causalflow::avelang::ir::CreateTypeConversion(
-        value, source_type, target_type, location, builder, true,
+    auto result = causalflow::avelang::ir::CreateExplicitTypeConversion(
+        value, source_type, target_type, location, builder,
         GetTypeInfo(value).is_unsigned_integer, targetUnsigned);
     if (!result) {
         std::string source_str, target_str;

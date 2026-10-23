@@ -18,6 +18,15 @@ For value types, Ave supports signed integers (`al.i8`, `al.i16`, `al.i32`, `al.
 
 Value conversion is described in [Builtin Functions](../builtin-functions/).
 
+FP8/BF8 type annotations distinguish the following formats:
+
+| Type | Format | Encoding |
+| --- | --- | --- |
+| `al.f8e4m3fn` | E4M3 (FP8) | OCP |
+| `al.f8e4m3fnuz` | E4M3 (FP8) | FNUZ |
+| `al.f8e5m2` | E5M2 (BF8) | OCP |
+| `al.f8e5m2fnuz` | E5M2 (BF8) | FNUZ |
+
 ### Automatic Integer Promotions In Expressions
 
 Ave distinguishes explicit conversion from automatic type promotion:
