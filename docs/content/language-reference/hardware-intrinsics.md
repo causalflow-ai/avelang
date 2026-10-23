@@ -69,12 +69,14 @@ The byte range is used by hardware bounds checking. Out-of-range raw-buffer load
 
 ## Raw-Buffer Loads And Stores
 
-Raw-buffer loads and stores operate on `i32` words. The suffix selects the number of words moved:
+Raw-buffer loads and stores usually operate on `i32` words. The `x1` / `x2` / `x4` suffix selects the number of words moved; `raw_buffer_load_u8` and `raw_buffer_store_u8` move one byte:
 
 ```text
+raw_buffer_load_u8   -> u8
 raw_buffer_load_x1   -> i32
 raw_buffer_load_x2   -> Tensor((2,), i32)
 raw_buffer_load_x4   -> Tensor((4,), i32)
+raw_buffer_store_u8  <- u8
 raw_buffer_store_x1  <- i32
 raw_buffer_store_x2  <- Tensor((2,), i32)
 raw_buffer_store_x4  <- Tensor((4,), i32)
@@ -89,6 +91,8 @@ load_offset = al.convert((lane_col * k + k_base) * BF16_BYTES, al.i32)
 words = al.amdgpu.raw_buffer_load_x4(A_rsrc, zero, load_offset, 0)
 al.amdgpu.raw_buffer_store_x4(words, C_rsrc, zero, store_offset, 0)
 ```
+
+`raw_buffer_load_u8(resource, byte_offset, scalar_offset, aux)` returns `u8`, which zero-extends when converted to a wider integer. `raw_buffer_store_u8(value, resource, byte_offset, scalar_offset, aux)` writes a `u8` value. Both operations require two `i32` / `u32` offsets and a compile-time integer `aux` in `[0, 31]`.
 
 The common GEMM pattern is to create one descriptor for the block-owned rows, then let each lane compute a byte offset for its vectorized load. For edge tiles, the descriptor range covers only valid rows or columns, so lanes outside the problem shape are handled by the hardware guard.
 
