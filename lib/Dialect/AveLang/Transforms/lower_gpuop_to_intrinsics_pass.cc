@@ -11,6 +11,7 @@
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -471,6 +472,31 @@ class NVVMStMatrixLowering : public mlir::OpRewritePattern<NVVMStMatrixOp> {
     }
 };
 
+class NVVMTMADescriptorLowering
+    : public mlir::OpRewritePattern<NVVMTMADescriptorOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMADescriptorOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMADescriptorOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+        if (!funcOp) {
+            return mlir::failure();
+        }
+
+        unsigned argIndex = funcOp.getNumArguments();
+        auto attrs = rewriter.getDictionaryAttr(
+            {rewriter.getNamedAttr("ave.nv_tma_desc", rewriter.getUnitAttr())});
+        if (mlir::failed(funcOp.insertArgument(
+                argIndex, op.getResult().getType(), attrs, op.getLoc()))) {
+            return mlir::failure();
+        }
+
+        rewriter.replaceOp(op, funcOp.getArgument(argIndex));
+        return mlir::success();
+    }
+};
 class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
   public:
     using mlir::OpRewritePattern<AMDGPUMfmaOp>::OpRewritePattern;
@@ -602,10 +628,11 @@ class LowerAveLangGPUToIntrinsicsPass
 
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
-        patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, AMDGPUMfmaLowering,
-                     AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
-            &getContext());
+        patterns
+            .add<NVVMMmaLowering, NVVMLdMatrixLowering, NVVMStMatrixLowering,
+                 NVVMTMADescriptorLowering, AMDGPUMfmaLowering,
+                 AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
+                &getContext());
 
         if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),
                                                      std::move(patterns)))) {

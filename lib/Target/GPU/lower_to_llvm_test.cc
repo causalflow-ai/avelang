@@ -3,9 +3,11 @@
 #include "avelang/config.h"
 #include "gpu_passes.h"
 #include "lower_to_llvm.h"
+#include "reconcile_nvgpu_index_bitwidth.h"
 
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Parser/Parser.h>
 #include <mlir/Pass/PassManager.h>
@@ -148,6 +150,34 @@ TEST_F(LLVMTargetTest, SimpleFunction) {
     )";
     TestLLVMCompilation(mlirCode);
 }
+
+#if defined(WITH_CUDA)
+TEST_F(LLVMTargetTest, TMADescriptorUsesKernelArgumentABI) {
+    const std::string mlirCode = R"(
+module {
+  func.func @tma_descriptor_test(%arg0: !ave.memref<!ave.layout<dims = [16, 16], strides = [16, 1]>, f32> {llvm.name = "global_mem"}) attributes {ave.gpu_func = 2 : i32} {
+    %c16 = arith.constant 16 : i32
+    %dims = ave.make_int_tuple %c16, %c16 {is_tuple = true} : i32, i32 -> none
+    %c1 = arith.constant 1 : i32
+    %strides = ave.make_int_tuple %c16, %c1 {is_tuple = true} : i32, i32 -> none
+    %layout = ave.make_layout %dims, %strides : (none, none) -> !ave.layout
+    %swizzle = arith.constant 0 : index
+    %desc = ave.gpu.nvvm_tma_descriptor %arg0, %layout, %swizzle : !ave.memref<!ave.layout<dims = [16, 16], strides = [16, 1]>, f32>, !ave.layout, index -> !nvgpu.tensormap.descriptor<tensor = memref<16x16xf32, strided<[16, 1]>, 3>, swizzle = none, l2promo = none, oob = zero, interleave = none>
+    return
+  }
+})";
+
+    std::string llvmDump;
+    auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
+    ASSERT_NE(llvmModule, nullptr);
+    EXPECT_NE(llvmDump.find("byval([128 x i8])"), std::string::npos);
+    EXPECT_NE(llvmDump.find("\"nvvm.grid_constant\""), std::string::npos);
+    EXPECT_NE(llvmDump.find("align 64"), std::string::npos);
+    EXPECT_EQ(llvmDump.find("ave.nv_tma_desc"), std::string::npos);
+    EXPECT_EQ(llvmDump.find("_avelang_nvvm_make_tma_descriptor"),
+              std::string::npos);
+}
+#endif
 
 TEST_F(LLVMTargetTest, FloorDiv) {
     const std::string mlirCode = R"(
@@ -307,6 +337,40 @@ module {
     EXPECT_NE(llvmDump.find("store i64"), std::string::npos);
 }
 
+TEST_F(LLVMTargetTest, ReconcilePointerTruncatedByIndexLowering) {
+    const std::string mlirCode = R"(
+module {
+  llvm.func @reconcile_truncated_pointer(%arg0: !llvm.ptr) -> i64 {
+    %0 = llvm.ptrtoint %arg0 : !llvm.ptr to i64
+    %1 = llvm.trunc %0 : i64 to i32
+    %2 = llvm.mlir.constant(16 : i32) : i32
+    %3 = llvm.add %1, %2 : i32
+    %4 = llvm.zext %3 : i32 to i64
+    llvm.return %4 : i64
+  }
+})";
+
+    auto module = parseMLIRString(mlirCode);
+    ASSERT_TRUE(module);
+
+    mlir::PassManager pm(module->getContext());
+    pm.addPass(createReconcileNVGPUIndexBitwidthPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
+
+    int truncCount = 0;
+    int i64AddCount = 0;
+    module->walk([&](mlir::LLVM::TruncOp) { ++truncCount; });
+    module->walk([&](mlir::LLVM::AddOp add) {
+        auto type = mlir::dyn_cast<mlir::IntegerType>(add.getType());
+        if (type && type.getWidth() == 64) {
+            ++i64AddCount;
+        }
+    });
+
+    EXPECT_EQ(truncCount, 0);
+    EXPECT_EQ(i64AddCount, 1);
+}
+
 TEST_F(LLVMTargetTest, SharedMemory) {
     const std::string mlirCode = R"(module {
   func.func @test_shared_memory_basic(%arg0: !ave.memref<!ave.layout<dims = [32], strides = []>, i32> {llvm.name = "input_data"}, %arg1: !ave.memref<!ave.layout<dims = [32], strides = []>, i32> {llvm.name = "output_data"}) attributes {ave.gpu_func = 2 : i32} {
@@ -339,6 +403,11 @@ TEST_F(LLVMTargetTest, SharedMemory) {
     std::string llvmDump;
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
+    auto *sharedGlobal =
+        llvmModule->getGlobalVariable("__wg_test_shared_memory_basic_0", true);
+    ASSERT_NE(sharedGlobal, nullptr);
+    ASSERT_TRUE(sharedGlobal->getAlign());
+    EXPECT_LT(sharedGlobal->getAlign()->value(), 128u);
     EXPECT_NE(llvmDump.find("addrspace(3) global [128 x i8] undef"),
               std::string::npos);
     EXPECT_NE(llvmDump.find("store i32"), std::string::npos) << llvmDump;
@@ -349,7 +418,7 @@ TEST_F(LLVMTargetTest, SharedMemory) {
 TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     const std::string mlirCode = R"(module {
   func.func @test_shared_memory_union_subviews(%arg0: !ave.memref<!ave.layout<dims = [8], strides = [1]>, bf16> {llvm.name = "output_data"}) attributes {ave.gpu_func = 2 : i32} {
-    %shm = ave.memref.alloca() : !ave.memref<!ave.layout<dims = [32], strides = []>, i8, #gpu.address_space<workgroup>>
+    %shm = ave.memref.alloca() {alignment = 128 : i64} : !ave.memref<!ave.layout<dims = [32], strides = []>, i8, #gpu.address_space<workgroup>>
 
     %c8_i32 = arith.constant 8 : i32
     %shape_i32 = ave.make_int_tuple %c8_i32 {is_tuple = true} : i32 -> none
@@ -422,13 +491,15 @@ TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     std::string llvmDump;
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
-    EXPECT_NE(llvmDump.find("addrspace(3) global [32 x i8] undef"),
-              std::string::npos);
-    EXPECT_NE(llvmDump.find(
-                  "store <2 x bfloat> <bfloat 1.000000e+00, bfloat 2.000000e+00>, "
-                  "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
-                  "align 16"),
-              std::string::npos);
+    auto *sharedGlobal = llvmModule->getGlobalVariable(
+        "__wg_test_shared_memory_union_subviews_0", true);
+    ASSERT_NE(sharedGlobal, nullptr);
+    ASSERT_TRUE(sharedGlobal->getAlign());
+    EXPECT_GE(sharedGlobal->getAlign()->value(), 128u);
+    EXPECT_NE(
+        llvmDump.find("store <2 x bfloat> <bfloat 1.000000e+00, bfloat "
+                      "2.000000e+00>"),
+        std::string::npos);
 }
 
 TEST_F(LLVMTargetTest, SharedMemorySubviewLayoutCastLowers) {

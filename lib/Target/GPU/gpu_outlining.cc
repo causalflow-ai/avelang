@@ -108,6 +108,22 @@ class GpuOutliningPass
                     mlir::TypeRange{}  // private attributions
                 );
                 gpuFunc.setKernel(true);
+                llvm::SmallVector<int32_t> tmaDescriptorIndices;
+                for (unsigned index = 0; index < funcOp.getNumArguments();
+                     ++index) {
+                    if (funcOp.getArgAttr(index, "ave.nv_tma_desc")) {
+                        tmaDescriptorIndices.push_back(index);
+                    }
+                }
+                if (!tmaDescriptorIndices.empty()) {
+                    // Upstream GPUFuncOpLowering only propagates a fixed set
+                    // of argument attributes. Preserve the descriptor
+                    // positions as a function attribute until the LLVM
+                    // function signature is available.
+                    gpuFunc->setAttr(
+                        "ave.nv_tma_desc_indices",
+                        builder.getDenseI32ArrayAttr(tmaDescriptorIndices));
+                }
 
                 // Copy function body
                 mlir::IRMapping mapping;
@@ -139,8 +155,14 @@ class GpuOutliningPass
 
                 for (auto allocaOp : workgroupAllocaOps) {
                     auto memrefType = allocaOp.getType();
+                    unsigned attributionIndex =
+                        gpuFunc.getNumWorkgroupAttributions();
                     auto workgroupArg = gpuFunc.addWorkgroupAttribution(
                         memrefType, allocaOp.getLoc());
+                    if (auto alignment = allocaOp.getAlignmentAttr()) {
+                        gpuFunc.setWorkgroupAttributionAttr(
+                            attributionIndex, "llvm.align", alignment);
+                    }
                     allocaOp.getResult().replaceAllUsesWith(workgroupArg);
                     allocaOp.erase();
                 }

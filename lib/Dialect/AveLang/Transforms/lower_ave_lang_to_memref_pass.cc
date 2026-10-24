@@ -44,12 +44,18 @@ std::optional<int64_t> getStaticValue(mlir::Value value) {
 
 mlir::Attribute normalizeBuiltinMemorySpace(mlir::MLIRContext *context,
                                             mlir::Attribute memorySpace) {
+    if (auto intSpace =
+            mlir::dyn_cast_or_null<mlir::IntegerAttr>(memorySpace)) {
+        if (intSpace.getInt() == 5) {
+            return {};
+        }
+    }
+
     if (auto gpuSpace =
             mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(memorySpace)) {
         switch (gpuSpace.getValue()) {
         case mlir::gpu::AddressSpace::Private:
-            return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
-                                          5);
+            return {};
         case mlir::gpu::AddressSpace::Global:
         case mlir::gpu::AddressSpace::Workgroup:
             return memorySpace;

@@ -27,6 +27,8 @@ class NVVMBackend
         const causalflow::avelang::target::gpu::GPUCompilationOptions &options)
         override;
 
+    llvm::json::Object getKernelMetadata(mlir::ModuleOp module) const override;
+
     void EnsureInitialized() override;
 };
 

@@ -92,6 +92,7 @@ target_link_libraries(ave-lang-mlir
   MLIRSCFDialect
   MLIRControlFlowDialect
   MLIRGPUDialect
+  MLIRNVGPUDialect
   MLIRPtrDialect
   MLIRVectorDialect
   MLIRROCDLDialect
