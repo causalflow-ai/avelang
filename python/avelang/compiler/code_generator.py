@@ -122,6 +122,36 @@ def _serialize_global_constexprs(global_constants) -> str:
     return json.dumps(constexprs_list)
 
 
+def _collect_constexpr_jit_dependencies(src) -> list:
+    from avelang.runtime.jit import JITCallable
+
+    constants = getattr(src, "constants", None) or {}
+    global_constants = getattr(src, "global_constants", None) or {}
+    deps = []
+    seen = set()
+    for info in list(constants.values()) + list(global_constants.values()):
+        dep = info.get("_jit_callable") if isinstance(info, dict) else None
+        if isinstance(dep, JITCallable) and dep not in seen:
+            seen.add(dep)
+            for sub_dep in _collect_jit_dependencies(dep):
+                if sub_dep not in seen:
+                    seen.add(sub_dep)
+                    deps.append(sub_dep)
+            deps.append(dep)
+    return deps
+
+
+def _dedupe_jit_dependencies(deps: list) -> list:
+    seen = set()
+    ordered = []
+    for dep in deps:
+        if dep in seen:
+            continue
+        seen.add(dep)
+        ordered.append(dep)
+    return ordered
+
+
 def _get_function_def(py_module: ast.AST) -> ast.FunctionDef:
     for node in getattr(py_module, "body", []):
         if isinstance(node, ast.FunctionDef):
@@ -254,7 +284,9 @@ def _build_import_module(jit_fns: list) -> ast.Module:
 def compile_to_binary(src, target, opt_level: int = 2, options=None):
     constexprs_json = _serialize_constexprs(src)
 
-    jit_deps = _collect_jit_dependencies(src.fn)
+    jit_deps = _dedupe_jit_dependencies(
+        _collect_jit_dependencies(src.fn) + _collect_constexpr_jit_dependencies(src)
+    )
     import_module = _build_import_module([src.fn, *jit_deps])
 
     generator = _C.MLIRGenerator()

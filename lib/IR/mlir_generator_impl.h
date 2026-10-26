@@ -160,6 +160,8 @@ class MLIRGeneratorImpl {
     mlir::ModuleOp CreateModule();
     mlir::ModuleOp Generate(ast::ASTNode *root);
     void RegisterJitDependency(ast::FunctionDef *func);
+    llvm::Error RegisterJitDependencyAlias(llvm::StringRef alias,
+                                           llvm::StringRef dependency_name);
     void InitializeSymbolTable();
     void SnapshotModuleSymbolTable();
 
