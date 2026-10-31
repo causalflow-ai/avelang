@@ -542,6 +542,34 @@ class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
     }
 };
 
+class AMDGPUMfmaScaleLowering
+    : public mlir::OpRewritePattern<AMDGPUMfmaScaleOp> {
+  public:
+    using mlir::OpRewritePattern<AMDGPUMfmaScaleOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(AMDGPUMfmaScaleOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        const auto *config = amdgpu_mfma::MFMAScaleConfig::Find(
+            op.getMAttr().getInt(), op.getNAttr().getInt(),
+            op.getKAttr().getInt());
+        if (!config) {
+            return rewriter.notifyMatchFailure(op,
+                                               "unsupported scaled MFMA shape");
+        }
+        mlir::OperationState state(op.getLoc(), config->rocdlOp);
+        state.addTypes(op.getResult().getType());
+        state.addOperands(
+            {op.getA(), op.getB(), op.getC(), op.getScaleA(), op.getScaleB()});
+        state.addAttribute("cbsz", op.getCbszAttr());
+        state.addAttribute("blgp", op.getBlgpAttr());
+        state.addAttribute("opselA", op.getOpselAAttr());
+        state.addAttribute("opselB", op.getOpselBAttr());
+        rewriter.replaceOp(op, rewriter.create(state)->getResults());
+        return mlir::success();
+    }
+};
+
 class AMDGPURawBufferLoadLowering
     : public mlir::OpRewritePattern<AMDGPURawBufferLoadOp> {
   public:
@@ -602,10 +630,11 @@ class LowerAveLangGPUToIntrinsicsPass
 
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
-        patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, AMDGPUMfmaLowering,
-                     AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
-            &getContext());
+        patterns
+            .add<NVVMMmaLowering, NVVMLdMatrixLowering, NVVMStMatrixLowering,
+                 AMDGPUMfmaLowering, AMDGPUMfmaScaleLowering,
+                 AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
+                &getContext());
 
         if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),
                                                      std::move(patterns)))) {

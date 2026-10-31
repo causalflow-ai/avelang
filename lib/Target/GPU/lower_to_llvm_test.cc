@@ -11,13 +11,19 @@
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <gtest/gtest.h>
+#include <tuple>
+#include <utility>
 
 namespace causalflow::avelang::target::gpu {
 
@@ -525,6 +531,105 @@ TEST_F(LLVMTargetTest, MemrefCastFoldedScalarLayoutDimsStayStatic) {
 }
 
 #if defined(WITH_AMDGPU)
+TEST_F(LLVMTargetTest, AMDGPUMFMAScaleLowersToIntrinsic) {
+    compilation_options_.chipset = "gfx950";
+    struct InputCase {
+        int aRegs, bRegs, cbsz, blgp;
+    };
+    for (int m : {16, 32}) {
+        for (auto input : {InputCase{8, 4, 0, 4}, InputCase{6, 8, 3, 1},
+                           InputCase{6, 8, 4, 2}}) {
+            SCOPED_TRACE(llvm::formatv("m={0}, cbsz={1}, blgp={2}", m,
+                                       input.cbsz, input.blgp)
+                             .str());
+            int k = 2048 / m;
+            int cElements = m * m / 64;
+            const std::string mlirCode =
+                llvm::formatv(R"(
+module {{
+  gpu.module @kernels {{
+    gpu.func @scaled_mfma_kernel(%a: vector<{3}xi32>, %b: vector<{4}xi32>,
+                                %c: vector<{2}xf32>, %sa: i32, %sb: i32,
+                                %out: memref<{2}xf32>) kernel {{
+      %result = ave.gpu.amdgpu_mfma_scale %a, %b, %c, %sa, %sb
+        {{m = {0} : i32, n = {0} : i32, k = {1} : i32,
+          cbsz = {5} : i32, blgp = {6} : i32, opsel_a = 2 : i32, opsel_b = 1 : i32}
+        : vector<{3}xi32>, vector<{4}xi32>, vector<{2}xf32>, i32, i32 -> vector<{2}xf32>
+      %zero = arith.constant 0 : index
+      vector.store %result, %out[%zero] : memref<{2}xf32>, vector<{2}xf32>
+      gpu.return
+    }
+  }
+}
+)",
+                              m, k, cElements, input.aRegs, input.bRegs,
+                              input.cbsz, input.blgp)
+                    .str();
+            auto llvmModule = CompileToLLVM(mlirCode, nullptr, nullptr);
+            ASSERT_NE(llvmModule, nullptr);
+            auto intrinsic =
+                llvm::formatv("llvm.amdgcn.mfma.scale.f32.{0}x{0}x{1}.f8f6f4.",
+                              m, k)
+                    .str();
+            auto callee = llvm::find_if(*llvmModule, [&](auto &function) {
+                return function.getName().starts_with(intrinsic);
+            });
+            ASSERT_TRUE(callee != llvmModule->end());
+            ASSERT_TRUE(callee->hasOneUse());
+            auto *call = llvm::dyn_cast<llvm::CallInst>(*callee->user_begin());
+            ASSERT_NE(call, nullptr);
+            EXPECT_EQ(call->getType(),
+                      llvm::FixedVectorType::get(
+                          llvm::Type::getFloatTy(llvmContext_), cElements));
+            ASSERT_EQ(call->arg_size(), 9u);
+            for (auto [index, expected] : {std::pair{3u, input.cbsz},
+                                           {4u, input.blgp},
+                                           {5u, 2},
+                                           {7u, 1}}) {
+                auto *value = llvm::dyn_cast<llvm::ConstantInt>(
+                    call->getArgOperand(index));
+                ASSERT_NE(value, nullptr);
+                EXPECT_EQ(value->getSExtValue(), expected);
+            }
+            EXPECT_EQ(call->getArgOperand(6), call->getFunction()->getArg(3));
+            EXPECT_EQ(call->getArgOperand(8), call->getFunction()->getArg(4));
+        }
+    }
+}
+
+TEST_F(LLVMTargetTest, AMDGPUMFMAScaleRejectsInvalidShapeAndResult) {
+    LowerToLLVM compiler(ir_context_.get());
+    for (auto [k, resultElements, expected] :
+         {std::tuple{64, 4, "unsupported scaled MFMA shape"},
+          std::tuple{128, 16,
+                     "accumulator and result must be vector<4xf32>"}}) {
+        SCOPED_TRACE(expected);
+        std::string errors;
+        mlir::ScopedDiagnosticHandler handler(
+            compiler.getContext(), [&](mlir::Diagnostic &diagnostic) {
+                llvm::raw_string_ostream os(errors);
+                diagnostic.print(os);
+                return mlir::success();
+            });
+        const std::string mlirCode = llvm::formatv(R"(
+module {{
+  func.func @invalid(%a: vector<4xi32>, %c: vector<4xf32>, %scale: i32) {{
+    %result = ave.gpu.amdgpu_mfma_scale %a, %a, %c, %scale, %scale
+      {{m = 16 : i32, n = 16 : i32, k = {0} : i32,
+        cbsz = 4 : i32, blgp = 4 : i32, opsel_a = 0 : i32, opsel_b = 0 : i32}
+      : vector<4xi32>, vector<4xi32>, vector<4xf32>, i32, i32 -> vector<{1}xf32>
+    return
+  }
+}
+)",
+                                                   k, resultElements)
+                                         .str();
+        EXPECT_FALSE(mlir::parseSourceString<mlir::ModuleOp>(
+            mlirCode, compiler.getContext()));
+        EXPECT_NE(errors.find(expected), std::string::npos) << errors;
+    }
+}
+
 TEST_F(LLVMTargetTest, AMDGPUSchedGroupBarrierLowers) {
     const std::string mlirCode = R"(
 module {

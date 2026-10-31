@@ -20,8 +20,10 @@
 #pragma clang diagnostic pop
 
 #include <gtest/gtest.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <set>
+#include <tuple>
 #include <vector>
 
 namespace causalflow::avelang::frontend {
@@ -1728,6 +1730,95 @@ def mfma_test(a_fp8: S.Tensor((2,), S.u32),
 
     RunMLIRGenerationTest(kSourceCode);
 }
+
+struct MFMAScaleCase {
+    const char *arguments;
+    const char *error = nullptr;
+    bool loopSelector = false;
+};
+
+class MFMAScaleTest
+    : public MLIRGeneratorTest,
+      public ::testing::WithParamInterface<std::tuple<int, MFMAScaleCase>> {};
+
+TEST_P(MFMAScaleTest, GenerateOrReject) {
+    auto [m, test] = GetParam();
+    SCOPED_TRACE(test.arguments);
+    auto source = llvm::formatv(R"(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def mfma_scale_test(a4: S.Tensor((4,), S.u32),
+                    a5: S.Tensor((5,), S.u32),
+                    a6: S.Tensor((6,), S.u32),
+                    a7: S.Tensor((7,), S.u32),
+                    a8: S.Tensor((8,), S.u32),
+                    c: S.Tensor(({0},), S.f32),
+                    other_c: S.Tensor(({1},), S.f32),
+                    sa: S.u32, sb: S.u32,
+                    selector: S.i32, fmt: S.i32):
+{2}    result = S.amdgpu.mfma_scale_f32_{3}x{3}x{4}_f8f6f4({5})
+)",
+                                m * m / 64, m == 16 ? 16 : 4,
+                                test.loopSelector
+                                    ? "    for selector in S.range(4):\n    "
+                                    : "",
+                                m, 2048 / m, test.arguments)
+                      .str();
+    if (test.error) {
+        RunMLIRGenerationErrorTest(source, test.error);
+    } else {
+        RunMLIRGenerationTest(source);
+    }
+}
+
+static constexpr auto kSelectorError =
+    "compile-time integer scale selectors in [0, 3]";
+static constexpr auto kFormatError =
+    "compile-time integer cbsz/blgp formats in [0, 4]";
+static const MFMAScaleCase kMFMAScaleCases[] = {
+    // Constant expressions, excess registers, and a runtime loop selector.
+    {"a4, a8, c, 2 + 2, 1 - 1, 1 + 2, sa, 3 - 1, sb"},
+    {"a8, a6, c, 4, 2, 2, sa, 1, sb"},
+    {"a4, a4, c, 4, 4, selector, sa, 0, sb", kSelectorError, true},
+    // Selectors: runtime values, out-of-range values, and non-integers.
+    {"a4, a4, c, 4, 4, selector, sa, 0, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 0, sa, selector, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, -1, sa, 0, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 0, sa, -1, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 4, sa, 0, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 0, sa, 4, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 0.5, sa, 0, sb", kSelectorError},
+    {"a4, a4, c, 4, 4, 0, sa, 0.5, sb", kSelectorError},
+    // Formats: the same categories, independently for A and B.
+    {"a8, a8, c, fmt, 4, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 4, fmt, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, -1, 4, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 4, -1, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 5, 4, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 4, 5, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 0.5, 4, 2, sa, 1, sb", kFormatError},
+    {"a8, a8, c, 4, 0.5, 2, sa, 1, sb", kFormatError},
+    // Operand widths, element types, accumulator shape, and argument count.
+    {"a4, a8, c, 0, 0, 0, sa, 0, sb", "enough elements for cbsz"},
+    {"a8, a6, c, 0, 1, 0, sa, 0, sb", "enough elements for blgp"},
+    {"a4, a6, c, 2, 2, 0, sa, 0, sb", "enough elements for cbsz"},
+    {"a6, a4, c, 3, 3, 0, sa, 0, sb", "enough elements for blgp"},
+    {"a5, a4, c, 4, 4, 0, sa, 0, sb", "4, 6 or 8 elements"},
+    {"a4, a7, c, 4, 4, 0, sa, 0, sb", "4, 6 or 8 elements"},
+    {"a4, c, c, 4, 4, 0, sa, 0, sb", "rank-1 i32 vector"},
+    {"a4, a4, other_c, 4, 4, 0, sa, 0, sb", "accumulator and result"},
+    {"a4, a4, a4, 4, 4, 0, sa, 0, sb", "accumulator and result"},
+    {"a4, a4, c, 4, 4, 0, 0.5, 0, sb", "32-bit signless integer"},
+    {"a4, a4, c, 4, 4, 0, sa, 0, 0.5", "32-bit signless integer"},
+    {"a4, a4, c, 4, 4, 0, sa, 0", "requires 9 arguments"},
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    AMDGPU, MFMAScaleTest,
+    ::testing::Combine(::testing::Values(16, 32),
+                       ::testing::ValuesIn(kMFMAScaleCases)));
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPURawBufferLoad) {
     static const std::string kSourceCode = R"""""(

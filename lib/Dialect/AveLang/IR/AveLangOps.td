@@ -293,6 +293,45 @@ def AMDGPUMfmaOp : AveLang_GPU_Op<"amdgpu_mfma", []> {
     let hasVerifier = 1;
 }
 
+def AMDGPUMfmaScaleOp : AveLang_GPU_Op<"amdgpu_mfma_scale", []> {
+    let summary = "AMDGPU F8/F6/F4 MFMA with E8M0 scales";
+    let description = [{
+        A and B are packed i32 vectors. The cbsz and blgp immediate attributes
+        independently select their formats: 0 = FP8 E4M3, 1 = FP8 E5M2,
+        2 = FP6 E2M3, 3 = FP6 E3M2, 4 = FP4 E2M1. They require at least
+        8, 8, 6, 6, or 4 i32 elements respectively, in vectors of 4, 6, or 8
+        elements. Supported shapes are 16x16x128 and 32x32x64, with
+        vector<4xf32> and vector<16xf32> accumulators/results respectively.
+
+        The scale selectors are immediate attributes in [0, 3]. All four
+        immediates and the packed scales pass directly to the native instruction.
+    }];
+
+    let arguments = (ins
+        LLVM_AnyVector:$a,
+        LLVM_AnyVector:$b,
+        LLVM_AnyVector:$c,
+        I32Attr:$m,
+        I32Attr:$n,
+        I32Attr:$k,
+        I32Attr:$cbsz,
+        I32Attr:$blgp,
+        I32Attr:$opsel_a,
+        I32:$scale_a,
+        I32Attr:$opsel_b,
+        I32:$scale_b
+    );
+    let results = (outs LLVM_AnyVector:$result);
+
+    let assemblyFormat = [{
+        $a `,` $b `,` $c `,` $scale_a `,` $scale_b
+        attr-dict `:` type($a) `,` type($b) `,` type($c) `,` type($scale_a)
+        `,` type($scale_b) `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+}
+
 def AMDGPURawBufferLoadOp : AveLang_GPU_Op<"amdgpu_raw_buffer_load", []> {
     let summary = "AMDGPU Raw Buffer Load operation";
     let description = [{

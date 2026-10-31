@@ -24,3 +24,12 @@ def has_rocm():
     if not torch.cuda.is_available():
         return False
     return hasattr(torch.version, "hip") and torch.version.hip is not None
+
+
+def has_gfx950():
+    import torch
+
+    if not has_rocm():
+        return False
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.gcnArchName.split(":", 1)[0] == "gfx950"

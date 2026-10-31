@@ -33,6 +33,7 @@ extern "C" const unsigned char _binary_amdgpu_intrinsics_mlirbc_start[];
 extern "C" const unsigned char _binary_amdgpu_intrinsics_mlirbc_end[];
 
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
@@ -80,6 +81,10 @@ class AMDGPUIntrinsic : public NamedModule {
     void Initialize() override;
     void DeclareModules(mlir::ModuleOp module) override;
 
+    mlir::Value
+    CreateScaledMfmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args,
+                             const amdgpu_mfma::MFMAScaleConfig &config) const;
     mlir::Value CreateMfmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                    llvm::ArrayRef<mlir::Value> resolved_args,
                                    const amdgpu_mfma::MFMAConfig &config) const;
@@ -161,6 +166,9 @@ class AMDGPUIntrinsic : public NamedModule {
     bool
     CheckGenericMFMAFunction(ast::Call *call_expr, GeneratorContext *ctx,
                              llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool
+    CheckScaledMfmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                            llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckGenericRawBufferLoadFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -223,6 +231,22 @@ void AMDGPUIntrinsic::Initialize() {
                    llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
                 return CheckGenericMFMAFunction(call_expr, gen_ctx,
                                                 resolved_args);
+            });
+    }
+
+    for (const auto &config : amdgpu_mfma::MFMAScaleConfig::GetConfigs()) {
+        AddFunction(
+            config.name.str(),
+            [this,
+             config](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                     llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return CreateScaledMfmaFunction(call_expr, gen_ctx,
+                                                resolved_args, config);
+            },
+            [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+                return CheckScaledMfmaFunction(call_expr, gen_ctx,
+                                               resolved_args);
             });
     }
 
@@ -622,6 +646,33 @@ mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
         mlir::IntegerAttr::get(builder.getI32Type(), config.k),
         mlir::StringAttr::get(builder.getContext(), config.typeA),
         mlir::StringAttr::get(builder.getContext(), type_c_str));
+
+    return mfma_op.getResult();
+}
+
+mlir::Value AMDGPUIntrinsic::CreateScaledMfmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    const amdgpu_mfma::MFMAScaleConfig &config) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+
+    auto a = resolved_args[0];
+    auto b = resolved_args[1];
+    auto c = resolved_args[2];
+    auto cbsz = ConstantFolder::FoldIntValue(resolved_args[3]);
+    auto blgp = ConstantFolder::FoldIntValue(resolved_args[4]);
+    auto opsel_a = ConstantFolder::FoldIntValue(resolved_args[5]);
+    auto scale_a = resolved_args[6];
+    auto opsel_b = ConstantFolder::FoldIntValue(resolved_args[7]);
+    auto scale_b = resolved_args[8];
+    SS_ASSERT(cbsz && blgp && opsel_a && opsel_b);
+
+    auto result_type = mlir::VectorType::get({config.GetCElementCount()},
+                                             builder.getF32Type());
+    auto mfma_op = cf::AMDGPUMfmaScaleOp::create(
+        builder, location, result_type, a, b, c, config.m, config.n, config.k,
+        *cbsz, *blgp, *opsel_a, scale_a, *opsel_b, scale_b);
 
     return mfma_op.getResult();
 }
@@ -1118,6 +1169,39 @@ bool AMDGPUIntrinsic::CheckGenericMFMAFunction(
         return false;
     }
 
+    return true;
+}
+
+bool AMDGPUIntrinsic::CheckScaledMfmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 9 ||
+        llvm::any_of(resolved_args, [](mlir::Value value) { return !value; })) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "scaled MFMA requires 9 arguments: a, b, c, cbsz, blgp, "
+               "opsel_a, scale_a, opsel_b, scale_b";
+        return false;
+    }
+
+    for (unsigned index : {3u, 4u, 5u, 7u}) {
+        auto value = resolved_args[index];
+        auto constant = ConstantFolder::FoldIntValue(value);
+        bool isFormat = index == 3 || index == 4;
+        if (!value.getType().isIntOrIndex() || !constant ||
+            !(isFormat ? amdgpu_mfma::MFMAScaleConfig::IsValidFormat(*constant)
+                       : amdgpu_mfma::MFMAScaleConfig::IsValidScaleSelector(
+                             *constant))) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << (isFormat ? "scaled MFMA requires compile-time integer "
+                               "cbsz/blgp formats in [0, 4]"
+                             : "scaled MFMA requires compile-time integer "
+                               "scale selectors in [0, 3]");
+            return false;
+        }
+    }
     return true;
 }
 

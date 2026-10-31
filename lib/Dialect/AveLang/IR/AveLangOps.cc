@@ -540,6 +540,48 @@ mlir::LogicalResult AMDGPUMfmaOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// AMDGPUMfmaScaleOp
+//===----------------------------------------------------------------------===//
+
+mlir::LogicalResult AMDGPUMfmaScaleOp::verify() {
+    using amdgpu_mfma::MFMAScaleConfig;
+    const auto *config = MFMAScaleConfig::Find(
+        getMAttr().getInt(), getNAttr().getInt(), getKAttr().getInt());
+    if (!config) {
+        return emitOpError("unsupported scaled MFMA shape")
+               << " " << getMAttr().getInt() << "x" << getNAttr().getInt()
+               << "x" << getKAttr().getInt();
+    }
+    for (auto format : {getCbszAttr(), getBlgpAttr()}) {
+        if (!MFMAScaleConfig::IsValidFormat(format.getInt())) {
+            return emitOpError("cbsz and blgp formats must be in [0, 4]");
+        }
+    }
+    for (auto selector : {getOpselAAttr(), getOpselBAttr()}) {
+        if (!MFMAScaleConfig::IsValidScaleSelector(selector.getInt())) {
+            return emitOpError("scale selectors must be in [0, 3]");
+        }
+    }
+
+    if (!MFMAScaleConfig::MatchesInputType(getA().getType(),
+                                           getCbszAttr().getInt())) {
+        return emitOpError("A must be a rank-1 i32 vector of 4, 6 or 8 "
+                           "elements, with enough elements for cbsz");
+    }
+    if (!MFMAScaleConfig::MatchesInputType(getB().getType(),
+                                           getBlgpAttr().getInt())) {
+        return emitOpError("B must be a rank-1 i32 vector of 4, 6 or 8 "
+                           "elements, with enough elements for blgp");
+    }
+    if (!config->MatchesCType(getC().getType()) ||
+        !config->MatchesCType(getResult().getType())) {
+        return emitOpError("accumulator and result must be vector<")
+               << config->GetCElementCount() << "xf32> for " << config->name;
+    }
+    return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // AMDGPURawBufferLoadOp
 //===----------------------------------------------------------------------===//
 
