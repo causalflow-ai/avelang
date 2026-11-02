@@ -526,7 +526,8 @@ void AveLangModule::Initialize() {
     AddType("f8e4m3fn", Float8E4M3FNType::get(builder.getContext()));
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
 
-    // FIXME: Constexpr type (placeholder, currently i32)
+    // Annotation marker only.  Canonical constexpr symbols retain their own
+    // typed attributes; this type never represents a constexpr payload.
     AddType("constexpr", builder.getI32Type());
 
     AddSymbol("jit", [&builder]() -> mlir::Value {
@@ -544,28 +545,22 @@ void AveLangModule::Initialize() {
     // Add Tensor type factory function
     AddTypeFactory(
         "Tensor",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreateTensorType(call_expr, gen_ctx);
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx) -> mlir::Type {
+            return CreateTensorType(call_expr, gen_ctx);
         });
 
     // Add Pointer type factory function
     AddTypeFactory(
         "Pointer",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreatePointerType(call_expr, gen_ctx);
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx) -> mlir::Type {
+            return CreatePointerType(call_expr, gen_ctx);
         });
 
     // Add Layout type factory function
     AddTypeFactory(
         "Layout",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreateLayoutType(call_expr, gen_ctx);
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx) -> mlir::Type {
+            return CreateLayoutType(call_expr, gen_ctx);
         });
 
     // Add function wrappers for convert and bitcast

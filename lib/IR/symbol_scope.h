@@ -5,8 +5,10 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include <llvm/ADT/ArrayRef.h>
 
@@ -28,8 +30,8 @@ class SymbolScope {
         kValue,
     };
 
-    using TypeFactoryFunction = std::function<mlir::Type(
-        NamedModule *, ast::Call *, GeneratorContext *)>;
+    using TypeFactoryFunction =
+        std::function<mlir::Type(ast::Call *, GeneratorContext *)>;
     struct Function {
         using Implementation = std::function<mlir::Value(
             ast::Call *, GeneratorContext *, llvm::ArrayRef<mlir::Value>)>;
@@ -64,36 +66,37 @@ class SymbolScope {
         std::string symbol_name;
     };
 
-    // FIXME: This is broken in terms of lifecycle management
     struct Symbol {
-        SymbolKind kind;
-        bool immutable = false; // Track whether this symbol is immutable
-        union {
-            NamedModule *module;
-            TypeFactoryFunction type_factory;
-            Function function;
-            mlir::Type type;
-            mlir::Value value;
-        };
+        using Payload =
+            std::variant<std::monostate, NamedModule *, TypeFactoryFunction,
+                         Function, mlir::Type, mlir::Value>;
 
-        Symbol();
+        Symbol() = default;
         Symbol(NamedModule *m);
         Symbol(TypeFactoryFunction tf);
         Symbol(Function ff);
         Symbol(mlir::Type t);
-        Symbol(mlir::Value v);
-
-        ~Symbol();
-
-        Symbol(const Symbol &other);
-        Symbol &operator=(const Symbol &other);
+        Symbol(mlir::Value v, bool immutable = false);
 
         bool isa(SymbolKind k) const;
+        bool IsImmutable() const { return immutable_; }
+
+        NamedModule *GetModule() const;
+        TypeFactoryFunction GetTypeFactory() const;
+        Function GetFunction() const;
+        mlir::Type GetType() const;
+        mlir::Value GetValue() const;
+        const Payload &GetPayload() const { return payload_; }
+
+      private:
+        Payload payload_;
+        bool immutable_ = false;
     };
 
     // Symbol storage and access
     void AddSymbol(const std::string &name, const Symbol &symbol);
     std::optional<Symbol> LookupSymbol(const std::string &name) const;
+    const std::map<std::string, Symbol> &GetSymbols() const { return symbols_; }
 
     // Convenience methods for different symbol types
     void AddValue(const std::string &name, mlir::Value value,
