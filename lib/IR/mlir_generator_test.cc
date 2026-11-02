@@ -325,6 +325,20 @@ def matmul(a: S.i32):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, StopGeneratingStatementsAfterReturn) {
+    static const std::string kSourceCode = R""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def kernel(out: S.Tensor((1,), S.i32)):
+    return
+    out[0] = 1
+)"""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateKernelFunctionWithReturn) {
     static const std::string kSourceCode = R""""(
 import avelang
